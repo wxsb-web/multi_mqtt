@@ -88,7 +88,7 @@ def run_shell(client):
         pygments_lexers = importlib.import_module("pygments.lexers")
 
         session = prompt_toolkit.PromptSession(
-            lexer=prompt_toolkit_lexers.PygmentsLexer(pygments_lexers.PythonLexer()),
+            lexer=prompt_toolkit_lexers.PygmentsLexer(pygments_lexers.PythonLexer),
             style=prompt_toolkit_styles.Style.from_dict({"prompt": "ansicyan"}),
         )
         prompt = lambda: session.prompt(">>> ", multiline=True)
