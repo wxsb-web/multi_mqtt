@@ -19,6 +19,7 @@ logger = logging.getLogger("MultiMQTT")
 BROKER_LIST = [
     ("broker-cn.emqx.io", 1883),
     ("test.mosquitto.org", 1883),
+    ("mqtt.loralab.org", 1883),
     ("broker.mqtt.cool", 1883),
     ("mqtt.tyckr.io", 1883),
     ("public-mqtt-broker.bevywise.com", 1883),
@@ -26,15 +27,15 @@ BROKER_LIST = [
 
 AES_KEY = b"12345678901234567890123456789012"
 
-def stime():
+def stime(format='%Y-%m-%d__%H.%M.%S',ms_splitor='__.'):
     """可读毫秒级时间戳"""
     ft = time.time()
-    return time.strftime('%Y-%m-%d__%H.%M.%S', time.localtime(ft)) + '__.' + f"{ft:.3f}".split('.')[1]
+    return time.strftime(format, time.localtime(ft)) + ms_splitor + f"{ft:.3f}".split('.')[1]
 
 def get_req_id():
     """生成格式：req_YYYY-MM-DD__HH.MM.SS__.毫秒_随机Hash"""
     hash_str = hashlib.md5(f"{time.time()}_{random.random()}".encode()).hexdigest()[:6]
-    return f"req_{stime()}_{hash_str}"
+    return f"{stime(format='%Y%m%d_%H%M%S',ms_splitor='.')} {hash_str}"
 
 def process_cipher(data, decrypt=False, enabled=False, key=AES_KEY):
     """加解密浓缩函数：默认关闭 (enabled=False)。开启时使用 AES-GCM，关闭时仅转换 JSON"""

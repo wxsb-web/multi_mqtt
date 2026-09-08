@@ -20,13 +20,14 @@ class MQTTServer:
         logger.info(f"⚡ [{stime()}] [服务端处理请求] req_id={req_id} (首发节点: {rx_broker})")
 
         # 构造 Response 字典
+        server_time=time.time()
         response_data = {
-            "msg_id": f"resp_{req_id}",
+            # "msg_id": f"resp_{req_id}",
             "req_id": req_id,
-            "status": 200,
             "echo": payload,
-            "server_time": time.time(),
-            "server_from": rx_broker  # 标注来自哪个公共服务器
+            "server_time": server_time,
+            "server_from": rx_broker,  # 标注来自哪个公共服务器
+            "latency_send":round(server_time-data.get("timestamp"), 2) 
         }
 
         if reply_topic:

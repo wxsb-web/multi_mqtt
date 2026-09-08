@@ -80,11 +80,11 @@ if __name__ == "__main__":
     client = MQTTClientNode()
     client.start()
 
-    for i in range(1, 4):
+    for i in range(99):
         msg = f"Hello Multi-Broker MQTT Message #{i}"
         logger.info(f"发送消息: {msg}")
         resp = client.request(payload=msg, timeout=60)
         print(f"收到回应 -> {resp}\n")
-        time.sleep(2)
+        time.sleep(3)
 
     client.stop()
