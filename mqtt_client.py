@@ -38,7 +38,7 @@ class MQTTClientNode:
                 # 计算往返时延并注入回复字典
                 cost_ms = (time.perf_counter() - req_ctx['start_time']) * 1000
                 data["latency_ms"] = round(cost_ms, 2)
-                data["client_from"] = rx_broker
+                data["client_from"] = rx_broker # 现有 server_from 才有client_from
                 
                 req_ctx['response'] = data
                 req_ctx['event'].set()  # 解锁请求阻塞
@@ -68,7 +68,7 @@ class MQTTClientNode:
 
         if is_success:
             resp = req_ctx['response']
-            logger.info(f"{req_data} 耗时: {resp['latency_ms']:.2f}ms")
+            logger.info(f"{req_data} \n\t{resp}") #耗时: {resp['latency_ms']:.2f}ms
             return resp
         else:
             with self.lock:
