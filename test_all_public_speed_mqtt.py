@@ -7,22 +7,21 @@ from paho.mqtt.enums import CallbackAPIVersion
 
 # 全球公开免密 MQTT Broker 汇总列表
 BROKER_LIST = [
-    # 你的原有的 6 个节点
     ("broker-cn.emqx.io", 1883, "EMQX (中国)"),
     ("test.mosquitto.org", 1883, "Mosquitto 官方"),
     ("mqtt.loralab.org", 1883, "LoRaLab"),
     ("broker.mqtt.cool", 1883, "MQTT.Cool"),
     ("mqtt.tyckr.io", 1883, "Tyckr"),
     ("public-mqtt-broker.bevywise.com", 1883, "Bevywise"),
-    
-    # 补充补充的公开免密节点
     ("broker.hivemq.com", 1883, "HiveMQ 官方"),
     ("broker.emqx.io", 1883, "EMQX (国际)"),
-    ("mqtt.eclipseprojects.io", 1883, "Eclipse 官方"),
-    ("public.mqtthq.com", 1883, "MQTT HQ"),
     ("broker.mqtt-dashboard.com", 1883, "HiveMQ Dashboard"),
-    ("mqtt.fluux.io", 1883, "Fluux"),
+    ("mqtt.iotbhai.io", 1883, "IoTbhai"),
+    ("broker.codenow.cn", 1883, "CodeNow 国内公共MQTT"),
+    # 新增，注意端口18831
+    ("mq.tongxinmao.com", 18831, "同心猫 MQTT"),
 ]
+
 
 def test_single_broker(host, port, name, timeout=3.0):
     client_id = f"bench_{int(time.time())}_{uuid.uuid4().hex[:4]}"
@@ -113,11 +112,11 @@ def run_benchmark():
     # 输出格式化表格
     print(f"{'服务器名称':<20} | {'域名 (Host)':<32} | {'状态':<6} | {'连接延时':<10} | {'往返延时(RTT)':<12} | {'异常原因'}")
     print("-" * 115)
-    for r in results:
+    for n,r in enumerate(results):
         conn_str = f"{r['conn_ms']} ms" if r['conn_ms'] is not None else "N/A"
         rtt_str = f"{r['rtt_ms']} ms" if r['rtt_ms'] is not None else "N/A"
         status_symbol = "✅ OK" if r["status"] == "OK" else "❌ FAIL"
-        print(f"{r['name']:<20} | {r['host']:<32} | {status_symbol:<6} | {conn_str:<10} | {rtt_str:<12} | {r['error']}")
+        print(f"{n} {r['name']:<20} | {r['host']:<32} | {status_symbol:<6} | {conn_str:<10} | {rtt_str:<12} | {r['error']}")
 
 if __name__ == "__main__":
     run_benchmark()
