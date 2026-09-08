@@ -15,9 +15,9 @@ from rich.layout import Layout
 from rich.text import Text
 
 DB_FILE = "mqtt_topics_dump.db"
-FLUSH_INTERVAL = 5.0          # 每 5 秒批量写入磁盘
+FLUSH_INTERVAL = 66          # 每  秒批量写入磁盘
 MAX_PAYLOAD_SAVE = 1024       # 保存消息体前 1024 字节
-MAX_LOG_LINES = 8             # 底部固定留给日志的行数
+MAX_LOG_LINES = 20             # 底部固定留给日志的行数
 
 # ==========================================
 # 1. UI 日志拦截器 (使用 Rich 格式化)
