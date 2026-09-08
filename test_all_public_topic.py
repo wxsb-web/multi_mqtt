@@ -15,30 +15,37 @@ from rich.layout import Layout
 from rich.text import Text
 
 DB_FILE = "mqtt_topics_dump.db"
-FLUSH_INTERVAL = 66          # 每  秒批量写入磁盘
+FLUSH_INTERVAL = 66          # 每 66 秒批量写入磁盘
 MAX_PAYLOAD_SAVE = 1024       # 保存消息体前 1024 字节
-MAX_LOG_LINES = 20             # 底部固定留给日志的行数
+MAX_LOG_LINES = 28             # 底部固定留给日志的行数
 
 # ==========================================
 # 1. UI 日志拦截器 (使用 Rich 格式化)
 # ==========================================
 log_queue = collections.deque(maxlen=MAX_LOG_LINES)
+log_lock = threading.Lock()          # 保护 log_queue 的并发访问
 
 class UILogHandler(logging.Handler):
     """将日志捕获到队列，由 Live UI 统一渲染"""
     def emit(self, record):
         msg = self.format(record)
-        log_queue.append(msg)
+        with log_lock:
+            log_queue.append(msg)
 
-logger = logging.getLogger("MQTTSniffer")
-logger.propagate = False
-logger.setLevel(logging.INFO)
-if logger.hasHandlers():
-    logger.handlers.clear()
+# 【核心修复】：接管 Root Logger，拦截所有模块（包括 multi_mqtt）的日志
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# 清理可能已经被其他模块设置的默认控制台 Handler，防止重复打印
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
 
 ui_handler = UILogHandler()
 ui_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(ui_handler)
+root_logger.addHandler(ui_handler)
+
+# 当前脚本专用的 logger
+logger = logging.getLogger("MQTTSniffer")
 
 
 # ==========================================
@@ -248,10 +255,12 @@ class SnifferEngine:
                 )
                 layout["main"].update(main_group)
 
-                # 3. 底部日志框
-                logs_text = "\n".join(list(log_queue)) if log_queue else "暂无系统日志..."
+                # 3. 底部日志框（使用锁保护读取，避免并发修改 deque 引发异常）
+                with log_lock:
+                    logs_snapshot = list(log_queue)
+                logs_text = "\n".join(logs_snapshot) if logs_snapshot else "暂无系统日志..."
                 layout["footer"].update(
-                    Panel(logs_text, title="[bold]系统日志[/bold]", border_style="grey50")
+                    Panel(logs_text, title="[bold]系统日志[/bold]", border_style="grey50", height=MAX_LOG_LINES)
                 )
 
                 # 渲染整屏
