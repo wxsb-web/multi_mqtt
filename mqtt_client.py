@@ -1,7 +1,6 @@
 # client.py
-import time
+import time,threading,os
 import logging
-import threading
 import codeop
 import importlib
 from multi_mqtt import MultiMQTTManager, get_req_id
@@ -67,7 +66,7 @@ class MQTTClientNode:
 
         if is_success:
             resp = req_ctx['response']
-            logger.info(f"✨ [请求成功] 耗时: {resp['latency_ms']:.2f}ms")
+            logger.info(f"{req_data} 耗时: {resp['latency_ms']:.2f}ms")
             return resp
         else:
             with self.lock:
@@ -113,9 +112,11 @@ def run_shell(client):
         try:
             code = prompt() if session else _fallback_code_input()
         except (EOFError, KeyboardInterrupt):
-            print()
+            print('ctrl+c') # 我按 ctrl+d 退出，怎么也是走这个路径?
+            os._exit(0)
             break
         if code.strip() in {"exit()", "quit()"}:
+            os._exit(0)
             break
         if not code.strip():
             continue

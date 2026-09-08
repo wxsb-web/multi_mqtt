@@ -15,6 +15,26 @@
 
 
 
+mqtt_server.py 收到 code
+调用 PythonExecutor.execute(code)
+ast.parse() 解析代码
+发现最后一条语句是表达式 3
+把前面的语句执行完
+对最后表达式执行 eval
+eval("3") 返回整数 3
+服务端 format_result(3) 转成字符串 "3"
+返回：
+
+
+r=3这不是最后表达式，而是赋值语句：
+进入普通 exec
+执行后 locals 中出现 r: 3
+执行器读取 locals["r"]
+返回结果 3
+server 格式化后返回 "r": "3"
+
+所以 MQTT 支持两种结果来源
+
 
 #TODO
 加入非对称加密与解密支持。

@@ -25,7 +25,6 @@ BROKER_LIST = [
     ("public-mqtt-broker.bevywise.com", 1883),
 ]
 
-AES_KEY = b"12345678901234567890123456789012"
 
 def stime(format='%Y-%m-%d__%H.%M.%S',ms_splitor='__.'):
     """可读毫秒级时间戳"""
@@ -37,8 +36,9 @@ def get_req_id():
     hash_str = hashlib.md5(f"{time.time()}_{random.random()}".encode()).hexdigest()[:6]
     return f"{stime(format='%Y%m%d_%H%M%S',ms_splitor='.')} {hash_str}"
 
+AES_KEY = b"12345678901234567890123456789012"
 def process_cipher(data, decrypt=False, enabled=False, key=AES_KEY):
-    """加解密浓缩函数：默认关闭 (enabled=False)。开启时使用 AES-GCM，关闭时仅转换 JSON"""
+    """加密 解密 浓缩函数：默认关闭 (enabled=False)。开启时使用 AES-GCM，关闭时仅转换 JSON"""
     if not enabled:
         return json.loads(data) if decrypt else json.dumps(data)
     
