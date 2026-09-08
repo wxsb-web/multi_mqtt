@@ -2,6 +2,8 @@
 import time
 import logging
 import threading
+import codeop
+import importlib
 from multi_mqtt import MultiMQTTManager, get_req_id
 
 logger = logging.getLogger("Client")
@@ -47,7 +49,7 @@ class MQTTClientNode:
             "req_id": req_id,
             "msg_id": req_id,
             "reply_topic": RESPONSE_TOPIC,
-            "payload": payload,
+            "code": payload,
             "timestamp": start_time
         }
 
@@ -76,15 +78,61 @@ class MQTTClientNode:
     def stop(self):
         self.mqtt_net.stop()
 
+
+def run_shell(client):
+    """Run a small IPython-like multiline shell over MQTT."""
+    try:
+        prompt_toolkit = importlib.import_module("prompt_toolkit")
+        prompt_toolkit_lexers = importlib.import_module("prompt_toolkit.lexers")
+        prompt_toolkit_styles = importlib.import_module("prompt_toolkit.styles")
+        pygments_lexers = importlib.import_module("pygments.lexers")
+
+        session = prompt_toolkit.PromptSession(
+            lexer=prompt_toolkit_lexers.PygmentsLexer(pygments_lexers.PythonLexer()),
+            style=prompt_toolkit_styles.Style.from_dict({"prompt": "ansicyan"}),
+        )
+        prompt = lambda: session.prompt(">>> ", multiline=True)
+    except ImportError:
+        session = None
+
+    print("输入 Python 代码，prompt_toolkit 模式支持多行和语法高亮；输入 exit() 或 Ctrl-D 退出。")
+    while True:
+        try:
+            code = prompt() if session else _fallback_code_input()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if code.strip() in {"exit()", "quit()"}:
+            break
+        if not code.strip():
+            continue
+        response = client.request(code, timeout=60)
+        if response is None:
+            continue
+        if response.get("stdout"):
+            print(response["stdout"], end="")
+        if response.get("ok"):
+            if response.get("r") is not None:
+                print(response["r"])
+        else:
+            print(response.get("error", "remote execution failed"), end="")
+
+
+def _fallback_code_input():
+    lines = []
+    prompt = ">>> "
+    while True:
+        line = input(prompt)
+        lines.append(line)
+        source = "\n".join(lines)
+        if codeop.compile_command(source, "<shell>", "exec") is not None:
+            return source
+        prompt = "... "
+
 if __name__ == "__main__":
     client = MQTTClientNode()
     client.start()
-
-    for i in range(99):
-        msg = f"Hello Multi-Broker MQTT Message #{i}"
-        logger.info(f"发送消息: {msg}")
-        resp = client.request(payload=msg, timeout=60)
-        print(f"收到回应 -> {resp}\n")
-        time.sleep(3)
-
-    client.stop()
+    try:
+        run_shell(client)
+    finally:
+        client.stop()

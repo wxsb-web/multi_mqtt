@@ -2,6 +2,7 @@
 import time
 import logging
 from multi_mqtt import MultiMQTTManager, stime
+from rpc_executor import PythonExecutor, format_result
 
 logger = logging.getLogger("Server")
 REQUEST_TOPIC = "sys/device/request"
@@ -11,24 +12,27 @@ class MQTTServer:
         # 实例化网络层管理器 (enable_crypto 默认为 False)
         self.mqtt_net = MultiMQTTManager(log_messages=False)
         self.mqtt_net.set_on_message(self.handle_message)
+        self.executor = PythonExecutor()
 
     def handle_message(self, topic, data, rx_broker):
         req_id = data.get("req_id")
         reply_topic = data.get("reply_topic")
-        payload = data.get("payload")
+        code = data.get("code", data.get("payload"))
 
         logger.info(f"⚡ [{stime()}] [服务端处理请求] req_id={req_id} (首发节点: {rx_broker})")
 
-        # 构造 Response 字典
-        server_time=time.time()
+        execution = self.executor.execute(code)
+        server_time = time.time()
         response_data = {
-            # "msg_id": f"resp_{req_id}",
             "req_id": req_id,
-            "echo": payload,
+            "r": format_result(execution["r"]) if execution["ok"] else None,
+            "stdout": execution["stdout"],
+            "ok": execution["ok"],
             "server_time": server_time,
-            "server_from": rx_broker,  # 标注来自哪个公共服务器
-         #   "latency_send":round(server_time-data.get("timestamp")*1000, 2) # client server 服务器时间不同步，测量出不是真实值 
+            "server_from": rx_broker,
         }
+        if not execution["ok"]:
+            response_data["error"] = execution["error"]
 
         if reply_topic:
             self.mqtt_net.publish_broadcast(reply_topic, response_data)
