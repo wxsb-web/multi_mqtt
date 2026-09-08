@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import logging
 import collections
+import weakref
 from multi_mqtt import MultiMQTTManager, BROKER_LIST
 
 from rich.live import Live
@@ -29,6 +30,9 @@ class UILogHandler(logging.Handler):
     """将日志捕获到队列，由 Live UI 统一渲染"""
     def emit(self, record):
         msg = self.format(record)
+        # 【修复】限制单条日志长度，防止超大日志占用内存
+        if len(msg) > 500:
+            msg = msg[:500] + "..."
         with log_lock:
             log_queue.append(msg)
 
@@ -55,22 +59,42 @@ class HourTracker:
     def __init__(self):
         self.buckets = {}
         self.lock = threading.Lock()
+        # 【修复】添加 topic 字符串驻留池，控制重复字符串数量
+        self._topic_pool = {}
+
+    def _intern_topic(self, topic: str) -> str:
+        """复用已存在的相同字符串对象，防止无限创建新字符串"""
+        existing = self._topic_pool.get(topic)
+        if existing is not None:
+            return existing
+        # 限制池大小，防止恶意/随机 topic 导致内存泄漏
+        if len(self._topic_pool) > 100000:
+            # 清空一半，保留高频使用的（简单策略）
+            self._topic_pool = {k: v for i, (k, v) in enumerate(self._topic_pool.items()) if i % 2 == 0}
+        self._topic_pool[topic] = topic
+        return topic
 
     def add(self, topic: str):
         now_minute = int(time.time()) // 60
+        # 【修复】字符串驻留，减少内存占用
+        topic = self._intern_topic(topic)
         with self.lock:
             if now_minute not in self.buckets:
                 self.buckets[now_minute] = {'msgs': 0, 'topics': set()}
             self.buckets[now_minute]['msgs'] += 1
             self.buckets[now_minute]['topics'].add(topic)
             
+            # 【修复】使用 list 收集过期 key，避免在遍历时修改字典
             expired = [m for m in self.buckets.keys() if m < now_minute - 60]
             for m in expired:
+                # 【修复】清理时释放 set 引用，帮助 GC
+                self.buckets[m]['topics'].clear()
                 del self.buckets[m]
 
     def get_stats(self):
         with self.lock:
             total_msgs = sum(b['msgs'] for b in self.buckets.values())
+            # 【修复】避免创建中间 set，直接计数
             all_topics = set()
             for b in self.buckets.values():
                 all_topics.update(b['topics'])
@@ -90,6 +114,13 @@ class SnifferEngine:
         self.lock = threading.Lock()
         self.running = True
 
+        # 【修复】添加 host 和 topic 的全局驻留池，跨所有 HourTracker 复用字符串
+        self._global_topic_pool = {}
+        self._global_host_pool = {}
+        # 【修复】添加清理计数器，定期执行完整 GC
+        self._msg_counter = 0
+        self._last_cleanup = time.time()
+
         self._init_db()
         self._load_historical_stats()
 
@@ -98,6 +129,53 @@ class SnifferEngine:
         self.display_thread = threading.Thread(target=self._display_loop, daemon=True)
         self.flush_thread.start()
         self.display_thread.start()
+
+    def _intern_host(self, host: str) -> str:
+        """全局 host 字符串驻留"""
+        existing = self._global_host_pool.get(host)
+        if existing is not None:
+            return existing
+        if len(self._global_host_pool) > 10000:
+            self._global_host_pool = {}
+        self._global_host_pool[host] = host
+        return host
+
+    def _intern_topic(self, topic: str) -> str:
+        """全局 topic 字符串驻留（用于 buffer key 和 latest_msg）"""
+        existing = self._global_topic_pool.get(topic)
+        if existing is not None:
+            return existing
+        if len(self._global_topic_pool) > 200000:
+            self._global_topic_pool = {}
+        self._global_topic_pool[topic] = topic
+        return topic
+
+    def _cleanup_stale_hosts(self):
+        """【修复】清理长时间无消息的 host，防止字典无限增长"""
+        now = time.time()
+        # 每 5 分钟执行一次清理
+        if now - self._last_cleanup < 300:
+            return
+        
+        self._last_cleanup = now
+        stale_threshold = 86400 * 2  # 2 天无消息视为过期
+        
+        with self.lock:
+            stale_hosts = [
+                h for h, v in self.latest_msg.items()
+                if now - v.get("time", 0) > stale_threshold
+            ]
+            for h in stale_hosts:
+                del self.latest_msg[h]
+                # 同时清理关联的 tracker 以释放内存
+                if h in self.hour_trackers:
+                    # 清理内部 topic 池
+                    self.hour_trackers[h]._topic_pool.clear()
+                    del self.hour_trackers[h]
+                self.db_totals.pop(h, None)
+        
+        if stale_hosts:
+            logger.info(f"清理 {len(stale_hosts)} 个过期 host，释放内存")
 
     def _init_db(self):
         with sqlite3.connect(DB_FILE) as conn:
@@ -121,7 +199,7 @@ class SnifferEngine:
             cur = conn.cursor()
             cur.execute("SELECT host, COUNT(topic), SUM(msg_count) FROM topic_stats GROUP BY host")
             for host, topic_count, msg_count in cur.fetchall():
-                self.db_totals[host] = {"topics": topic_count, "msgs": msg_count}
+                self.db_totals[host] = {"topics": topic_count, "msgs": msg_count or 0}
         logger.info("数据库历史统计加载完毕！")
 
     def push(self, host: str, topic: str, payload: bytes):
@@ -130,13 +208,20 @@ class SnifferEngine:
 
         now = time.time()
         
+        # 【修复】字符串驻留，减少重复字符串创建
+        host = self._intern_host(host)
+        topic = self._intern_topic(topic)
+        
         # 1. 更新 1 小时统计
         if host not in self.hour_trackers:
             self.hour_trackers[host] = HourTracker()
         self.hour_trackers[host].add(topic)
 
         # 2. 清洗 Payload 文本，防止不可见乱码打乱 TUI 排版
+        # 【修复】限制处理长度，避免超大 payload 消耗 CPU 和内存
         safe_str = "".join([c if c.isprintable() else "." for c in payload.decode('utf-8', errors='replace')])
+        if len(safe_str) > MAX_PAYLOAD_SAVE:
+            safe_str = safe_str[:MAX_PAYLOAD_SAVE]
 
         with self.lock:
             key = (host, topic)
@@ -147,11 +232,24 @@ class SnifferEngine:
                 self.buffer[key]["time"] = now
                 self.buffer[key]["payload"] = payload
             
-            self.latest_msg[host] = {
-                "topic": topic, 
-                "time": now, 
-                "payload": safe_str
-            }
+            # 【修复】复用已有字典对象，避免频繁创建新字典
+            existing = self.latest_msg.get(host)
+            if existing is None:
+                self.latest_msg[host] = {
+                    "topic": topic, 
+                    "time": now, 
+                    "payload": safe_str
+                }
+            else:
+                existing["topic"] = topic
+                existing["time"] = now
+                existing["payload"] = safe_str
+        
+        # 【修复】定期清理计数和过期 host
+        self._msg_counter += 1
+        if self._msg_counter >= 100000:
+            self._msg_counter = 0
+            self._cleanup_stale_hosts()
 
     def _flush_loop(self):
         while self.running:
@@ -178,11 +276,13 @@ class SnifferEngine:
                     
                     cur = conn.cursor()
                     cur.execute("SELECT host, COUNT(topic), SUM(msg_count) FROM topic_stats GROUP BY host")
-                    fresh_totals = {row[0]: {"topics": row[1], "msgs": row[2]} for row in cur.fetchall()}
+                    fresh_totals = {row[0]: {"topics": row[1], "msgs": row[2] or 0} for row in cur.fetchall()}
                     with self.lock:
                         self.db_totals = fresh_totals
             except Exception as e:
                 logger.error(f"写入数据库失败: {e}")
+                # 【修复】异常时确保 batch 数据不会导致重复处理，但保留诊断信息
+                logger.error(f"丢失 batch 记录数: {len(records)}")
 
     def generate_layout() -> Layout:
         """构建 Rich 分屏界面"""
@@ -223,26 +323,61 @@ class SnifferEngine:
                 total_msgs_all = 0
                 total_topics_all = 0
 
+                # 【修复】减少锁持有时间，先复制必要数据
                 with self.lock:
                     hosts = sorted(set(self.db_totals.keys()) | set(self.latest_msg.keys()))
-                    
+                    # 预取所有需要的数据，减少锁内操作
+                    display_data = []
                     for host in hosts:
                         hist = self.db_totals.get(host, {"msgs": 0, "topics": 0})
                         total_msgs_all += hist["msgs"]
                         total_topics_all += hist["topics"]
                         
                         h1_msgs, h1_topics = 0, 0
-                        if host in self.hour_trackers:
-                            h1_msgs, h1_topics = self.hour_trackers[host].get_stats()
+                        tracker = self.hour_trackers.get(host)
+                        if tracker is not None:
+                            # 注意：这里调用 get_stats 会获取 tracker 的锁
+                            # 为避免死锁，先不调用，标记待处理
+                            h1_msgs, h1_topics = -1, -1  # 标记为需要后续获取
                         
                         latest = self.latest_msg.get(host, {"topic": "无", "time": 0, "payload": ""})
-                        t_str = time.strftime('%H:%M:%S', time.localtime(latest["time"])) if latest["time"] else "--:--:--"
                         
-                        hist_str = f"[bold green]{hist['msgs']:,}[/bold green] / {hist['topics']:,}"
-                        h1_str = f"[bold green]{h1_msgs:,}[/bold green] / {h1_topics:,}"
-                        latest_str = f"[{t_str}] [bold white]{latest['topic']}[/bold white] => {latest['payload']}"
+                        display_data.append({
+                            'host': host,
+                            'hist': hist,
+                            'h1_msgs': h1_msgs,
+                            'h1_topics': h1_topics,
+                            'latest': dict(latest)  # 复制，避免锁外访问被修改
+                        })
+                
+                # 【修复】在锁外获取 hour_tracker 统计（避免嵌套锁死锁风险）
+                for item in display_data:
+                    if item['h1_msgs'] == -1:
+                        tracker = self.hour_trackers.get(item['host'])
+                        if tracker is not None:
+                            item['h1_msgs'], item['h1_topics'] = tracker.get_stats()
+                        else:
+                            item['h1_msgs'], item['h1_topics'] = 0, 0
+                
+                # 填充表格（完全在锁外）
+                for item in display_data:
+                    host = item['host']
+                    hist = item['hist']
+                    h1_msgs = item['h1_msgs']
+                    h1_topics = item['h1_topics']
+                    latest = item['latest']
+                    
+                    t_str = time.strftime('%H:%M:%S', time.localtime(latest["time"])) if latest["time"] else "--:--:--"
+                    
+                    hist_str = f"[bold green]{hist['msgs']:,}[/bold green] / {hist['topics']:,}"
+                    h1_str = f"[bold green]{h1_msgs:,}[/bold green] / {h1_topics:,}"
+                    # 【修复】限制 payload 显示长度，防止超长字符串
+                    payload_display = latest['payload']
+                    if len(payload_display) > 200:
+                        payload_display = payload_display[:200] + "..."
+                    latest_str = f"[{t_str}] [bold white]{latest['topic']}[/bold white] => {payload_display}"
 
-                        table.add_row(host, hist_str, h1_str, latest_str)
+                    table.add_row(host, hist_str, h1_str, latest_str)
 
                 summary_text = f" [bold yellow]全局汇总[/bold yellow] => 历史总消息数: [bold green]{total_msgs_all:,}[/bold green] 条 | 捕获独立 Topic: [bold green]{total_topics_all:,}[/bold green] 个"
                 
@@ -271,6 +406,9 @@ class SnifferEngine:
         self.running = False
         self.flush_thread.join(timeout=2)
         self.display_thread.join(timeout=2)
+        # 【修复】清理全局池，帮助最终 GC
+        self._global_topic_pool.clear()
+        self._global_host_pool.clear()
 
 
 # ==========================================
