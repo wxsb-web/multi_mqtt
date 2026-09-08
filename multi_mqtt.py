@@ -131,8 +131,8 @@ class MultiMQTTManager:
                 data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
                 
                 # 去重判定：首胜丢弃逻辑
-                msg_id = data.get("msg_id") or data.get("req_id")
-                if msg_id and not self.dedup_cache.add_if_not_exists(msg_id):
+                req_id = data.get("req_id")
+                if req_id and not self.dedup_cache.add_if_not_exists(req_id):
                     return
 
                 if self.log_messages:

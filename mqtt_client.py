@@ -10,6 +10,9 @@ logger = logging.getLogger("Client")
 REQUEST_TOPIC = "sys/device/request"
 RESPONSE_TOPIC = "sys/device/response"
 
+_default_client = None
+_default_client_lock = threading.Lock()
+
 class MQTTClientNode:
     def __init__(self):
         # 实例化网络层管理器 (enable_crypto 默认为 False)
@@ -46,7 +49,6 @@ class MQTTClientNode:
         
         req_data = {
             "req_id": req_id,
-            "msg_id": req_id,
             "reply_topic": RESPONSE_TOPIC,
             "code": payload,
             "timestamp": start_time
@@ -76,6 +78,30 @@ class MQTTClientNode:
 
     def stop(self):
         self.mqtt_net.stop()
+
+
+def rpc(code: str, timeout: float = 60.0):
+    """Execute code through a lazily started shared MQTT client.
+
+    Returns the same response dictionary as ``MQTTClientNode.request``.
+    """
+    global _default_client
+    with _default_client_lock:
+        if _default_client is None:
+            _default_client = MQTTClientNode()
+            _default_client.start()
+        client = _default_client
+    return client.request(code, timeout=timeout)
+
+
+def stop():
+    """Stop the shared module-level MQTT client, if it was started."""
+    global _default_client
+    with _default_client_lock:
+        client = _default_client
+        _default_client = None
+    if client is not None:
+        client.stop()
 
 
 def run_shell(client):
