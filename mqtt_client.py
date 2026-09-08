@@ -83,15 +83,28 @@ def run_shell(client):
     """Run a small IPython-like multiline shell over MQTT."""
     try:
         prompt_toolkit = importlib.import_module("prompt_toolkit")
+        prompt_toolkit_key_binding = importlib.import_module("prompt_toolkit.key_binding")
         prompt_toolkit_lexers = importlib.import_module("prompt_toolkit.lexers")
         prompt_toolkit_styles = importlib.import_module("prompt_toolkit.styles")
         pygments_lexers = importlib.import_module("pygments.lexers")
 
+        key_bindings = prompt_toolkit_key_binding.KeyBindings()
+
+        @key_bindings.add("enter")
+        def accept_on_empty_line(event):
+            buffer = event.current_buffer
+            if buffer.document.current_line_before_cursor.strip():
+                buffer.insert_text("\n")
+            else:
+                buffer.validate_and_handle()
+
         session = prompt_toolkit.PromptSession(
             lexer=prompt_toolkit_lexers.PygmentsLexer(pygments_lexers.PythonLexer),
             style=prompt_toolkit_styles.Style.from_dict({"prompt": "ansicyan"}),
+            multiline=True,
+            key_bindings=key_bindings,
         )
-        prompt = lambda: session.prompt(">>> ", multiline=True)
+        prompt = lambda: session.prompt(">>> ")
     except ImportError:
         session = None
 
