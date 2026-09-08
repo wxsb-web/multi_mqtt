@@ -27,7 +27,7 @@ class MQTTServer:
             "echo": payload,
             "server_time": server_time,
             "server_from": rx_broker,  # 标注来自哪个公共服务器
-            "latency_send":round(server_time-data.get("timestamp")*1000, 2) 
+         #   "latency_send":round(server_time-data.get("timestamp")*1000, 2) # client server 服务器时间不同步，测量出不是真实值 
         }
 
         if reply_topic:

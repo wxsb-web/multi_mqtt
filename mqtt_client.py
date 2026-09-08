@@ -32,7 +32,7 @@ class MQTTClientNode:
                 req_ctx = self.pending_requests.pop(req_id)
                 
                 # 计算往返时延并注入回复字典
-                cost_ms = (time.time() - req_ctx['start_time']) * 1000
+                cost_ms = (time.perf_counter() - req_ctx['start_time']) * 1000
                 data["latency_ms"] = round(cost_ms, 2)
                 data["client_from"] = rx_broker
                 
@@ -41,17 +41,17 @@ class MQTTClientNode:
 
     def request(self, payload: str, timeout: float = 5.0):
         req_id = get_req_id()  # 生成 formatted req_id + hash
+        start_time = time.perf_counter()
         
         req_data = {
             "req_id": req_id,
             "msg_id": req_id,
             "reply_topic": RESPONSE_TOPIC,
             "payload": payload,
-            "timestamp": time.time()
+            "timestamp": start_time
         }
 
         event = threading.Event()
-        start_time = time.time()
         req_ctx = {"event": event, "start_time": start_time, "response": None}
         
         with self.lock:
