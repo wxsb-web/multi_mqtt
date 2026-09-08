@@ -17,12 +17,15 @@ logger = logging.getLogger("MultiMQTT")
 
 # 预设公共 MQTT Broker 列表
 BROKER_LIST = [
-    ("broker-cn.emqx.io", 1883),
-    ("test.mosquitto.org", 1883),
-    ("mqtt.loralab.org", 1883),
-    ("broker.mqtt.cool", 1883),
-    ("mqtt.tyckr.io", 1883),
-    ("public-mqtt-broker.bevywise.com", 1883),
+    ("broker.hivemq.com", 1883),               # RTT: 220.6 ms | 建连: 6386.8 ms (建连较慢，收发极快)
+    ("broker.mqtt-dashboard.com", 1883),        # RTT: 230.8 ms | 建连:  671.7 ms (综合体验佳)
+    ("broker-cn.emqx.io", 1883),                # RTT: 261.4 ms | 建连:  592.4 ms (国内推荐)
+    ("broker.emqx.io", 1883),                   # RTT: 279.0 ms | 建连:  662.9 ms
+    ("test.mosquitto.org", 1883),               # RTT: 381.2 ms | 建连:  510.4 ms
+    ("mqtt.tyckr.io", 1883),                    # RTT: 391.0 ms | 建连:  526.3 ms
+    ("broker.mqtt.cool", 1883),                 # RTT: 424.7 ms | 建连:  548.0 ms
+    ("mqtt.loralab.org", 1883),                 # RTT: 432.7 ms | 建连:  556.0 ms
+    ("public-mqtt-broker.bevywise.com", 1883),  # RTT: 506.9 ms | 建连:  754.2 ms
 ]
 
 
