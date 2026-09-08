@@ -1,8 +1,12 @@
 # multi_mqtt.py
 import json
-import uuid
 import time
+import os
+import uuid
+import hashlib
+import random
 import logging
+import base64
 import threading
 from collections import OrderedDict
 from paho.mqtt import client as mqtt_client
@@ -11,7 +15,7 @@ from paho.mqtt.enums import CallbackAPIVersion
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MultiMQTT")
 
-# 可用的免费公共 Broker 节点
+# 预设公共 MQTT Broker 列表
 BROKER_LIST = [
     ("broker-cn.emqx.io", 1883),
     ("test.mosquitto.org", 1883),
@@ -20,109 +24,141 @@ BROKER_LIST = [
     ("public-mqtt-broker.bevywise.com", 1883),
 ]
 
+AES_KEY = b"12345678901234567890123456789012"
+
+def stime():
+    """可读毫秒级时间戳"""
+    ft = time.time()
+    return time.strftime('%Y-%m-%d__%H.%M.%S', time.localtime(ft)) + '__.' + f"{ft:.3f}".split('.')[1]
+
+def get_req_id():
+    """生成格式：req_YYYY-MM-DD__HH.MM.SS__.毫秒_随机Hash"""
+    hash_str = hashlib.md5(f"{time.time()}_{random.random()}".encode()).hexdigest()[:6]
+    return f"req_{stime()}_{hash_str}"
+
+def process_cipher(data, decrypt=False, enabled=False, key=AES_KEY):
+    """加解密浓缩函数：默认关闭 (enabled=False)。开启时使用 AES-GCM，关闭时仅转换 JSON"""
+    if not enabled:
+        return json.loads(data) if decrypt else json.dumps(data)
+    
+    # 动态导入，关闭时无需依赖 cryptography 库
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    aesgcm = AESGCM(key)
+    if decrypt:
+        raw = base64.b64decode(data.encode('utf-8'))
+        return json.loads(aesgcm.decrypt(raw[:12], raw[12:], None).decode('utf-8'))
+    else:
+        nonce = os.urandom(12)
+        plaintext = json.dumps(data).encode('utf-8')
+        ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+        return base64.b64encode(nonce + ciphertext).decode('utf-8')
+
 class TTLCache:
-    """轻量级内存 TTL 缓存去重器（无第三方依赖，省电高效）"""
-    def __init__(self, ttl_seconds=60):
+    """轻量级内存去重缓存"""
+    def __init__(self, ttl_seconds=30):
         self.ttl = ttl_seconds
         self.cache = OrderedDict()
         self.lock = threading.Lock()
 
     def add_if_not_exists(self, key: str) -> bool:
-        """如果 Key 不存在则添加并返回 True；如果已存在则返回 False"""
         now = time.time()
         with self.lock:
-            self._cleanup(now)
+            while self.cache and next(iter(self.cache.values())) < now - self.ttl:
+                self.cache.popitem(last=False)
             if key in self.cache:
                 return False
             self.cache[key] = now
             return True
 
-    def _cleanup(self, now: float):
-        while self.cache and next(iter(self.cache.values())) < now - self.ttl:
-            self.cache.popitem(last=False)
-
 class MultiMQTTManager:
-    def __init__(self, brokers=BROKER_LIST, log_messages=False):
+    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False):
         self.brokers = brokers
-        self.clients = []
+        self.clients = {}
         self.log_messages = log_messages
+        self.enable_crypto = enable_crypto  # 默认关闭加密
         self.dedup_cache = TTLCache(ttl_seconds=30)
         self.message_callback = None
         self.subscribed_topics = set()
         self.lock = threading.Lock()
 
     def set_on_message(self, callback):
-        """设置上层消息接收回调，回调签名: fn(topic, payload_dict)"""
+        """设置上层回调，签名: fn(topic, data_dict, rx_broker)"""
         self.message_callback = callback
 
     def start(self):
-        """同时启动与所有 Broker 的连接"""
+        """启动与所有 Broker 的连接并启用后台自动断线重连"""
         for host, port in self.brokers:
-            client_id = f"multi_mqtt_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
+            client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
             client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
             
-            # 绑定回调
-            client.on_connect = self._make_on_connect(host)
-            client.on_message = self._on_message_wrapper
+            # 开启自动重连退避策略 (1~60秒)
+            client.reconnect_delay_set(min_delay=1, max_delay=60)
             
+            client.on_connect = self._make_on_connect(host)
+            client.on_disconnect = self._make_on_disconnect(host)
+            client.on_message = self._make_on_message(host)
+
             try:
                 client.connect_async(host, port, keepalive=30)
                 client.loop_start()
-                self.clients.append(client)
-                logger.info(f"已发起连接异步任务 -> {host}:{port}")
+                self.clients[host] = client
+                logger.info(f"开启后台连接任务 -> {host}:{port}")
             except Exception as e:
                 logger.error(f"连接初始化失败 [{host}]: {e}")
 
     def _make_on_connect(self, host):
         def on_connect(client, userdata, flags, rc, properties=None):
             if rc == 0:
-                logger.info(f"🟢 [已连接] Broker: {host}")
+                logger.info(f"✅ [已连接] Broker: {host}")
                 with self.lock:
                     for topic in self.subscribed_topics:
                         client.subscribe(topic)
             else:
-                logger.warning(f"🔴 [连接失败] Broker: {host}, rc={rc}")
+                logger.warning(f"❌ [连接失败] Broker: {host}, rc={rc}")
         return on_connect
 
-    def _on_message_wrapper(self, client, userdata, msg):
-        try:
-            payload_str = msg.payload.decode('utf-8')
-            data = json.loads(payload_str)
-            msg_id = data.get("msg_id")
+    def _make_on_disconnect(self, host):
+        def on_disconnect(client, userdata, flags, rc, properties=None):
+            if rc != 0:
+                logger.warning(f"⚠️ [意外断开] Broker: {host} (rc={rc})，自动尝试重连...")
+        return on_disconnect
 
-            # 网络首胜去重核心判断
-            if msg_id:
-                if not self.dedup_cache.add_if_not_exists(msg_id):
-                    # 重复消息，直接丢弃（省去后续解析和处理开销）
+    def _make_on_message(self, host):
+        def on_message(client, userdata, msg):
+            try:
+                raw_payload = msg.payload.decode('utf-8')
+                data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
+                
+                # 去重判定：首胜丢弃逻辑
+                msg_id = data.get("msg_id") or data.get("req_id")
+                if msg_id and not self.dedup_cache.add_if_not_exists(msg_id):
                     return
 
-            if self.log_messages:
-                logger.info(f"📩 收到首发消息 [{msg.topic}]: {payload_str[:100]}")
+                if self.log_messages:
+                    logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}")
 
-            if self.message_callback:
-                self.message_callback(msg.topic, data)
-        except Exception as e:
-            # 非 JSON 格式或解析失败处理
-            pass
+                if self.message_callback:
+                    self.message_callback(msg.topic, data, host)
+            except Exception:
+                pass
+        return on_message
 
     def subscribe(self, topic: str):
-        """订阅所有 Broker 上的指定 Topic"""
         with self.lock:
             self.subscribed_topics.add(topic)
-            for c in self.clients:
+            for host, c in self.clients.items():
                 if c.is_connected():
                     c.subscribe(topic)
 
     def publish_broadcast(self, topic: str, payload_dict: dict):
-        """向所有 Broker 广播同一条消息"""
-        payload_str = json.dumps(payload_dict)
-        for c in self.clients:
+        """广播传输消息"""
+        payload_str = process_cipher(payload_dict, decrypt=False, enabled=self.enable_crypto)
+        for host, c in self.clients.items():
             if c.is_connected():
                 c.publish(topic, payload_str, qos=0)
 
     def stop(self):
-        for c in self.clients:
+        for c in self.clients.values():
             c.loop_stop()
             c.disconnect()
         logger.info("所有 MQTT 连接已安全关闭")
-        

@@ -1,9 +1,8 @@
 # client.py
 import time
-import uuid
 import logging
 import threading
-from multi_mqtt import MultiMQTTManager
+from multi_mqtt import MultiMQTTManager, get_req_id
 
 logger = logging.getLogger("Client")
 
@@ -12,6 +11,7 @@ RESPONSE_TOPIC = "sys/device/response"
 
 class MQTTClientNode:
     def __init__(self):
+        # 实例化网络层管理器 (enable_crypto 默认为 False)
         self.mqtt_net = MultiMQTTManager(log_messages=False)
         self.mqtt_net.set_on_message(self._on_message)
         self.pending_requests = {}
@@ -20,55 +20,57 @@ class MQTTClientNode:
     def start(self):
         self.mqtt_net.start()
         time.sleep(2)
-        # 订阅客户端回复 Topic
         self.mqtt_net.subscribe(RESPONSE_TOPIC)
 
-    def _on_message(self, topic, data):
+    def _on_message(self, topic, data, rx_broker):
         req_id = data.get("req_id")
         if not req_id:
             return
 
         with self.lock:
-            # 找到正在等待的请求事件
             if req_id in self.pending_requests:
                 req_ctx = self.pending_requests.pop(req_id)
+                
+                # 计算往返时延并注入回复字典
+                cost_ms = (time.time() - req_ctx['start_time']) * 1000
+                data["latency_ms"] = round(cost_ms, 2)
+                data["client_from"] = rx_broker
+                
                 req_ctx['response'] = data
-                # 激活线程锁，解锁阻塞的 client.request() 调用
-                req_ctx['event'].set()
+                req_ctx['event'].set()  # 解锁请求阻塞
 
     def request(self, payload: str, timeout: float = 5.0):
-        """向服务端发起请求并等待首个最快响应 (类似 HTTP GET/POST)"""
-        msg_id = f"req_{int(time.time()*1000)}_{uuid.uuid4().hex[:6]}"
+        req_id = get_req_id()  # 生成 formatted req_id + hash
         
         req_data = {
-            "msg_id": msg_id,
+            "req_id": req_id,
+            "msg_id": req_id,
             "reply_topic": RESPONSE_TOPIC,
             "payload": payload,
             "timestamp": time.time()
         }
 
-        # 注册等待句柄
         event = threading.Event()
-        req_ctx = {"event": event, "response": None}
+        start_time = time.time()
+        req_ctx = {"event": event, "start_time": start_time, "response": None}
         
         with self.lock:
-            self.pending_requests[msg_id] = req_ctx
+            self.pending_requests[req_id] = req_ctx
 
-        # 并发向多 Broker 广播发送请求
-        start_t = time.time()
+        # 并发投递广播
         self.mqtt_net.publish_broadcast(REQUEST_TOPIC, req_data)
 
-        # 阻塞等待最快返回的结果
+        # 等待最快节点返回
         is_success = event.wait(timeout=timeout)
-        elapsed = (time.time() - start_t) * 1000
 
         if is_success:
-            logger.info(f"✨ [请求成功] 耗时: {elapsed:.2f}ms")
-            return req_ctx['response']
+            resp = req_ctx['response']
+            logger.info(f"✨ [请求成功] 耗时: {resp['latency_ms']:.2f}ms")
+            return resp
         else:
             with self.lock:
-                self.pending_requests.pop(msg_id, None)
-            logger.error(f"❌ [请求超时] msg_id={msg_id}")
+                self.pending_requests.pop(req_id, None)
+            logger.error(f"❌ [请求超时] req_id={req_id}")
             return None
 
     def stop(self):
@@ -78,11 +80,10 @@ if __name__ == "__main__":
     client = MQTTClientNode()
     client.start()
 
-    # 测试多次请求
     for i in range(1, 4):
         msg = f"Hello Multi-Broker MQTT Message #{i}"
         logger.info(f"发送消息: {msg}")
-        resp = client.request(payload=msg, timeout=5.0)
+        resp = client.request(payload=msg, timeout=60)
         print(f"收到回应 -> {resp}\n")
         time.sleep(2)
 
