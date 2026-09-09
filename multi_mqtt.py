@@ -2,7 +2,7 @@
 import importlib.util,os,subprocess,sys
 def ensure_dependencies():
     packages = {
-        "paho.mqtt": "paho-mqtt",
+        "paho": "paho-mqtt",
     }
     missing = [package for module, package in packages.items()
                if importlib.util.find_spec(module) is None]
