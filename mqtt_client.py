@@ -1,4 +1,4 @@
-# client.py
+#!/usr/bin/env python3
 import time,threading,os
 import logging
 import codeop
