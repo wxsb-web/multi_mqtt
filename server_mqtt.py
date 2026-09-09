@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+from multi_mqtt import MultiMQTTManager, stime
 import time
 import logging
-from multi_mqtt import MultiMQTTManager, stime
 from rpc_executor import PythonExecutor, format_result
 
 logger = logging.getLogger("Server")
