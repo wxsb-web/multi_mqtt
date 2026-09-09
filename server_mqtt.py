@@ -52,5 +52,20 @@ class MQTTServer:
             self.mqtt_net.stop()
 
 if __name__ == "__main__":
+    import argparse,server_http
+    parser = argparse.ArgumentParser(description='mqtt http rpc')
+    parser.add_argument('--port', type=int, default=1133)
+    parser.add_argument('--host', default='0.0.0.0')
+    args = parser.parse_args()
+    hs=server_http.start_rpc_server(
+        port=args.port,
+        ip=args.host,
+        globals=globals(),
+        locals=locals(),
+        # websocket_handler=editor.websocket,
+        # websocket_path='/ws',
+        # redirect_root='/preview_html(p)',
+    )
     server = MQTTServer()
+    print(hs,server)
     server.start()
