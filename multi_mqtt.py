@@ -57,6 +57,7 @@ BROKER_LIST = [
     ("broker.mqtt.cool", 1883),                 # RTT: 424.7 ms | 建连:  548.0 ms
     ("mqtt.loralab.org", 1883),                 # RTT: 432.7 ms | 建连:  556.0 ms
     ("public-mqtt-broker.bevywise.com", 1883),  # RTT: 506.9 ms | 建连:  754.2 ms
+    ("mqtt.touchsocket.net", 1883),
 ]
 
 '''
