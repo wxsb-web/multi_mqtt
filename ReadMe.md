@@ -1,3 +1,6 @@
+如果两个服务端 ./server_mqtt.py  同时运行，  client 只会显示最先到达的那个
+
+
 降低 CPU 与耗电 (Low-Resource & Power Efficiency):
 
 去磁盘 IO：丢弃了频繁写 SQLite 的操作，换用内存 TTLCache 实现 O(1) 时间复杂度的消息查重，显著降低 CPU 负载与磁盘读写耗电。
