@@ -30,7 +30,7 @@ class MQTTServer:
             "ok": execution["ok"],
             "server_time": server_time,
             "server_from": rx_broker,
-#"latency_send":round(server_time-data.get("timestamp")*1000, 2) # client server 时间不同步，测量出不是真实值 
+#"latency_send":round(server_time-data.get("timestamp")*1000, 2) # client server 时间不同步，测量出不是真实值
 
         }
         if not execution["ok"]:

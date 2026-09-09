@@ -207,5 +207,5 @@ Out[208]:
  'server_from': 'public-mqtt-broker.bevywise.com',
  'latency_ms': 359.89,
  'client_from': 'mqtt.tyckr.io'}
- 
+
 '''

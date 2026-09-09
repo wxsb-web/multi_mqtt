@@ -44,7 +44,7 @@ def process_cipher(data, decrypt=False, enabled=False, key=AES_KEY):
     """加密 解密 浓缩函数：默认关闭 (enabled=False)。开启时使用 AES-GCM，关闭时仅转换 JSON"""
     if not enabled:
         return json.loads(data) if decrypt else json.dumps(data)
-    
+
     # 动态导入，关闭时无需依赖 cryptography 库
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     aesgcm = AESGCM(key)
@@ -94,10 +94,10 @@ class MultiMQTTManager:
         for host, port in self.brokers:
             client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
             client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
-            
+
             # 开启自动重连退避策略 (1~60秒)
             client.reconnect_delay_set(min_delay=1, max_delay=60)
-            
+
             client.on_connect = self._make_on_connect(host)
             client.on_disconnect = self._make_on_disconnect(host)
             client.on_message = self._make_on_message(host)
@@ -132,7 +132,7 @@ class MultiMQTTManager:
             try:
                 raw_payload = msg.payload.decode('utf-8')
                 data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
-                
+
                 # 去重判定：首胜丢弃逻辑
                 req_id = data.get("req_id")
                 if req_id and not self.dedup_cache.add_if_not_exists(req_id):

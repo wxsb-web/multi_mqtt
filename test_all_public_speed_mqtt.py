@@ -26,7 +26,7 @@ BROKER_LIST = [
 def test_single_broker(host, port, name, timeout=3.0):
     client_id = f"bench_{int(time.time())}_{uuid.uuid4().hex[:4]}"
     test_topic = f"sys/bench/{client_id}"
-    
+
     res = {
         "name": name,
         "host": host,
@@ -36,7 +36,7 @@ def test_single_broker(host, port, name, timeout=3.0):
         "rtt_ms": None,
         "error": ""
     }
-    
+
     recv_event = threading.Event()
     t_send = [0.0]
     t_recv = [0.0]
@@ -58,20 +58,20 @@ def test_single_broker(host, port, name, timeout=3.0):
         t0 = time.perf_counter()
         client.connect(host, port, keepalive=10)
         client.loop_start()
-        
+
         start_wait = time.time()
         while not client.is_connected():
             if time.time() - start_wait > timeout:
                 raise TimeoutError("连接超时")
             time.sleep(0.02)
-            
+
         t1 = time.perf_counter()
         res["conn_ms"] = round((t1 - t0) * 1000, 1)
 
         # 2. 测量消息往返延时 (RTT)
         client.subscribe(test_topic, qos=0)
         time.sleep(0.1)  # 等待订阅确认完成
-        
+
         t_send[0] = time.perf_counter()
         client.publish(test_topic, "ping", qos=0)
 
@@ -96,11 +96,11 @@ def test_single_broker(host, port, name, timeout=3.0):
 def run_benchmark():
     print("🚀 开始并发测试所有公开 MQTT 服务器...\n")
     results = []
-    
+
     # 线程池并发测试所有 Broker
     with ThreadPoolExecutor(max_workers=len(BROKER_LIST)) as executor:
         futures = [
-            executor.submit(test_single_broker, host, port, name) 
+            executor.submit(test_single_broker, host, port, name)
             for host, port, name in BROKER_LIST
         ]
         for future in as_completed(futures):

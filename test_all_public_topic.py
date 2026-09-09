@@ -83,7 +83,7 @@ class HourTracker:
                 self.buckets[now_minute] = {'msgs': 0, 'topics': set()}
             self.buckets[now_minute]['msgs'] += 1
             self.buckets[now_minute]['topics'].add(topic)
-            
+
             # 【修复】使用 list 收集过期 key，避免在遍历时修改字典
             expired = [m for m in self.buckets.keys() if m < now_minute - 60]
             for m in expired:
@@ -110,7 +110,7 @@ class SnifferEngine:
         self.db_totals = {}     # host -> {"msgs": 0, "topics": 0}
         self.hour_trackers = {} # host -> HourTracker
         self.latest_msg = {}    # host -> {"topic": str, "payload": str, "time": float}
-        
+
         self.lock = threading.Lock()
         self.running = True
 
@@ -156,10 +156,10 @@ class SnifferEngine:
         # 每 5 分钟执行一次清理
         if now - self._last_cleanup < 300:
             return
-        
+
         self._last_cleanup = now
         stale_threshold = 86400 * 2  # 2 天无消息视为过期
-        
+
         with self.lock:
             stale_hosts = [
                 h for h, v in self.latest_msg.items()
@@ -173,7 +173,7 @@ class SnifferEngine:
                     self.hour_trackers[h]._topic_pool.clear()
                     del self.hour_trackers[h]
                 self.db_totals.pop(h, None)
-        
+
         if stale_hosts:
             logger.info(f"清理 {len(stale_hosts)} 个过期 host，释放内存")
 
@@ -207,11 +207,11 @@ class SnifferEngine:
             payload = payload[:MAX_PAYLOAD_SAVE]
 
         now = time.time()
-        
+
         # 【修复】字符串驻留，减少重复字符串创建
         host = self._intern_host(host)
         topic = self._intern_topic(topic)
-        
+
         # 1. 更新 1 小时统计
         if host not in self.hour_trackers:
             self.hour_trackers[host] = HourTracker()
@@ -231,20 +231,20 @@ class SnifferEngine:
                 self.buffer[key]["count"] += 1
                 self.buffer[key]["time"] = now
                 self.buffer[key]["payload"] = payload
-            
+
             # 【修复】复用已有字典对象，避免频繁创建新字典
             existing = self.latest_msg.get(host)
             if existing is None:
                 self.latest_msg[host] = {
-                    "topic": topic, 
-                    "time": now, 
+                    "topic": topic,
+                    "time": now,
                     "payload": safe_str
                 }
             else:
                 existing["topic"] = topic
                 existing["time"] = now
                 existing["payload"] = safe_str
-        
+
         # 【修复】定期清理计数和过期 host
         self._msg_counter += 1
         if self._msg_counter >= 100000:
@@ -273,7 +273,7 @@ class SnifferEngine:
                             last_payload = excluded.last_payload
                     """, records)
                     conn.commit()
-                    
+
                     cur = conn.cursor()
                     cur.execute("SELECT host, COUNT(topic), SUM(msg_count) FROM topic_stats GROUP BY host")
                     fresh_totals = {row[0]: {"topics": row[1], "msgs": row[2] or 0} for row in cur.fetchall()}
@@ -296,7 +296,7 @@ class SnifferEngine:
 
     def _display_loop(self):
         console = Console()
-        
+
         # 使用 Rich Live 机制接管屏幕，自适应分辨率，防闪烁、防排版错乱
         with Live(refresh_per_second=2, screen=True, console=console) as live:
             while self.running:
@@ -332,16 +332,16 @@ class SnifferEngine:
                         hist = self.db_totals.get(host, {"msgs": 0, "topics": 0})
                         total_msgs_all += hist["msgs"]
                         total_topics_all += hist["topics"]
-                        
+
                         h1_msgs, h1_topics = 0, 0
                         tracker = self.hour_trackers.get(host)
                         if tracker is not None:
                             # 注意：这里调用 get_stats 会获取 tracker 的锁
                             # 为避免死锁，先不调用，标记待处理
                             h1_msgs, h1_topics = -1, -1  # 标记为需要后续获取
-                        
+
                         latest = self.latest_msg.get(host, {"topic": "无", "time": 0, "payload": ""})
-                        
+
                         display_data.append({
                             'host': host,
                             'hist': hist,
@@ -349,7 +349,7 @@ class SnifferEngine:
                             'h1_topics': h1_topics,
                             'latest': dict(latest)  # 复制，避免锁外访问被修改
                         })
-                
+
                 # 【修复】在锁外获取 hour_tracker 统计（避免嵌套锁死锁风险）
                 for item in display_data:
                     if item['h1_msgs'] == -1:
@@ -358,7 +358,7 @@ class SnifferEngine:
                             item['h1_msgs'], item['h1_topics'] = tracker.get_stats()
                         else:
                             item['h1_msgs'], item['h1_topics'] = 0, 0
-                
+
                 # 填充表格（完全在锁外）
                 for item in display_data:
                     host = item['host']
@@ -366,9 +366,9 @@ class SnifferEngine:
                     h1_msgs = item['h1_msgs']
                     h1_topics = item['h1_topics']
                     latest = item['latest']
-                    
+
                     t_str = time.strftime('%H:%M:%S', time.localtime(latest["time"])) if latest["time"] else "--:--:--"
-                    
+
                     hist_str = f"[bold green]{hist['msgs']:,}[/bold green] / {hist['topics']:,}"
                     h1_str = f"[bold green]{h1_msgs:,}[/bold green] / {h1_topics:,}"
                     # 【修复】限制 payload 显示长度，防止超长字符串
@@ -380,12 +380,12 @@ class SnifferEngine:
                     table.add_row(host, hist_str, h1_str, latest_str)
 
                 summary_text = f" [bold yellow]全局汇总[/bold yellow] => 历史总消息数: [bold green]{total_msgs_all:,}[/bold green] 条 | 捕获独立 Topic: [bold green]{total_topics_all:,}[/bold green] 个"
-                
+
                 # 将表格与汇总打包成主面板
                 main_group = Panel(
-                    table, 
-                    title=summary_text, 
-                    title_align="left", 
+                    table,
+                    title=summary_text,
+                    title_align="left",
                     border_style="green"
                 )
                 layout["main"].update(main_group)
