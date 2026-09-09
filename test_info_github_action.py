@@ -150,12 +150,12 @@ r={
     'is_docker':is_docker,
     'user':current_user,
     'public_ip':pub_ip,
-    'local_ip':lan_ip,
+    'local_ip':lan_ip,ient_mqtt
     'env':env
 }
 '''
-import mqtt_client
-res = mqtt_client.rpc(code)
+import client_mqtt
+res = client_mqtt.rpc(code)
 print(res['r'])
 res
 #mqtt
