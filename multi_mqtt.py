@@ -48,16 +48,18 @@ logger = logging.getLogger("MultiMQTT")
 
 # 预设公共 MQTT Broker 列表
 BROKER_LIST = [
-    ("broker.hivemq.com", 1883),               # RTT: 220.6 ms | 建连: 6386.8 ms (建连较慢，收发极快)
-    ("broker.mqtt-dashboard.com", 1883),        # RTT: 230.8 ms | 建连:  671.7 ms (综合体验佳)
-    ("broker-cn.emqx.io", 1883),                # RTT: 261.4 ms | 建连:  592.4 ms (国内推荐)
-    ("broker.emqx.io", 1883),                   # RTT: 279.0 ms | 建连:  662.9 ms
-    ("test.mosquitto.org", 1883),               # RTT: 381.2 ms | 建连:  510.4 ms
-    ("mqtt.tyckr.io", 1883),                    # RTT: 391.0 ms | 建连:  526.3 ms
-    ("broker.mqtt.cool", 1883),                 # RTT: 424.7 ms | 建连:  548.0 ms
-    ("mqtt.loralab.org", 1883),                 # RTT: 432.7 ms | 建连:  556.0 ms
-    ("public-mqtt-broker.bevywise.com", 1883),  # RTT: 506.9 ms | 建连:  754.2 ms
-    ("mqtt.touchsocket.net", 1883),
+    ("mqtt.touchsocket.net", 1883),             # RTT:  29.5 ms | 建连:  293.4 ms (b 视频)
+    ("broker.codenow.cn", 1883),                # RTT:  31.4 ms | 建连:  110.1 ms (CodeNow 国内公共MQTT)
+    ("broker.emqx.io", 1883),                   # RTT: 282.9 ms | 建连:  620.4 ms (EMQX 国际)
+    ("mqtt.loralab.org", 1883),                 # RTT: 349.0 ms | 建连:  524.4 ms (LoRaLab)
+    ("test.mosquitto.org", 1883),               # RTT: 398.4 ms | 建连:  586.0 ms (Mosquitto 官方)
+    ("broker-cn.emqx.io", 1883),                # RTT: 407.3 ms | 建连:  751.3 ms (EMQX 中国)
+    ("broker.hivemq.com", 1883),                # RTT: 301.0 ms | 建连:12830.1 ms (HiveMQ 官方，建连极慢，收发快)
+    ("broker.mqtt-dashboard.com", 1883),        # RTT: 307.1 ms | 建连:  465.6 ms (HiveMQ Dashboard，综合体验佳)
+    ("broker.mqtt.cool", 1883),                 # RTT: 425.4 ms | 建连:  594.8 ms (MQTT.Cool)
+    ("mqtt.iotbhai.io", 1883),                  # RTT: 429.3 ms | 建连:  597.7 ms (IoTbhai)
+    ("mqtt.tyckr.io", 1883),                    # RTT: 436.0 ms | 建连:  596.2 ms (Tyckr)
+    ("public-mqtt-broker.bevywise.com", 1883),  # RTT: 451.3 ms | 建连:  575.9 ms (Bevywise)
 ]
 
 '''

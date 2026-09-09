@@ -19,7 +19,8 @@ BROKER_LIST = [
     ("mqtt.iotbhai.io", 1883, "IoTbhai"),
     ("broker.codenow.cn", 1883, "CodeNow 国内公共MQTT"),
     # 新增，注意端口18831
-    ("mq.tongxinmao.com", 18831, "同心猫 MQTT"),
+    # ("mq.tongxinmao.com", 1883, "同心猫 MQTT 18831 也无法连接"),
+    ("mqtt.touchsocket.net", 1883,'b 视频'),  #好像又可以了 国内最快  这个不能正确转发消息，显示连接成功但是 没有反应
 ]
 
 
