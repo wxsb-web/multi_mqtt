@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import time,threading,os
+import time, threading, os
 import logging
 import codeop
 import importlib
@@ -137,8 +137,10 @@ def run_shell(client):
     while True:
         try:
             code = prompt() if session else _fallback_code_input()
-        except (EOFError, KeyboardInterrupt):
-            print('ctrl+c') # 我按 ctrl+d 退出，怎么也是走这个路径?
+        except KeyboardInterrupt:
+            print("\nKeyboardInterrupt (使用 Ctrl-D 或 exit() 退出)")
+            continue
+        except EOFError:
             os._exit(0)
             break
         if code.strip() in {"exit()", "quit()"}:

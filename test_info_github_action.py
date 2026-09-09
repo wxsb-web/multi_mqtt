@@ -150,7 +150,7 @@ r={
     'is_docker':is_docker,
     'user':current_user,
     'public_ip':pub_ip,
-    'local_ip':lan_ip,ient_mqtt
+    'local_ip':lan_ip,
     'env':env
 }
 '''
