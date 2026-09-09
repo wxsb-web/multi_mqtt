@@ -57,7 +57,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=1133)
     parser.add_argument('--host', default='0.0.0.0')
     args = parser.parse_args()
-    hs=server_http.start_rpc_server(
+    ghs=server_http.start_rpc_server(
         port=args.port,
         ip=args.host,
         globals=globals(),
@@ -66,6 +66,6 @@ if __name__ == "__main__":
         # websocket_path='/ws',
         # redirect_root='/preview_html(p)',
     )
-    server = MQTTServer()
-    print(hs,server)
-    server.start()
+    gms = MQTTServer()
+    print(ghs,gms)
+    gms.start()
