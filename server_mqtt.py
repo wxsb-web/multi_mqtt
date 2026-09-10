@@ -10,7 +10,8 @@ REQUEST_TOPIC = "sys/device/request"
 class MQTTServer:
     def __init__(self):
         # 实例化网络层管理器 (enable_crypto 默认为 False)
-        self.mqtt_net = MultiMQTTManager(log_messages=False)
+        bpub=b'ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBER9c5vu215n+5gv1YjGdm78Nf99wpfqw1fIT8nXib2FLUglq4NBMe7hLp2VOkqv9z00m5Wn+uUADH4zyXLiWzI='
+        self.mqtt_net = MultiMQTTManager(log_messages=False,server_public_key_bytes=bpub)
         self.mqtt_net.set_on_message(self.handle_message)
         self.executor = PythonExecutor()
 
@@ -66,6 +67,7 @@ if __name__ == "__main__":
         # websocket_path='/ws',
         # redirect_root='/preview_html(p)',
     )
+    
     gms = MQTTServer()
     print(ghs,gms)
     gms.start()

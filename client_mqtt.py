@@ -43,7 +43,7 @@ class MQTTClientNode:
                 req_ctx['response'] = data
                 req_ctx['event'].set()  # 解锁请求阻塞
 
-    def request(self, payload: str, timeout: float = 5.0):
+    def request(self, payload: str, timeout: float = 5.0,client_private_key_bytes=None):
         req_id = get_req_id()  # 生成 formatted req_id + hash
         start_time = time.perf_counter()
 
@@ -61,7 +61,7 @@ class MQTTClientNode:
             self.pending_requests[req_id] = req_ctx
 
         # 并发投递广播
-        self.mqtt_net.publish_broadcast(REQUEST_TOPIC, req_data)
+        self.mqtt_net.publish_broadcast(REQUEST_TOPIC, req_data,client_private_key_bytes=client_private_key_bytes)
 
         # 等待最快节点返回
         is_success = event.wait(timeout=timeout)
@@ -80,7 +80,7 @@ class MQTTClientNode:
         self.mqtt_net.stop()
 
 
-def rpc(code: str, timeout: float = 60.0):
+def rpc(code: str, timeout: float = 60.0,client_private_key_bytes=None):
     """Execute code through a lazily started shared MQTT client.
 
     Returns the same response dictionary as ``MQTTClientNode.request``.
@@ -91,7 +91,7 @@ def rpc(code: str, timeout: float = 60.0):
             _default_client = MQTTClientNode()
             _default_client.start()
         client = _default_client
-    return client.request(code, timeout=timeout)
+    return client.request(code, timeout=timeout,client_private_key_bytes=client_private_key_bytes)
 
 
 def stop():

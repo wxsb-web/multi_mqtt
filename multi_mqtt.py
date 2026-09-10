@@ -128,6 +128,95 @@ class TTLCache:
             self.cache[key] = now
             return True
 
+def get_standard_pem_bytes(key_input) -> bytes:
+    """
+    [新增组件] 统一私钥解析：支持 整数secexp、文件路径、OpenSSH格式、标准PEM格式(bytes/str)
+    最终统一返回 ecdsa 库直接兼容的标准 PEM (SEC1) 字节流。
+    """
+    if not key_input:
+        return None
+        
+    # 1. 整数或纯数字字符串当作 secexp 处理
+    if isinstance(key_input, int) or (isinstance(key_input, str) and key_input.isdigit()):
+        secexp = int(key_input)
+        return ecdsa.SigningKey.from_secret_exponent(secexp=secexp, curve=ecdsa.NIST256p).to_pem()
+        
+    # 2. 如果是文件路径，读取内容；否则转为 bytes
+    raw_bytes = b""
+    if isinstance(key_input, str):
+        if os.path.isfile(key_input):
+            with open(key_input, "rb") as f:
+                raw_bytes = f.read()
+        else:
+            raw_bytes = key_input.encode('utf-8')
+    elif isinstance(key_input, bytes):
+        raw_bytes = key_input
+        
+    if not raw_bytes:
+        raise ValueError("无法解析传入的 client_private_key_bytes")
+
+    # 3. 检查是否已经是原生 ecdsa 支持的格式
+    if b"-----BEGIN EC PRIVATE KEY-----" in raw_bytes or b"-----BEGIN PRIVATE KEY-----" in raw_bytes:
+        return raw_bytes
+        
+    # 4. 如果是 OpenSSH 格式，动态借助 cryptography 转换为 ecdsa 库兼容的标准格式
+    if b"-----BEGIN OPENSSH PRIVATE KEY-----" in raw_bytes:
+        try:
+            from cryptography.hazmat.primitives import serialization
+        except ImportError:
+            raise ImportError("解析 OpenSSH 格式私钥需要 cryptography 库，请先安装。")
+            
+        try:
+            priv_key = serialization.load_ssh_private_key(raw_bytes, password=None)
+        except ValueError:
+            priv_key = serialization.load_pem_private_key(raw_bytes, password=None)
+            
+        return priv_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL, # 强制转为兼容性极佳的 SEC1
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        
+    return raw_bytes # 默认兜底返回
+
+def get_standard_public_pem_bytes(key_input) -> bytes:
+    """
+    统一公钥解析：支持 OpenSSH 公钥、PEM 公钥、文件路径、bytes/str。
+    最终返回 ecdsa 库兼容的标准 PEM 公钥字节流。
+    """
+    if not key_input:
+        return None
+
+    raw_bytes = b""
+    if isinstance(key_input, str):
+        if os.path.isfile(key_input):
+            with open(key_input, "rb") as f:
+                raw_bytes = f.read()
+        else:
+            raw_bytes = key_input.encode('utf-8')
+    elif isinstance(key_input, bytes):
+        raw_bytes = key_input
+
+    if not raw_bytes:
+        raise ValueError("无法解析传入的公钥")
+
+    # 已经是 PEM 格式
+    if b"-----BEGIN PUBLIC KEY-----" in raw_bytes:
+        return raw_bytes
+
+    # 尝试作为 OpenSSH 公钥解析
+    try:
+        from cryptography.hazmat.primitives import serialization
+        public_key = serialization.load_ssh_public_key(raw_bytes)
+        pem = public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        return pem
+    except Exception:
+        # 如果解析失败，可能已经是其他格式，直接返回
+        return raw_bytes
+
 class MultiMQTTManager:
     # [微调] 增加了 server_public_key_bytes (服务端验签用) 和 client_private_key_bytes (客户端签名用)，默认均为 None
     def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None):
@@ -135,8 +224,8 @@ class MultiMQTTManager:
         self.clients = {}
         self.log_messages = log_messages
         self.enable_crypto = enable_crypto  # 默认关闭加密
-        self.server_public_key_bytes = server_public_key_bytes
-        self.client_private_key_bytes = client_private_key_bytes
+        self.server_public_key_bytes = get_standard_public_pem_bytes(server_public_key_bytes)
+        self.client_private_key_bytes = get_standard_pem_bytes(client_private_key_bytes) # [接入解析]
         self.dedup_cache = TTLCache(ttl_seconds=30)
         self.message_callback = None
         self.subscribed_topics = set()
@@ -191,7 +280,14 @@ class MultiMQTTManager:
                 data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
 
                 req_id = data.get("req_id")
+                # 去重判定：首胜丢弃逻辑 网络层行为放最前 (无论是原生 req_id 还是附带签名的 req_id，直接全量存入 Cache 用于 30 秒内去重)
+                if req_id and not self.dedup_cache.add_if_not_exists(req_id):
+                    return
                 
+                
+                
+                # logger.info(f"""📩 收到消息 {data} 来自 {host}  {self.server_public_key_bytes}
+                # {self.log_messages}  cb{self.message_callback}""")
                 # --- [新增] ECDSA 验证防重放核心逻辑 ---
                 # 只有当用户启用了签名(传入了公钥) 并且当前数据是下发命令("code"存在)时，才触发验签
                 if self.server_public_key_bytes and "code" in data:
@@ -204,8 +300,9 @@ class MultiMQTTManager:
                     
                     # 验证1: 时间戳过期检测 (防超过 30s 的绝对重放)
                     msg_ts = float(data.get("timestamp", 0))
-                    if abs(time.time() - msg_ts) > self.dedup_cache.ttl:
-                        logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放")
+                    t=time.perf_counter()#time.time()
+                    if abs(t - msg_ts) > self.dedup_cache.ttl:
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {t} {msg_ts} {self.dedup_cache.tt}")
                         return
                     
                     # 验证2: ECDSA 签名防篡改 (联合 hash 校验 base_req_id, code, timestamp)
@@ -221,14 +318,13 @@ class MultiMQTTManager:
                         return
                 # ----------------------------------------
 
-                # 去重判定：首胜丢弃逻辑 (无论是原生 req_id 还是附带签名的 req_id，直接全量存入 Cache 用于 30 秒内去重)
-                if req_id and not self.dedup_cache.add_if_not_exists(req_id):
-                    return
 
                 if self.log_messages:
                     logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}")
 
                 if self.message_callback:
+                    if '|' in req_id:
+                        data["req_id"] = req_id.split('|')[0]  # client 发送经过签名后 ，收到自动去除返回
                     self.message_callback(msg.topic, data, host)
             except Exception:
                 pass
@@ -241,17 +337,23 @@ class MultiMQTTManager:
                 if c.is_connected():
                     c.subscribe(topic)
 
-    def publish_broadcast(self, topic: str, payload_dict: dict):
+    def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None):
         """广播传输消息"""
         
         # --- [新增] ECDSA 发起请求时自动签名逻辑 ---
         # 只有在启用了签名(传入了私钥)，且当前发送的数据包含 "code" 时，才附带签名
-        if self.client_private_key_bytes and "code" in payload_dict:
-            # 补齐防重放所需的必要字段
-            if "timestamp" not in payload_dict:
-                payload_dict["timestamp"] = time.time()
-            if "req_id" not in payload_dict:
-                payload_dict["req_id"] = get_req_id()
+        
+        # [接入解析] 取传入的私钥，若无则使用全局私钥，统一解析格式
+        current_priv_key = get_standard_pem_bytes(client_private_key_bytes) if client_private_key_bytes else self.client_private_key_bytes
+        
+        if current_priv_key and "code" in payload_dict:
+            assert "timestamp" in payload_dict
+            # 防重放所需的必要字段 就2个 ，其实可以只要一个
+            
+            # if "timestamp" not in payload_dict:
+                # payload_dict["timestamp"] = time.time()
+            # if "req_id" not in payload_dict:
+                # payload_dict["req_id"] = get_req_id()
                 
             base_req_id = str(payload_dict["req_id"])
             code_str = str(payload_dict.get("code", ""))
@@ -259,7 +361,7 @@ class MultiMQTTManager:
             
             # 生成防篡改签名字符串并 Hash
             sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
-            sk = ecdsa.SigningKey.from_pem(self.client_private_key_bytes)
+            sk = ecdsa.SigningKey.from_pem(current_priv_key)
             signature = sk.sign(sign_msg, hashfunc=hashlib.sha256)
             
             # 隐写签名：直接将签名拼接到 req_id 字段尾部 (形如 '20260910...|abc123hex...')
