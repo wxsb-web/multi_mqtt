@@ -54,9 +54,15 @@ class MQTTServer:
 if __name__ == "__main__":
     import argparse,server_http
     parser = argparse.ArgumentParser(description='mqtt http rpc')
-    parser.add_argument('--port', type=int, default=1177)
-    parser.add_argument('--host', default='0.0.0.0')
+    parser.add_argument('--port','-port','-p', type=int, default=1177)
+    parser.add_argument('--host','-host', default='0.0.0.0')
+    _PUB=b'ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBER9c5vu215n+5gv1YjGdm78Nf99wpfqw1fIT8nXib2FLUglq4NBMe7hLp2VOkqv9z00m5Wn+uUADH4zyXLiWzI='
+    # nargs='*' ：--pub 放到最后，其后所有空格分隔的片段会被拼回一个参数
+    # --pub（后面什么都不给） 或 --pub ""  ->  b''
+    parser.add_argument('--pub','--pubkey', nargs='*', default=None)
     args = parser.parse_args()
+    args.pub = _PUB if args.pub is None else ' '.join(args.pub).encode('utf-8')
+    
     ghs=server_http.start_rpc_server(
         port=args.port,
         ip=args.host,
@@ -68,7 +74,7 @@ if __name__ == "__main__":
     )
     
     gms = MQTTServer(
-server_public_key_bytes=b'ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBER9c5vu215n+5gv1YjGdm78Nf99wpfqw1fIT8nXib2FLUglq4NBMe7hLp2VOkqv9z00m5Wn+uUADH4zyXLiWzI=',
+server_public_key_bytes=args.pub,
     )
     print(ghs,gms)
     gms.start()

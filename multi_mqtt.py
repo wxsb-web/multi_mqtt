@@ -323,7 +323,7 @@ class MultiMQTTManager:
                     logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}")
 
                 if self.message_callback:
-                    if '|' in req_id:
+                    if (self.server_public_key_bytes or self.client_private_key_bytes) and '|' in req_id:
                         data["req_id"] = req_id.split('|')[0]  # client 发送经过签名后 ，收到自动去除返回
                     self.message_callback(msg.topic, data, host)
             except Exception:

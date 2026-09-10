@@ -19,46 +19,81 @@ class PythonExecutor:
         self.main_loop = main_loop
         self.lock = threading.RLock()
 
-    def execute(self, code,globals_dict=None,locals_dict=None):
-        '''修改 PythonExecutor 支持环境注入  用于每次请求注入上下文变量'''
+    def execute(self, code, globals_dict=None, locals_dict=None):
+        """Execute code with optional temporary context variables.
+        
+        Context variables (globals_dict/locals_dict) are injected for this
+        execution only and do not persist to future calls.
+        """
         if not isinstance(code, str) or not code.strip():
             return {"r": "", "stdout": "", "ok": False, "error": "code is required"}
 
-        output = io.StringIO()
-        with self.lock:
-            try:
-                with _redirect_stdout(output):
-                    result = self._execute(code,globals_dict=globals_dict,locals_dict=locals_dict)
-                return {
-                    "r": result,
-                    "stdout": output.getvalue(),
-                    "ok": True,
-                }
-            except Exception:
-                return {
-                    "r": None,
-                    "stdout": output.getvalue(),
-                    "ok": False,
-                    "error": traceback.format_exc(),
-                }
+        # Inject context variables directly into persistent namespaces.
+        # Save old values so we can restore them after execution.
+        saved_globals = {}
+        injected_g = []
+        if isinstance(globals_dict, dict):
+            for k, v in globals_dict.items():
+                if k in self.globals:
+                    saved_globals[k] = self.globals[k]
+                self.globals[k] = v
+                injected_g.append(k)
 
-    def _execute(self, code,globals_dict=None,locals_dict=None):
+        saved_locals = {}
+        injected_l = []
+        if isinstance(locals_dict, dict):
+            for k, v in locals_dict.items():
+                if k in self.locals:
+                    saved_locals[k] = self.locals[k]
+                self.locals[k] = v
+                injected_l.append(k)
+
+        output = io.StringIO()
+        try:
+            with self.lock:
+                with _redirect_stdout(output):
+                    result = self._execute(code)
+            return {
+                "r": result,
+                "stdout": output.getvalue(),
+                "ok": True,
+            }
+        except Exception:
+            return {
+                "r": None,
+                "stdout": output.getvalue(),
+                "ok": False,
+                "error": traceback.format_exc(),
+            }
+        finally:
+            # Restore or remove injected context variables.
+            # This guarantees request-scoped variables (request, response, etc.)
+            # never leak into the persistent REPL state.
+            for k in injected_g:
+                if k in saved_globals:
+                    self.globals[k] = saved_globals[k]
+                else:
+                    self.globals.pop(k, None)
+            for k in injected_l:
+                if k in saved_locals:
+                    self.locals[k] = saved_locals[k]
+                else:
+                    self.locals.pop(k, None)
+
+    def _execute(self, code):
         tree = ast.parse(code, filename="<rpc>", mode="exec")
-        
-        is_await=False
+
+        is_await = False
         try:
             compiled_tree = compile(tree, "<rpc>", "exec")
         except SyntaxError:
             if "await" not in code:
                 raise
-            else:is_await=True
-             
-        if isinstance(globals_dict,dict):self.globals.update(globals_dict)
-        if isinstance(locals_dict,dict):self.locals.update(locals_dict)
-        
-        if is_await:return self._execute_awaitable(code)
-        
-        
+            is_await = True
+
+        if is_await:
+            return self._execute_awaitable(code)
+
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             prefix = ast.Module(body=tree.body[:-1], type_ignores=[])
             if prefix.body:
@@ -83,8 +118,14 @@ class PythonExecutor:
         else:
             async_code = f"async def __rpc_async__():\n{indented_code}\n    return locals()"
 
-        async_globals = self.globals.copy()
-        async_globals.update(self.locals)
+        # If locals and globals are the same object (typical REPL mode),
+        # avoid the copy entirely.
+        if self.locals is self.globals:
+            async_globals = self.globals
+        else:
+            async_globals = self.globals.copy()
+            async_globals.update(self.locals)
+
         exec(async_code, async_globals, self.locals)
         coroutine_function = self.locals.pop("__rpc_async__")
         result = self._run_coroutine(coroutine_function())
