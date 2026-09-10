@@ -19,7 +19,7 @@ class PythonExecutor:
         self.main_loop = main_loop
         self.lock = threading.RLock()
 
-    def execute(self, code):
+    def execute(self, code,globals_dict=None,locals_dict=None):
         if not isinstance(code, str) or not code.strip():
             return {"r": "", "stdout": "", "ok": False, "error": "code is required"}
 
@@ -27,7 +27,7 @@ class PythonExecutor:
         with self.lock:
             try:
                 with _redirect_stdout(output):
-                    result = self._execute(code)
+                    result = self._execute(code,globals_dict=globals_dict,locals_dict=locals_dict)
                 return {
                     "r": result,
                     "stdout": output.getvalue(),
@@ -41,15 +41,23 @@ class PythonExecutor:
                     "error": traceback.format_exc(),
                 }
 
-    def _execute(self, code):
+    def _execute(self, code,globals_dict=None,locals_dict=None):
         tree = ast.parse(code, filename="<rpc>", mode="exec")
+        
+        is_await=False
         try:
             compiled_tree = compile(tree, "<rpc>", "exec")
         except SyntaxError:
             if "await" not in code:
                 raise
-            return self._execute_awaitable(code)
-
+            else:is_await=True
+             
+        if isinstance(globals_dict,dict):self.globals.update(globals_dict)
+        if isinstance(locals_dict,dict):self.locals.update(locals_dict)
+        
+        if is_await:return self._execute_awaitable(code)
+        
+        
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             prefix = ast.Module(body=tree.body[:-1], type_ignores=[])
             if prefix.body:
