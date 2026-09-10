@@ -8,10 +8,9 @@ logger = logging.getLogger("Server")
 REQUEST_TOPIC = "sys/device/request"
 
 class MQTTServer:
-    def __init__(self):
+    def __init__(self,server_public_key_bytes=None,):
         # 实例化网络层管理器 (enable_crypto 默认为 False)
-        bpub=b'ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBER9c5vu215n+5gv1YjGdm78Nf99wpfqw1fIT8nXib2FLUglq4NBMe7hLp2VOkqv9z00m5Wn+uUADH4zyXLiWzI='
-        self.mqtt_net = MultiMQTTManager(log_messages=False,server_public_key_bytes=bpub)
+        self.mqtt_net = MultiMQTTManager(log_messages=False,server_public_key_bytes=server_public_key_bytes)
         self.mqtt_net.set_on_message(self.handle_message)
         self.executor = PythonExecutor()
 
@@ -55,7 +54,7 @@ class MQTTServer:
 if __name__ == "__main__":
     import argparse,server_http
     parser = argparse.ArgumentParser(description='mqtt http rpc')
-    parser.add_argument('--port', type=int, default=1133)
+    parser.add_argument('--port', type=int, default=1177)
     parser.add_argument('--host', default='0.0.0.0')
     args = parser.parse_args()
     ghs=server_http.start_rpc_server(
@@ -68,6 +67,8 @@ if __name__ == "__main__":
         # redirect_root='/preview_html(p)',
     )
     
-    gms = MQTTServer()
+    gms = MQTTServer(
+server_public_key_bytes=b'ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBER9c5vu215n+5gv1YjGdm78Nf99wpfqw1fIT8nXib2FLUglq4NBMe7hLp2VOkqv9z00m5Wn+uUADH4zyXLiWzI=',
+    )
     print(ghs,gms)
     gms.start()

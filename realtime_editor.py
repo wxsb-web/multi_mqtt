@@ -155,7 +155,7 @@ class Editor:
 
     def save(self, content):
         temporary = self.path.with_name('.' + self.path.name + '.realtime-editor.tmp')
-        temporary.write_text(content, encoding='utf-8', newline='')
+        temporary.write_text(content, encoding='utf-8',) # newline='' 低版本py不支持
         os.replace(temporary, self.path)
         self.content = content
         self.signature = self._signature()
