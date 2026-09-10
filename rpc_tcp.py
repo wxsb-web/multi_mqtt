@@ -7,12 +7,14 @@ import traceback
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s %(levelname)s [%(name)s] %(message)s'
-)
+# 模块内独立日志配置，不污染全局
 logger = logging.getLogger(__file__)
-
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s [%(name)s] %(message)s'))
+    logger.addHandler(handler)
+    
 class TCPFrameProtocol:
     """长度前缀 + JSON 的帧协议"""
     HEADER_FMT = '!II'  # req_id: uint32, body_len: uint32 (网络字节序)
@@ -155,20 +157,20 @@ class TCPServer:
             inject_locals['__name__'] = '__tcp_rpc__'
             # inject_locals['client_id'] = client_id
             inject_locals['client_sock'] = client_sock  # 危险！直接暴露socket
+            #这是设计好的行为，尽可能暴露底层 原生 socket 对象暴露给执行代码后，用户可以直接调用 `client_sock.recv()`、`accept()` 等阻塞方法，直接挂死 worker 线程
+            # 不用更安全的包装
+            # class SocketWrapper:
+                # def __init__(self, sock):
+                    # self._sock = sock
+                # def send(self, data):
+                    # if isinstance(data, str):
+                        # data = data.encode()
+                    # self._sock.sendall(data)
+                # @property
+                # def peer(self):
+                    # return self._sock.getpeername()
             
-            # 更安全的包装
-            class SocketWrapper:
-                def __init__(self, sock):
-                    self._sock = sock
-                def send(self, data):
-                    if isinstance(data, str):
-                        data = data.encode()
-                    self._sock.sendall(data)
-                @property
-                def peer(self):
-                    return self._sock.getpeername()
-            
-            inject_locals['conn'] = SocketWrapper(client_sock)
+            # inject_locals['conn'] = SocketWrapper(client_sock)
             
             # 执行
             execution = self.executor.execute(
@@ -209,9 +211,7 @@ class TCPServer:
         # except (BrokenPipeError, ConnectionResetError):
         except Exception as e:
             logger.warning(f"Send failed, client gone: {client_id}\n{e}")        
-        except Exception as e:
-            logger.warning(f"Failed to send response, client gone: {client_id}  \n{e}")
-    
+        
     def stop(self):
         self.running = False
         self.server_socket.close()
