@@ -338,7 +338,7 @@ if __name__ == '__main__':
         print(f"Result: {result}")
         
         print(client.call("dir()"))
-        print(client.call("r=client_sock")) #不知道为什么这一句卡住
+        print(client.call("r=client_sock")) #不知道为什么这一句卡住 因为json序列化，但是最好架构参考上面注释TODO
         print(client.call("r=str(client_sock)"))
         print(client.call("r=repr(client_sock),dir(client_sock)"))
         

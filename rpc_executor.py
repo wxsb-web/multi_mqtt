@@ -20,6 +20,7 @@ class PythonExecutor:
         self.lock = threading.RLock()
 
     def execute(self, code,globals_dict=None,locals_dict=None):
+        '''修改 PythonExecutor 支持环境注入  用于每次请求注入上下文变量'''
         if not isinstance(code, str) or not code.strip():
             return {"r": "", "stdout": "", "ok": False, "error": "code is required"}
 
