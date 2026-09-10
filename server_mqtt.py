@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from multi_mqtt import MultiMQTTManager, stime
+from multi_mqtt import MultiMQTTManager, stime, utc_ms
 import time
 import logging
 from rpc_executor import PythonExecutor, format_result
@@ -22,7 +22,7 @@ class MQTTServer:
         logger.info(f"⚡ [{stime()}] [服务端处理请求] req_id={req_id} (首发节点: {rx_broker})")
 
         execution = self.executor.execute(code)
-        server_time = time.time()
+        server_time = utc_ms()
         response_data = {
             "req_id": req_id,
             "r": format_result(execution["r"]) if execution["ok"] else None,
@@ -30,7 +30,7 @@ class MQTTServer:
             "ok": execution["ok"],
             "server_time": server_time,
             "server_from": rx_broker,
-#"latency_send":round(server_time-data.get("timestamp")*1000, 2) # client server 时间不同步，测量出不是真实值
+#"latency_send":server_time-data.get("timestamp") # client server 时间不同步，测量出不是真实值
 
         }
         if not execution["ok"]:

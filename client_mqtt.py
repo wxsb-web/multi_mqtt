@@ -3,7 +3,7 @@ import time, threading, os
 import logging
 import codeop
 import importlib
-from multi_mqtt import MultiMQTTManager, get_req_id
+from multi_mqtt import MultiMQTTManager, get_req_id, utc_ms
 
 logger = logging.getLogger("Client")
 
@@ -51,7 +51,7 @@ class MQTTClientNode:
             "req_id": req_id,
             "reply_topic": RESPONSE_TOPIC,
             "code": payload,
-            "timestamp": start_time
+            "timestamp": utc_ms()
         }
 
         event = threading.Event()

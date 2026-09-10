@@ -38,6 +38,7 @@ import hashlib
 import random
 import logging
 import base64
+import struct
 import threading
 import ecdsa  # [新增]
 from collections import OrderedDict
@@ -87,6 +88,10 @@ def stime(format='%Y-%m-%d__%H.%M.%S',ms_splitor='__.'):
     """可读毫秒级时间戳"""
     ft = time.time()
     return time.strftime(format, time.localtime(ft)) + ms_splitor + f"{ft:.3f}".split('.')[1]
+
+def utc_ms():
+    """Return the current UTC Unix timestamp in integer milliseconds."""
+    return time.time_ns() // 1_000_000
 
 def get_req_id():
     """生成格式：req_YYYY-MM-DD__HH.MM.SS__.毫秒_随机Hash"""
@@ -204,7 +209,38 @@ def get_standard_public_pem_bytes(key_input) -> bytes:
     if b"-----BEGIN PUBLIC KEY-----" in raw_bytes:
         return raw_bytes
 
-    # 尝试作为 OpenSSH 公钥解析
+    # 尝试作为 OpenSSH 公钥解析。cryptography 是可选依赖，因此这里保留
+    # 一个仅依赖 ecdsa 的解析路径。
+    if raw_bytes.startswith(b"ecdsa-sha2-nistp256 "):
+        try:
+            encoded_key = raw_bytes.split(None, 2)[1]
+            key_blob = base64.b64decode(encoded_key, validate=True)
+            offset = 0
+
+            def read_ssh_field():
+                nonlocal offset
+                if offset + 4 > len(key_blob):
+                    raise ValueError("OpenSSH 公钥字段长度无效")
+                field_length = struct.unpack(">I", key_blob[offset:offset + 4])[0]
+                offset += 4
+                field = key_blob[offset:offset + field_length]
+                if len(field) != field_length:
+                    raise ValueError("OpenSSH 公钥字段被截断")
+                offset += field_length
+                return field
+
+            key_type = read_ssh_field()
+            curve_name = read_ssh_field()
+            point = read_ssh_field()
+            if key_type != b"ecdsa-sha2-nistp256" or curve_name != b"nistp256":
+                raise ValueError("仅支持 ecdsa-sha2-nistp256 公钥")
+            return ecdsa.VerifyingKey.from_string(
+                point, curve=ecdsa.NIST256p
+            ).to_pem()
+        except (ValueError, IndexError, TypeError, base64.binascii.Error) as error:
+            raise ValueError(f"无法解析 OpenSSH 公钥: {error}") from error
+
+    # 尝试借助 cryptography 解析其它 OpenSSH 公钥格式
     try:
         from cryptography.hazmat.primitives import serialization
         public_key = serialization.load_ssh_public_key(raw_bytes)
@@ -299,10 +335,11 @@ class MultiMQTTManager:
                     base_req_id, sig_hex = req_id.rsplit("|", 1)
                     
                     # 验证1: 时间戳过期检测 (防超过 30s 的绝对重放)
-                    msg_ts = float(data.get("timestamp", 0))
-                    t=time.perf_counter()#time.time()
-                    if abs(t - msg_ts) > self.dedup_cache.ttl:
-                        logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {t} {msg_ts} {self.dedup_cache.tt}")
+                    msg_ts = int(data.get("timestamp", 0))
+                    now_ms = utc_ms()
+                    ttl_ms = self.dedup_cache.ttl * 1000
+                    if abs(now_ms - msg_ts) > ttl_ms:
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {now_ms} {msg_ts} {ttl_ms}")
                         return
                     
                     # 验证2: ECDSA 签名防篡改 (联合 hash 校验 base_req_id, code, timestamp)
@@ -327,7 +364,7 @@ class MultiMQTTManager:
                         data["req_id"] = req_id.split('|')[0]  # client 发送经过签名后 ，收到自动去除返回
                     self.message_callback(msg.topic, data, host)
             except Exception:
-                pass
+                logger.exception("处理 MQTT 消息失败 [%s]", host)
         return on_message
 
     def subscribe(self, topic: str):
@@ -351,7 +388,7 @@ class MultiMQTTManager:
             # 防重放所需的必要字段 就2个 ，其实可以只要一个
             
             # if "timestamp" not in payload_dict:
-                # payload_dict["timestamp"] = time.time()
+                # payload_dict["timestamp"] = utc_ms()
             # if "req_id" not in payload_dict:
                 # payload_dict["req_id"] = get_req_id()
                 
