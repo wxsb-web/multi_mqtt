@@ -3,6 +3,7 @@ import importlib.util,os,subprocess,sys
 def ensure_dependencies():
     packages = {
         "paho": "paho-mqtt",
+        "ecdsa": "ecdsa",  # [新增] 仅追加了 ecdsa 依赖，以支持私钥签名
     }
     missing = [package for module, package in packages.items()
                if importlib.util.find_spec(module) is None]
@@ -29,7 +30,6 @@ def ensure_dependencies():
         sys.exit(1)
 ensure_dependencies()
 
-
 import json
 import time
 import os
@@ -39,6 +39,7 @@ import random
 import logging
 import base64
 import threading
+import ecdsa  # [新增]
 from collections import OrderedDict
 from paho.mqtt import client as mqtt_client
 from paho.mqtt.enums import CallbackAPIVersion
@@ -72,7 +73,14 @@ BROKER_LIST = [
  public-mqtt-broker.bevyw… │           200,928 / 69 
  test.mosquitto.org        │   188,030,853 / 77,948 
 ───────────────────────────┴────────────────────────
-                                                    
+
+
+逻辑还是没有清晰  ，这次不写代码。  client 发送时候有私钥 可以签名， server 启动时候只有公钥 收到  再次回复   那返回信息又没有签名。  你的代码可以正确解析这种情况吗。   如果要实现完整加密，那又太复杂了  。  https ，ssh 密钥协商
+
+客户端发送指令时：由于你要让服务器执行代码，payload 里必然带有 "code": "import platform..."。客户端的发送函数一看到有 "code"，并且自己有私钥，就会主动触发签名。
+服务端接收指令时：服务端看到有 "code"，并且自己配了公钥，就会强制触发验签。如果不通过，直接丢弃。
+服务端返回结果时：服务端的回复 payload 是 {"req_id": "...", "stdout": "...", "ok": True}。里面没有 "code" 字段。此时服务端的发送函数会直接跳过签名逻辑，把原封不动的 JSON 发回去。
+客户端接收结果时：客户端收到回复，看到 payload 里没有 "code" 字段，就会直接跳过验签逻辑，走原来的普通流程（去重 -> 打印结果）。
 '''
 
 def stime(format='%Y-%m-%d__%H.%M.%S',ms_splitor='__.'):
@@ -121,11 +129,14 @@ class TTLCache:
             return True
 
 class MultiMQTTManager:
-    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False):
+    # [微调] 增加了 server_public_key_bytes (服务端验签用) 和 client_private_key_bytes (客户端签名用)，默认均为 None
+    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None):
         self.brokers = brokers
         self.clients = {}
         self.log_messages = log_messages
         self.enable_crypto = enable_crypto  # 默认关闭加密
+        self.server_public_key_bytes = server_public_key_bytes
+        self.client_private_key_bytes = client_private_key_bytes
         self.dedup_cache = TTLCache(ttl_seconds=30)
         self.message_callback = None
         self.subscribed_topics = set()
@@ -179,8 +190,38 @@ class MultiMQTTManager:
                 raw_payload = msg.payload.decode('utf-8')
                 data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
 
-                # 去重判定：首胜丢弃逻辑
                 req_id = data.get("req_id")
+                
+                # --- [新增] ECDSA 验证防重放核心逻辑 ---
+                # 只有当用户启用了签名(传入了公钥) 并且当前数据是下发命令("code"存在)时，才触发验签
+                if self.server_public_key_bytes and "code" in data:
+                    if not req_id or "|" not in req_id:
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: 缺少 ECDSA 签名结构 (req_id格式不符)")
+                        return
+                    
+                    # 剥离出真实的 req_id 和 签名Hex
+                    base_req_id, sig_hex = req_id.rsplit("|", 1)
+                    
+                    # 验证1: 时间戳过期检测 (防超过 30s 的绝对重放)
+                    msg_ts = float(data.get("timestamp", 0))
+                    if abs(time.time() - msg_ts) > self.dedup_cache.ttl:
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放")
+                        return
+                    
+                    # 验证2: ECDSA 签名防篡改 (联合 hash 校验 base_req_id, code, timestamp)
+                    code_str = str(data.get("code", ""))
+                    ts_str = str(data.get("timestamp", ""))
+                    sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
+                    
+                    try:
+                        vk = ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes)
+                        vk.verify(bytes.fromhex(sig_hex), sign_msg, hashfunc=hashlib.sha256)
+                    except Exception:
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效")
+                        return
+                # ----------------------------------------
+
+                # 去重判定：首胜丢弃逻辑 (无论是原生 req_id 还是附带签名的 req_id，直接全量存入 Cache 用于 30 秒内去重)
                 if req_id and not self.dedup_cache.add_if_not_exists(req_id):
                     return
 
@@ -202,6 +243,29 @@ class MultiMQTTManager:
 
     def publish_broadcast(self, topic: str, payload_dict: dict):
         """广播传输消息"""
+        
+        # --- [新增] ECDSA 发起请求时自动签名逻辑 ---
+        # 只有在启用了签名(传入了私钥)，且当前发送的数据包含 "code" 时，才附带签名
+        if self.client_private_key_bytes and "code" in payload_dict:
+            # 补齐防重放所需的必要字段
+            if "timestamp" not in payload_dict:
+                payload_dict["timestamp"] = time.time()
+            if "req_id" not in payload_dict:
+                payload_dict["req_id"] = get_req_id()
+                
+            base_req_id = str(payload_dict["req_id"])
+            code_str = str(payload_dict.get("code", ""))
+            ts_str = str(payload_dict["timestamp"])
+            
+            # 生成防篡改签名字符串并 Hash
+            sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
+            sk = ecdsa.SigningKey.from_pem(self.client_private_key_bytes)
+            signature = sk.sign(sign_msg, hashfunc=hashlib.sha256)
+            
+            # 隐写签名：直接将签名拼接到 req_id 字段尾部 (形如 '20260910...|abc123hex...')
+            payload_dict["req_id"] = f"{base_req_id}|{signature.hex()}"
+        # ------------------------------------------
+
         payload_str = process_cipher(payload_dict, decrypt=False, enabled=self.enable_crypto)
         for host, c in self.clients.items():
             if c.is_connected():
