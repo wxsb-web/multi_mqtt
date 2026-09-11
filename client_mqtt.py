@@ -10,6 +10,7 @@ logger = logging.getLogger("Client")
 
 REQUEST_TOPIC = "sys/device/request"
 RESPONSE_TOPIC = "sys/device/response"
+DEFAULT_TIMEOUT = 30
 
 _default_client = None
 _default_client_lock = threading.Lock()
@@ -67,7 +68,14 @@ class MQTTClientNode:
                 req_ctx['response'] = data
                 req_ctx['event'].set()
 
-    def request(self, payload: str, timeout: float = 5.0, client_private_key_bytes=None, allow_no_server_pubkey_response: bool = None):
+    def request(
+        self,
+        payload: str,
+        request_topic: str = REQUEST_TOPIC,
+        timeout: float = 5.0,
+        client_private_key_bytes=None,
+        allow_no_server_pubkey_response: bool = None,
+    ):
         client_private_key_bytes = client_private_key_bytes or self.mqtt_net.client_private_key_bytes
         if allow_no_server_pubkey_response is None:
             allow_no_server_pubkey_response = self.allow_no_server_pubkey_response
@@ -95,7 +103,7 @@ class MQTTClientNode:
 
         try:
             # 并发投递广播
-            self.mqtt_net.publish_broadcast(REQUEST_TOPIC, req_data, client_private_key_bytes=client_private_key_bytes)
+            self.mqtt_net.publish_broadcast(request_topic, req_data, client_private_key_bytes=client_private_key_bytes)
         except Exception as exc:
             with self.lock:
                 self.pending_requests.pop(req_id, None)
@@ -131,7 +139,13 @@ class MQTTClientNode:
             logger.warning("⚠️ [用户中断] 已停止 MQTT 连接")
 
 
-def rpc(code: str, timeout: float = 60.0, client_private_key_bytes=None, allow_no_server_pubkey_response: bool = False):
+def rpc(
+    code: str,
+    request_topic: str = REQUEST_TOPIC,
+    timeout: float = DEFAULT_TIMEOUT,
+    client_private_key_bytes=None,
+    allow_no_server_pubkey_response: bool = False,
+):
     """Execute code through a lazily started shared MQTT client.
 
     这是一个“签名请求 + 受控回包接受”的安全阈值：
@@ -151,6 +165,7 @@ def rpc(code: str, timeout: float = 60.0, client_private_key_bytes=None, allow_n
         client = _default_client
     return client.request(
         code,
+        request_topic=request_topic,
         timeout=timeout,
         client_private_key_bytes=client_private_key_bytes,
         allow_no_server_pubkey_response=allow_no_server_pubkey_response,
@@ -269,7 +284,7 @@ if __name__ == "__main__":
         "--timeout",
         "-t",
         type=float,
-        default=30,
+        default=DEFAULT_TIMEOUT,
         help="命令等待远端响应的超时时间，单位秒。",
     )
     parser.add_argument(
