@@ -2,6 +2,8 @@ import builtins
 import unittest
 from unittest.mock import Mock
 
+import ecdsa
+
 import client_mqtt
 from multi_mqtt import get_standard_pem_bytes
 
@@ -46,6 +48,27 @@ class ClientMqttTests(unittest.TestCase):
 
         self.assertFalse(event.set.called)
         self.assertIsNone(node.pending_requests["req-123"]["response"])
+
+    def test_signed_request_is_accepted_when_server_pubkey_is_known(self):
+        server_key = ecdsa.SigningKey.generate(curve=ecdsa.NIST256p).verifying_key.to_pem()
+        node = client_mqtt.MQTTClientNode(
+            client_private_key_bytes="2**128",
+            server_public_key_bytes=server_key,
+        )
+        event = Mock()
+        req_id = "req-123|deadbeef"
+        node.pending_requests["req-123"] = {
+            "event": event,
+            "start_time": 0.0,
+            "response": None,
+            "client_private_key_bytes": "1+1",
+            "allow_no_server_pubkey_response": False,
+        }
+
+        node._on_message("sys/device/response", {"req_id": req_id, "ok": True}, "mqtt.emqx.io")
+
+        self.assertTrue(event.set.called)
+        self.assertEqual(node.pending_requests["req-123"]["response"]["req_id"], "req-123")
 
     def test_signed_request_is_accepted_when_response_req_id_is_clean(self):
         node = client_mqtt.MQTTClientNode(

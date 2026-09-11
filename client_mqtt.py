@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-import time, threading, os
+import time, threading, os, sys
 import logging
 import codeop
 import importlib
@@ -16,8 +16,15 @@ _default_client = None
 _default_client_lock = threading.Lock()
 
 class MQTTClientNode:
-    def __init__(self, client_private_key_bytes=None, allow_no_server_pubkey_response: bool = False):
-        # 私钥模式下，若服务端没有公钥，默认拒绝回复；除非用户显式开启 allow_no_server_pubkey_response
+    def __init__(
+        self,
+        client_private_key_bytes=None,
+        allow_no_server_pubkey_response: bool = False,
+    ):
+        self.client_private_key_bytes = client_private_key_bytes
+        self.allow_no_server_pubkey_response = allow_no_server_pubkey_response
+
+        # 客户端无需配置 server_public_key_bytes
         self.mqtt_net = MultiMQTTManager(
             log_messages=False,
             client_private_key_bytes=client_private_key_bytes,
@@ -25,7 +32,6 @@ class MQTTClientNode:
         self.mqtt_net.set_on_message(self._on_message)
         self.pending_requests = {}
         self.lock = threading.Lock()
-        self.allow_no_server_pubkey_response = allow_no_server_pubkey_response
 
     def start(self):
         self.mqtt_net.start()
@@ -33,32 +39,34 @@ class MQTTClientNode:
         self.mqtt_net.subscribe(RESPONSE_TOPIC)
 
     def _on_message(self, topic, data, rx_broker):
-        req_id = data.get("req_id")
-        if not req_id:
+        received_req_id = data.get("req_id")
+        if not received_req_id:
             return
 
-        base_req_id = req_id.split("|", 1)[0] if isinstance(req_id, str) and "|" in req_id else req_id
+        # 判断服务端是否原样退回了附带签名的 req_id (去时有，来时无)
+        is_unverified_echo = isinstance(received_req_id, str) and "|" in received_req_id
+        base_req_id = received_req_id.split("|", 1)[0] if is_unverified_echo else received_req_id
 
         with self.lock:
-            req_ctx = self.pending_requests.get(req_id)
-            if req_ctx is None and base_req_id != req_id:
-                req_ctx = self.pending_requests.get(base_req_id)
+            # 客户端本地缓存的总是 base_req_id
+            req_ctx = self.pending_requests.get(base_req_id)
 
             if req_ctx is not None:
-                signed_req = bool(req_ctx.get("client_private_key_bytes") or self.mqtt_net.client_private_key_bytes)
-                signed_response = isinstance(req_id, str) and "|" in req_id
-                allow = bool(req_ctx.get("allow_no_server_pubkey_response", self.allow_no_server_pubkey_response))
-                if signed_req and signed_response and not allow:
+                has_client_pri = bool(req_ctx.get("client_private_key_bytes"))
+                allow_no_pub = req_ctx.get("allow_no_server_pubkey_response", False)
+
+                # 拦截逻辑：
+                # 如果客户端带有私钥发送 (has_client_pri)
+                # 且服务端原样返回了带签名的 req_id (说明服务端没有公钥，未进行验签剥离)
+                # 且配置不允许放行此类响应
+                if has_client_pri and is_unverified_echo and not allow_no_pub:
                     logger.warning(
-                        "⚠️ [拦截无公钥服务器返回] req_id=%s reply_topic=%s broker=%s "
-                        "(私钥模式默认不接受未验签/无公钥返回，设 allow_no_server_pubkey_response=True 可放行)",
-                        req_id,
-                        data.get("reply_topic", RESPONSE_TOPIC),
-                        rx_broker,
+                        f"⛔ [安全拦截] req_id={received_req_id} | 服务端未验签 (原样返回了带签名的 req_id)，且 allow_no_server_pubkey_response=False，丢弃该响应。",
                     )
                     return
 
-                if "|" in str(data.get("req_id", "")):
+                # 清理回包中的 req_id 还原为 base_req_id，方便后续统一使用
+                if is_unverified_echo:
                     data["req_id"] = base_req_id
 
                 cost_ms = (time.perf_counter() - req_ctx['start_time']) * 1000
@@ -76,9 +84,12 @@ class MQTTClientNode:
         client_private_key_bytes=None,
         allow_no_server_pubkey_response: bool = None,
     ):
-        client_private_key_bytes = client_private_key_bytes or self.mqtt_net.client_private_key_bytes
+        client_private_key_bytes = client_private_key_bytes or self.client_private_key_bytes or getattr(self.mqtt_net, 'client_private_key_bytes', None)
+        
         if allow_no_server_pubkey_response is None:
             allow_no_server_pubkey_response = self.allow_no_server_pubkey_response
+
+        # 生成基础的 req_id（不带签名）
         req_id = get_req_id()
         start_time = time.perf_counter()
 
@@ -102,33 +113,32 @@ class MQTTClientNode:
             self.pending_requests[req_id] = req_ctx
 
         try:
-            # 并发投递广播
+            # MultiMQTTManager 发送时会自动在网络层加上 `|签名`
             self.mqtt_net.publish_broadcast(request_topic, req_data, client_private_key_bytes=client_private_key_bytes)
         except Exception as exc:
             with self.lock:
                 self.pending_requests.pop(req_id, None)
-            logger.error(f"❌ [私钥解析失败] req_id={req_id} error={exc}")
-            print(f"[ERROR] 私钥解析失败: {exc}")
+            logger.error(f"❌ [请求发送失败] req_id={req_id} error={exc}")
+            print(f"[ERROR] 请求发送失败: {exc}")
             return None
 
-        # 等待最快节点返回
         try:
             is_success = event.wait(timeout=timeout)
         except KeyboardInterrupt:
-            with self.lock:
-                self.pending_requests.pop(req_id, None)
             logger.warning(f"⚠️ [请求中断] req_id={req_id}")
             print("[INFO] 用户中断等待，已停止本次请求。")
             return None
+        finally:
+            # 解决内存泄漏：请求结束后（成功、超时或中断）清理 pending 记录
+            with self.lock:
+                self.pending_requests.pop(req_id, None)
 
         if is_success:
             resp = req_ctx['response']
-            logger.info(f"{req_data} \n\t{resp}") #耗时: {resp['latency_ms']:.2f}ms
+            # 不打印冗余字典，可直接依赖后续 response 解析
             return resp
         else:
-            with self.lock:
-                self.pending_requests.pop(req_id, None)
-            logger.error(f"❌ [请求超时] req_id={req_id}")
+            logger.error(f"❌ [请求超时/被拦截] req_id={req_id}")
             return None
 
     def stop(self):
@@ -146,14 +156,7 @@ def rpc(
     client_private_key_bytes=None,
     allow_no_server_pubkey_response: bool = False,
 ):
-    """Execute code through a lazily started shared MQTT client.
-
-    这是一个“签名请求 + 受控回包接受”的安全阈值：
-    - 如果客户端启用了私钥签名
-    - 但当前没有已知的服务端公钥
-    - 且未显式允许放行
-    则直接拒收回包。
-    """
+    """Execute code through a lazily started shared MQTT client."""
     global _default_client
     with _default_client_lock:
         if _default_client is None:
@@ -163,6 +166,7 @@ def rpc(
             )
             _default_client.start()
         client = _default_client
+
     return client.request(
         code,
         request_topic=request_topic,
@@ -211,7 +215,7 @@ def run_shell(client, timeout: float = 60.0):
     except ImportError:
         session = None
 
-    print("输入 Python 代码，prompt_toolkit 模式支持多行和语法高亮；输入 exit() 或 Ctrl-D 退出。")
+    print("输入 Python 代码，prompt_toolkit 模式支持多行；输入 exit() 或 Ctrl-D 退出。")
     while True:
         try:
             code = prompt() if session else _fallback_code_input()
@@ -219,18 +223,19 @@ def run_shell(client, timeout: float = 60.0):
             print("\n[INFO] 已中断当前等待，回到命令提示符。")
             continue
         except EOFError:
-            os._exit(0)
             break
+        
         if code.strip() in {"exit()", "quit()"}:
-            os._exit(0)
             break
         if not code.strip():
             continue
+            
         try:
             response = client.request(code, timeout=timeout)
         except Exception as exc:
             print(f"[ERROR] 执行请求失败: {exc}")
             continue
+            
         if response is None:
             continue
         if response.get("stdout"):
@@ -248,9 +253,7 @@ def _fallback_code_input():
     while True:
         try:
             line = input(prompt)
-        except EOFError:
-            raise
-        except KeyboardInterrupt:
+        except (EOFError, KeyboardInterrupt):
             raise
 
         if not line.strip():
@@ -270,12 +273,13 @@ def _fallback_code_input():
             return source
         prompt = "... "
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MQTT RPC client")
     parser.add_argument(
         "--client-private-key",
         "--private-key",
-        "--key",'-key','-pri',
+        "--key", '-key', '-pri',
         dest="client_private_key",
         default=None,
         help="客户端私钥文件路径或 PEM 内容；启用后请求会带签名。",
@@ -292,35 +296,44 @@ if __name__ == "__main__":
         action="store_true",
         help="允许在私钥模式下接收无公钥服务器的返回。默认会拦截。",
     )
-    parser.add_argument('--port','-port','-p', type=int, default=1166)
-    parser.add_argument('--host','-host', default='0.0.0.0')
+    parser.add_argument('--port', '-port', '-p', type=int, default=1166)
+    parser.add_argument('--host', '-host', default='0.0.0.0')
     args = parser.parse_args()
 
-    import server_http # 想要运行时候动态改client参数 用这个
-    ghs=server_http.start_rpc_server(
-            port=args.port,
-            ip=args.host,
-            globals=globals(),
-            locals=locals(),
-        )
+    import server_http
+    ghs = server_http.start_rpc_server(
+        port=args.port,
+        ip=args.host,
+        globals=globals(),
+        locals=locals(),
+    )
+
+    # 规范化私钥读取逻辑
+    key_bytes = None
+    if args.client_private_key:
+        if os.path.isfile(args.client_private_key):
+            with open(args.client_private_key, "rb") as f:
+                key_bytes = f.read()
+        else:
+            key_bytes = args.client_private_key.encode("utf-8")
 
     try:
         client = MQTTClientNode(
-            client_private_key_bytes=args.client_private_key,
+            client_private_key_bytes=key_bytes,
             allow_no_server_pubkey_response=args.allow_no_server_pubkey_response,
         )
         client.start()
         try:
-            if args.client_private_key:
-                print(f"[INFO] 使用私钥模式: {args.client_private_key}")
+            if key_bytes:
+                print(f"[INFO] 已开启客户端私钥签名模式")
+            print(f"[INFO] 允许未验签服务端响应: {args.allow_no_server_pubkey_response}")
             print(f"[INFO] 请求超时: {args.timeout}s")
             run_shell(client, timeout=args.timeout)
         finally:
             client.stop()
     except KeyboardInterrupt:
         print("\n[INFO] 用户中断，程序已体面退出。")
-        raise SystemExit(0)
+        sys.exit(0)
     except Exception as exc:
         print(f"[ERROR] 启动 MQTT client 失败: {exc}")
-        print("[INFO] 程序已体面退出。")
-        raise SystemExit(1)
+        sys.exit(1)

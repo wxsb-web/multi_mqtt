@@ -269,6 +269,24 @@ def get_standard_pem_bytes(key_input) -> bytes:
 
     return raw_bytes # 默认兜底返回
 
+def _describe_public_key(value: bytes | str | None) -> str:
+    """返回可直接写入日志的公钥摘要与详细值。"""
+    if not value:
+        return "未配置"
+    try:
+        data = value if isinstance(value, (bytes, bytearray)) else str(value).encode('utf-8')
+        if not data:
+            return "空值"
+        text = data.decode('utf-8', 'replace').strip()
+        if b"BEGIN PUBLIC KEY" in data or b"BEGIN EC PUBLIC KEY" in data:
+            return f"已配置(type=PEM, len={len(data)}, value={text})"
+        if b"ecdsa-sha2-nistp256" in data:
+            return f"已配置(type=OpenSSH, len={len(data)}, value={text})"
+        return f"已配置(type=unknown, len={len(data)}, value={text})"
+    except Exception:
+        return f"已配置(len={len(str(value))}, value={str(value)})"
+
+
 def get_standard_public_pem_bytes(key_input) -> bytes:
     """
     统一公钥解析：支持 OpenSSH 公钥、PEM 公钥、文件路径、bytes/str。
@@ -411,33 +429,47 @@ class MultiMQTTManager:
                 # {self.log_messages}  cb{self.message_callback}""")
                 # --- [新增] ECDSA 验证防重放核心逻辑 ---
                 # 只有当用户启用了签名(传入了公钥) 并且当前数据是下发命令("code"存在)时，才触发验签
-                if self.server_public_key_bytes and "code" in data:
-                    if not req_id or "|" not in req_id:
-                        logger.warning(f"⚠️ [{host}] 拒绝执行: 缺少 ECDSA 签名结构 (req_id格式不符)")
-                        return
-                    
-                    # 剥离出真实的 req_id 和 签名Hex
-                    base_req_id, sig_hex = req_id.rsplit("|", 1)
-                    
-                    # 验证1: 时间戳过期检测 (防超过 30s 的绝对重放)
-                    msg_ts = int(data.get("timestamp", 0))
-                    now_ms = utc_ms()
-                    ttl_ms = self.dedup_cache.ttl * 1000
-                    if abs(now_ms - msg_ts) > ttl_ms:
-                        logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {now_ms} {msg_ts} {ttl_ms}")
-                        return
-                    
-                    # 验证2: ECDSA 签名防篡改 (联合 hash 校验 base_req_id, code, timestamp)
-                    code_str = str(data.get("code", ""))
-                    ts_str = str(data.get("timestamp", ""))
-                    sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
-                    
-                    try:
-                        vk = ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes)
-                        vk.verify(bytes.fromhex(sig_hex), sign_msg, hashfunc=hashlib.sha256)
-                    except Exception:
-                        logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效")
-                        return
+                if "code" in data:
+                    if not self.server_public_key_bytes:
+                        logger.debug(
+                                    "ℹ️ [%s] 服务器未配置公钥，跳过验签检查。req_id=%s | has_code=%s",
+                                    host,req_id,("code" in data),  )
+                    else:
+                        if not req_id or "|" not in req_id:
+                            logger.warning(f"⚠️ [{host}] 拒绝执行: 缺少 ECDSA 签名结构 (req_id格式不符) | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
+                            return
+
+                        base_req_id, sig_hex = req_id.rsplit("|", 1)
+                        logger.info(
+                            "🔑 [%s] 请求已签名，开始验签: req_id=%s | base_req_id=%s | signature_len=%d | server_pubkey=%s",
+                            host,
+                            req_id,
+                            base_req_id,
+                            len(sig_hex),
+                            _describe_public_key(self.server_public_key_bytes),
+                        )
+
+                        msg_ts = int(data.get("timestamp", 0))
+                        now_ms = utc_ms()
+                        ttl_ms = self.dedup_cache.ttl * 1000
+                        if abs(now_ms - msg_ts) > ttl_ms:
+                            logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {now_ms} {msg_ts} {ttl_ms}")
+                            return
+
+                        code_str = str(data.get("code", ""))
+                        ts_str = str(data.get("timestamp", ""))
+                        sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
+
+                        try:
+                            vk = ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes)
+                            vk.verify(bytes.fromhex(sig_hex), sign_msg, hashfunc=hashlib.sha256)
+                            logger.info("✅ [%s] ECDSA 验签成功，允许执行: req_id=%s", host, base_req_id)
+                        except Exception:
+                            logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 | req_id={req_id} | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
+                            return
+                
+                # 没有code 字段，没有 可能是客户端收到服务器的信息
+                
                 # ----------------------------------------
 
 

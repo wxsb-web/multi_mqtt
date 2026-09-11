@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-from multi_mqtt import BROKER_LIST, MultiMQTTManager, stime, utc_ms
+from multi_mqtt import BROKER_LIST, MultiMQTTManager, stime, utc_ms, _describe_public_key
 import time
 import logging
 from rpc_executor import PythonExecutor, format_result
 
 logger = logging.getLogger("Server")
-REQUEST_TOPIC = "sys/device/request"
+REQUEST_TOPIC = 'req_topic'#"sys/device/request"
 DEFAULT_REPLY_TOPIC = "sys/device/response"
 
 class MQTTServer:
@@ -27,11 +27,22 @@ class MQTTServer:
         req_id = data.get("req_id")
         reply_topic = data.get("reply_topic") or self.reply_topic
         code = data.get("code", data.get("payload"))
+        server_pubkey = self.mqtt_net.server_public_key_bytes
 
-        logger.info(f"⚡ [{stime()}] [服务端处理请求] req_id={req_id} (首发节点: {rx_broker})")
+        logger.info(
+            "⚡ [%s] [服务端处理请求] req_id=%s (首发节点: %s) | has_code=%s | has_server_pubkey=%s | server_pubkey=%s",
+            stime(),
+            req_id,
+            rx_broker,
+            bool(code),
+            bool(server_pubkey),
+            "已配置" if server_pubkey else "未配置",
+        )
 
         execution = self.executor.execute(code)
         server_time = utc_ms()
+        if (self.mqtt_net.server_public_key_bytes ) and '|' in req_id:
+            req_id= req_id.split('|')[0]  # client 发送经过签名后 ，收到自动去除返回 代表验证执行成功
         response_data = {
             "req_id": req_id,
             "r": format_result(execution["r"]) if execution["ok"] else None,
@@ -52,7 +63,14 @@ class MQTTServer:
         self.mqtt_net.start()
         time.sleep(2)
         self.mqtt_net.subscribe(self.request_topic)
-        logger.info(f"🚀 [{stime()}] 服务端已就绪，正在监听: {self.request_topic}")
+        logger.info(
+            "🚀 [%s] 服务端已就绪，正在监听: %s | reply_topic=%s | mqtt_pub_key=%s | 验签=%s",
+            stime(),
+            self.request_topic,
+            self.reply_topic,
+            _describe_public_key(self.mqtt_net.server_public_key_bytes),
+            '启用' if self.mqtt_net.server_public_key_bytes else '关闭（接收所有消息）',
+        )
 
         try:
             while True:
@@ -68,11 +86,19 @@ def start(config):
         reply_topic=str(config.get("mqtt_reply_topic", DEFAULT_REPLY_TOPIC)),
     )
     logger.info("🚀 启动 MQTT RPC，使用网络层 BROKER_LIST，共 %d 个 Broker", len(BROKER_LIST))
-    logger.info("🔓 MQTT 公钥验签: %s", "启用" if config.get("mqtt_pub_key", "").strip() else "关闭（接收所有消息）")
+    pub_key_raw = str(config.get("mqtt_pub_key", ""))
+    server_pubkey = pub_key_raw.strip()
     server.mqtt_net.start()
     time.sleep(2)
     server.mqtt_net.subscribe(server.request_topic)
-    logger.info(f"🚀 [{stime()}] 服务端已就绪，正在监听: {server.request_topic}")
+    logger.info(
+        "🚀 [%s] 服务端已就绪，正在监听: %s | reply_topic=%s | mqtt_pub_key=%s | 验签=%s",
+        stime(),
+        server.request_topic,
+        server.reply_topic,
+        _describe_public_key(server.mqtt_net.server_public_key_bytes),
+        '启用' if server.mqtt_net.server_public_key_bytes else '关闭（接收所有消息）',
+    )
     return server
 
 
