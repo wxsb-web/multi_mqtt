@@ -8,8 +8,11 @@ from multi_mqtt import MultiMQTTManager, get_req_id, utc_ms
 
 logger = logging.getLogger("Client")
 
-REQUEST_TOPIC = "sys/device/request"
-RESPONSE_TOPIC = "sys/device/response"
+
+# REQUEST_TOPIC = "sys/device/request"
+# REPLY_TOPIC = "sys/device/response"
+from server_mqtt import REQUEST_TOPIC,DEFAULT_REPLY_TOPIC as REPLY_TOPIC
+
 DEFAULT_TIMEOUT = 30
 
 _default_client = None
@@ -36,7 +39,7 @@ class MQTTClientNode:
     def start(self):
         self.mqtt_net.start()
         time.sleep(2)
-        self.mqtt_net.subscribe(RESPONSE_TOPIC)
+        self.mqtt_net.subscribe(REPLY_TOPIC)
 
     def _on_message(self, topic, data, rx_broker):
         received_req_id = data.get("req_id")
@@ -95,7 +98,7 @@ class MQTTClientNode:
 
         req_data = {
             "req_id": req_id,
-            "reply_topic": RESPONSE_TOPIC,
+            "reply_topic": REPLY_TOPIC,
             "code": payload,
             "timestamp": utc_ms()
         }
@@ -138,7 +141,7 @@ class MQTTClientNode:
             # 不打印冗余字典，可直接依赖后续 response 解析
             return resp
         else:
-            logger.error(f"❌ [请求超时/被拦截] req_id={req_id}")
+            logger.error(f"❌ [请求超时] req_id={req_id}")
             return None
 
     def stop(self):

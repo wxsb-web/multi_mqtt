@@ -5,7 +5,7 @@ import logging
 from rpc_executor import PythonExecutor, format_result
 
 logger = logging.getLogger("Server")
-REQUEST_TOPIC = 'req_topic'#"sys/device/request"
+REQUEST_TOPIC = "sys/device/request"
 DEFAULT_REPLY_TOPIC = "sys/device/response"
 
 class MQTTServer:
@@ -79,7 +79,7 @@ class MQTTServer:
             self.mqtt_net.stop()
 
 
-def start(config):
+def start(config):# 为了导出给 Chaquopy 调用
     server = MQTTServer(
         server_public_key_bytes=str(config.get("mqtt_pub_key", "")) or None,
         request_topic=str(config.get("mqtt_request_topic", REQUEST_TOPIC)),
@@ -111,7 +111,7 @@ if __name__ == "__main__":
     #_PUB=b''
     # nargs='*' ：--pub 放到最后，其后所有空格分隔的片段会被拼回一个参数
     # --pub（后面什么都不给） 或 --pub ""  ->  b''
-    parser.add_argument('--pub','--pubkey', nargs='*', default=None)
+    parser.add_argument('--pub','--pubkey','-pub', nargs='*', default=None)
     args = parser.parse_args()
     args.pub = _PUB if args.pub is None else ' '.join(args.pub).encode('utf-8')
     
