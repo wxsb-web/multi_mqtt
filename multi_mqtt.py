@@ -30,6 +30,7 @@ def ensure_dependencies():
         sys.exit(1)
 ensure_dependencies()
 
+import ast
 import json
 import time
 import os
@@ -133,19 +134,103 @@ class TTLCache:
             self.cache[key] = now
             return True
 
+def _eval_safe_int_expression(expr):
+    """Safely evaluate a small Python integer expression used as a secret exponent."""
+    if expr is None:
+        return None
+    if isinstance(expr, int):
+        return expr
+    if not isinstance(expr, str):
+        raise ValueError("private key expression must be a string or int")
+
+    expr = expr.strip()
+    if not expr:
+        return None
+
+    try:
+        node = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"无法解析私钥表达式: {expr}") from exc
+
+    allowed_nodes = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Constant,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.FloorDiv,
+        ast.Mod,
+        ast.Pow,
+        ast.UAdd,
+        ast.USub,
+    )
+
+    def _eval(node):
+        if not isinstance(node, allowed_nodes):
+            raise ValueError(f"不允许的私钥表达式节点: {type(node).__name__}")
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, int) and not isinstance(node.value, bool):
+                return node.value
+            raise ValueError("私钥表达式必须计算出整数")
+        if isinstance(node, ast.UnaryOp):
+            operand = _eval(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return +operand
+            if isinstance(node.op, ast.USub):
+                return -operand
+            raise ValueError("不支持的一元运算")
+        if isinstance(node, ast.BinOp):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left // right
+            if isinstance(node.op, ast.FloorDiv):
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.Pow):
+                return left ** right
+            raise ValueError("不支持的二元运算")
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        raise ValueError("无法计算私钥表达式")
+
+    value = _eval(node)
+    if not isinstance(value, int):
+        raise ValueError("私钥表达式必须结果为整数")
+    return value
+
+
 def get_standard_pem_bytes(key_input) -> bytes:
     """
-    [新增组件] 统一私钥解析：支持 整数secexp、文件路径、OpenSSH格式、标准PEM格式(bytes/str)
+    [新增组件] 统一私钥解析：支持 整数secexp、Python 整数表达式、文件路径、OpenSSH格式、标准PEM格式(bytes/str)
     最终统一返回 ecdsa 库直接兼容的标准 PEM (SEC1) 字节流。
     """
     if not key_input:
         return None
-        
-    # 1. 整数或纯数字字符串当作 secexp 处理
-    if isinstance(key_input, int) or (isinstance(key_input, str) and key_input.isdigit()):
-        secexp = int(key_input)
+
+    # 1. 整数或安全 Python 整数表达式当作 secexp 处理
+    if isinstance(key_input, int):
+        secexp = key_input
         return ecdsa.SigningKey.from_secret_exponent(secexp=secexp, curve=ecdsa.NIST256p).to_pem()
-        
+    if isinstance(key_input, str):
+        text = key_input.strip()
+        if text.isdigit() or text.startswith(("0x", "0X")) or any(ch in text for ch in "+-*/%**() "):
+            try:
+                secexp = _eval_safe_int_expression(text)
+                return ecdsa.SigningKey.from_secret_exponent(secexp=secexp, curve=ecdsa.NIST256p).to_pem()
+            except ValueError:
+                pass
+
     # 2. 如果是文件路径，读取内容；否则转为 bytes
     raw_bytes = b""
     if isinstance(key_input, str):
@@ -156,32 +241,32 @@ def get_standard_pem_bytes(key_input) -> bytes:
             raw_bytes = key_input.encode('utf-8')
     elif isinstance(key_input, bytes):
         raw_bytes = key_input
-        
+
     if not raw_bytes:
         raise ValueError("无法解析传入的 client_private_key_bytes")
 
     # 3. 检查是否已经是原生 ecdsa 支持的格式
     if b"-----BEGIN EC PRIVATE KEY-----" in raw_bytes or b"-----BEGIN PRIVATE KEY-----" in raw_bytes:
         return raw_bytes
-        
+
     # 4. 如果是 OpenSSH 格式，动态借助 cryptography 转换为 ecdsa 库兼容的标准格式
     if b"-----BEGIN OPENSSH PRIVATE KEY-----" in raw_bytes:
         try:
             from cryptography.hazmat.primitives import serialization
         except ImportError:
             raise ImportError("解析 OpenSSH 格式私钥需要 cryptography 库，请先安装。")
-            
+
         try:
             priv_key = serialization.load_ssh_private_key(raw_bytes, password=None)
         except ValueError:
             priv_key = serialization.load_pem_private_key(raw_bytes, password=None)
-            
+
         return priv_key.private_bytes(
             encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL, # 强制转为兼容性极佳的 SEC1
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
             encryption_algorithm=serialization.NoEncryption()
         )
-        
+
     return raw_bytes # 默认兜底返回
 
 def get_standard_public_pem_bytes(key_input) -> bytes:
@@ -360,8 +445,8 @@ class MultiMQTTManager:
                     logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}")
 
                 if self.message_callback:
-                    if (self.server_public_key_bytes or self.client_private_key_bytes) and '|' in req_id:
-                        data["req_id"] = req_id.split('|')[0]  # client 发送经过签名后 ，收到自动去除返回
+                    # 只在真正的签名校验路径中才剥离 req_id 的签名尾巴。
+                    # 对于普通回包，req_id 的形态本身就能表示“无公钥服务端原样返回了签名参数”或“可信服务端已去签名返回”。
                     self.message_callback(msg.topic, data, host)
             except Exception:
                 logger.exception("处理 MQTT 消息失败 [%s]", host)
