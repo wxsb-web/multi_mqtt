@@ -67,7 +67,7 @@ BROKER_LIST = [
 
 '''
 这5个允许订阅 #  。泄漏所有消息
- Broker 节点               ┃     历史总 Msg / Topic 
+ Broker 节点                ┃     历史总 Msg / Topic 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━
  broker.mqtt.cool          │       18,183,031 / 976 
  mqtt.loralab.org          │             40,734 / 3 
@@ -364,15 +364,209 @@ def get_standard_public_pem_bytes(key_input) -> bytes:
         # 如果解析失败，可能已经是其他格式，直接返回
         return raw_bytes
 
+
+# =========================================================================
+# [新增解耦功能] 网络质量统计模型与管理模块（默认不占额外内存，极其轻量）
+# =========================================================================
+class BrokerStat:
+    """单一节点的数据模型（完全摒弃历史数组，保证O(1)极低内存开销）"""
+    def __init__(self):
+        self.disconnect_count = 0
+        self.last_disconnect_time = 0.0
+        self.last_connect_time = 0.0
+        self.max_offline_time = 0.0
+        self.total_online_time = 0.0
+        self.total_offline_time = 0.0
+        self.is_connected = False
+        
+        # 延迟指标滚动记录
+        self.latency_min = float('inf')
+        self.latency_max = 0.0
+        self.latency_sum = 0.0
+        self.latency_count = 0
+        
+        # 发送 QoS1 Ping 时的上下文记录
+        self.pending_ping_mid = None
+        self.pending_ping_time = 0.0
+        self.created_at = time.time()
+
+    def update_latency(self, latency_ms):
+        if latency_ms < self.latency_min: self.latency_min = latency_ms
+        if latency_ms > self.latency_max: self.latency_max = latency_ms
+        self.latency_sum += latency_ms
+        self.latency_count += 1
+        
+    @property
+    def avg_latency(self):
+        return self.latency_sum / self.latency_count if self.latency_count > 0 else 0.0
+        
+    @property
+    def reliability(self):
+        now = time.time()
+        online = self.total_online_time
+        offline = self.total_offline_time
+        
+        if self.is_connected:
+            if self.last_connect_time > 0:
+                online += (now - self.last_connect_time)
+        else:
+            if self.last_disconnect_time > 0:
+                offline += (now - self.last_disconnect_time)
+            elif self.created_at > 0:
+                offline += (now - self.created_at)
+        
+        total = online + offline
+        return (online / total * 100) if total > 0 else 0.0
+
+
+class ConnectionQualityStats:
+    """网络连接质量统筹管理器，可方便开启与关闭"""
+    def __init__(self, enabled=True, print_interval=3600):
+        self.enabled = enabled
+        self.stats = {}
+        self.lock = threading.Lock()
+        self.print_interval = print_interval
+        self.running = False
+        self.thread = None
+        self.clients_ref = {}
+
+    def start(self, clients_ref):
+        if not self.enabled: return
+        self.clients_ref = clients_ref
+        self.running = True
+        for host in self.clients_ref.keys():
+            self.stats[host] = BrokerStat()
+        
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="StatsPingThread")
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        
+    def on_connect(self, host):
+        if not self.enabled: return
+        with self.lock:
+            stat = self.stats.setdefault(host, BrokerStat())
+            now = time.time()
+            stat.is_connected = True
+            stat.last_connect_time = now
+            if stat.last_disconnect_time > 0:
+                offline_duration = now - stat.last_disconnect_time
+                stat.total_offline_time += offline_duration
+                if offline_duration > stat.max_offline_time:
+                    stat.max_offline_time = offline_duration
+
+    def on_disconnect(self, host):
+        if not self.enabled: return
+        with self.lock:
+            stat = self.stats.setdefault(host, BrokerStat())
+            now = time.time()
+            stat.is_connected = False
+            stat.last_disconnect_time = now
+            stat.disconnect_count += 1
+            if stat.last_connect_time > 0:
+                stat.total_online_time += (now - stat.last_connect_time)
+
+    def record_ping_send(self, host, mid):
+        if not self.enabled: return
+        with self.lock:
+            stat = self.stats.setdefault(host, BrokerStat())
+            stat.pending_ping_mid = mid
+            stat.pending_ping_time = time.time()
+
+    def on_publish_ack(self, host, mid):
+        """挂钩到底层 on_publish 回调计算 QoS 1 的精准 RTT 延迟"""
+        if not self.enabled: return
+        with self.lock:
+            stat = self.stats.get(host)
+            if stat and stat.pending_ping_mid == mid:
+                latency_ms = (time.time() - stat.pending_ping_time) * 1000
+                if latency_ms < 10000: # 剔除由于断线堆积重发导致的超长异常延迟(>10s)
+                    stat.update_latency(latency_ms)
+                stat.pending_ping_mid = None
+                
+    def get_report(self):
+        lines = ["\n" + "="*90]
+        header = f"{'Broker':<30} | {'Rel(%)':<6} | {'Avg(ms)':<7} | {'Min':<5} | {'Max':<5} | {'Drops':<5} | {'MaxOff(s)':<9} | {'Last Drop':<10}"
+        lines.append(header)
+        lines.append("-" * 90)
+        with self.lock:
+            # 按可靠性从高到低，同等可靠性按延迟从低到高排序
+            sorted_stats = sorted(self.stats.items(), key=lambda item: (-item[1].reliability, item[1].avg_latency))
+            for host, stat in sorted_stats:
+                rel = f"{stat.reliability:.1f}"
+                avg = f"{stat.avg_latency:.1f}" if stat.latency_count > 0 else "-"
+                min_l = f"{stat.latency_min:.1f}" if stat.latency_count > 0 else "-"
+                max_l = f"{stat.latency_max:.1f}" if stat.latency_count > 0 else "-"
+                drops = str(stat.disconnect_count)
+                max_off = f"{stat.max_offline_time:.1f}"
+                
+                if stat.last_disconnect_time > 0:
+                    last_drop = time.strftime("%H:%M:%S", time.localtime(stat.last_disconnect_time))
+                else:
+                    last_drop = "-"
+                
+                status_marker = "🟢" if stat.is_connected else "🔴"
+                row = f"{status_marker} {host:<28} | {rel:>6} | {avg:>7} | {min_l:>5} | {max_l:>5} | {drops:>5} | {max_off:>9} | {last_drop:>10}"
+                lines.append(row)
+        lines.append("="*90)
+        return "\n".join(lines)
+
+    def _monitor_loop(self):
+        """修复了原有的睡眠阻塞逻辑，通过秒级步进分开判断统计报告与Ping的时机"""
+        sleep_step = 6
+        ping_interval = 10 * 60  # 秒 发起一次极小代价的 Ping
+        
+        ping_counter = ping_interval # 启动时先立刻测一次
+        print_counter = 0
+        
+        while self.running:
+            time.sleep(sleep_step)
+            ping_counter += sleep_step
+            print_counter += sleep_step
+            
+            # 1. 检测是否需要发送 PING 指令来测距
+            if ping_counter >= ping_interval:
+                ping_counter = 0
+                for host, client in self.clients_ref.items():
+                    stat = self.stats.get(host)
+                    if stat and stat.is_connected and client.is_connected():
+                        try:
+                            # 使用 QoS 1 发布空载荷到隔离 topic 测试 RTT
+                            # 发送成功会触发 on_publish 抛出 PUBACK 进行秒表停止
+                            msg_info = client.publish(f"multi_mqtt/ping_rtt/{host}", b"", qos=1)
+                            self.record_ping_send(host, msg_info.mid)
+                        except Exception:
+                            pass
+                        
+            # 2. 检测是否需要打印输出报告（不再依赖 ping_interval 被阻塞）
+            if self.print_interval > 0 and print_counter >= self.print_interval:
+                print_counter = 0
+                logger.info("📡 [连接质量统计报告]" + self.get_report())
+
+
+# =========================================================================
+
 class MultiMQTTManager:
-    # [微调] 增加了 server_public_key_bytes (服务端验签用) 和 client_private_key_bytes (客户端签名用)，默认均为 None
-    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None):
+    # [微调] 增加了 server_public_key_bytes, client_private_key_bytes 以及连接统计参数 (enable_stats/log_connection)
+    # [新增] keepalive 与 max_reconnect_delay 参数
+    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60, max_reconnect_delay=3600):
         self.brokers = brokers
+        self.keepalive = keepalive
+        self.max_reconnect_delay = max_reconnect_delay
         self.clients = {}
         self.log_messages = log_messages
         self.enable_crypto = enable_crypto  # 默认关闭加密
         self.server_public_key_bytes = get_standard_public_pem_bytes(server_public_key_bytes)
         self.client_private_key_bytes = get_standard_pem_bytes(client_private_key_bytes) # [接入解析]
+        
+        # --- [统计功能新增] ---
+        self.enable_stats = enable_stats
+        # 如果没有显式指定，当开启统计时自动把底层刷屏连接日志关掉
+        self.log_connection = log_connection if log_connection is not None else not enable_stats
+        self.stats = ConnectionQualityStats(enabled=self.enable_stats)
+        # ----------------------
+        
         self.dedup_cache = TTLCache(ttl_seconds=30)
         self.message_callback = None
         self.subscribed_topics = set()
@@ -388,37 +582,56 @@ class MultiMQTTManager:
             client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
             client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
 
-            # 开启自动重连退避策略 (1~60秒)
-            client.reconnect_delay_set(min_delay=1, max_delay=60)
+            # [调整] 开启自动重连退避策略，将 max_delay 拉长至 max_reconnect_delay (默认1小时) 防止重连风暴发热
+            client.reconnect_delay_set(min_delay=1, max_delay=self.max_reconnect_delay)
 
             client.on_connect = self._make_on_connect(host)
             client.on_disconnect = self._make_on_disconnect(host)
             client.on_message = self._make_on_message(host)
+            client.on_publish = self._make_on_publish(host)  # [新增] 挂钩测速回调
 
             try:
-                client.connect_async(host, port, keepalive=30)
+                # [调整] 传入 keepalive 参数让底层操作系统来维持 TCP 连接 (默认60s)
+                client.connect_async(host, port, keepalive=self.keepalive)
                 client.loop_start()
                 self.clients[host] = client
-                logger.info(f"开启后台连接任务 -> {host}:{port}")
+                if self.log_connection:
+                    logger.info(f"开启后台连接任务 -> {host}:{port}")
             except Exception as e:
                 logger.error(f"连接初始化失败 [{host}]: {e}")
+                
+        # 启动质量统计模块
+        if self.enable_stats:
+            self.stats.start(self.clients)
 
     def _make_on_connect(self, host):
         def on_connect(client, userdata, flags, rc, properties=None):
             if rc == 0:
-                logger.info(f"✅ [已连接] Broker: {host}")
+                if self.log_connection:
+                    logger.info(f"✅ [已连接] Broker: {host}")
+                self.stats.on_connect(host)  # [接入统计]
                 with self.lock:
                     for topic in self.subscribed_topics:
                         client.subscribe(topic)
             else:
-                logger.warning(f"❌ [连接失败] Broker: {host}, rc={rc}")
+                if self.log_connection:
+                    logger.warning(f"❌ [连接失败] Broker: {host}, rc={rc}")
         return on_connect
 
     def _make_on_disconnect(self, host):
         def on_disconnect(client, userdata, flags, rc, properties=None):
+            self.stats.on_disconnect(host)  # [接入统计]
             if rc != 0:
-                logger.warning(f"⚠️ [意外断开] Broker: {host} (rc={rc})，自动尝试重连...")
+                if self.log_connection:
+                    logger.warning(f"⚠️ [意外断开] Broker: {host} (rc={rc})，自动尝试重连...")
         return on_disconnect
+
+    def _make_on_publish(self, host):
+        # 兼容 paho-mqtt 各版本的 on_publish 函数签名
+        def on_publish(client, userdata, mid, *args, **kwargs):
+            if self.enable_stats:
+                self.stats.on_publish_ack(host, mid)
+        return on_publish
 
     def _make_on_message(self, host):
         def on_message(client, userdata, msg):
@@ -536,6 +749,8 @@ class MultiMQTTManager:
                 c.publish(topic, payload_str, qos=0)
 
     def stop(self):
+        if self.enable_stats:
+            self.stats.stop()
         for c in self.clients.values():
             c.loop_stop()
             c.disconnect()
