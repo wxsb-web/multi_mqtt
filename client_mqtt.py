@@ -86,6 +86,7 @@ class MQTTClientNode:
         timeout: float = 5.0,
         client_private_key_bytes=None,
         allow_no_server_pubkey_response: bool = None,
+        reply_topic: str = REPLY_TOPIC,
     ):
         client_private_key_bytes = client_private_key_bytes or self.client_private_key_bytes or getattr(self.mqtt_net, 'client_private_key_bytes', None)
         
@@ -93,14 +94,15 @@ class MQTTClientNode:
             allow_no_server_pubkey_response = self.allow_no_server_pubkey_response
 
         # 生成基础的 req_id（不带签名）
-        req_id = get_req_id()
+        ms=utc_ms()
+        req_id = get_req_id(ms)
         start_time = time.perf_counter()
 
         req_data = {
             "req_id": req_id,
-            "reply_topic": REPLY_TOPIC,
+            "reply_topic": reply_topic,
             "code": payload,
-            "timestamp": utc_ms()
+            "timestamp": ms
         }
 
         event = threading.Event()
@@ -115,6 +117,10 @@ class MQTTClientNode:
         with self.lock:
             self.pending_requests[req_id] = req_ctx
 
+        # 如果使用了非默认的 reply_topic，确保网络层已订阅该主题以免收不到回包
+        if reply_topic != REPLY_TOPIC:
+            self.mqtt_net.subscribe(reply_topic)
+
         try:
             # MultiMQTTManager 发送时会自动在网络层加上 `|签名`
             self.mqtt_net.publish_broadcast(request_topic, req_data, client_private_key_bytes=client_private_key_bytes)
@@ -126,7 +132,13 @@ class MQTTClientNode:
             return None
 
         try:
-            is_success = event.wait(timeout=timeout)
+            # 将长时间的一步阻塞拆分为小步轮询，避免子线程阻塞过深无法响应退出信号
+            start_t = time.perf_counter()
+            is_success = False
+            while time.perf_counter() - start_t < timeout:
+                if event.wait(timeout=0.2):
+                    is_success = True
+                    break
         except KeyboardInterrupt:
             logger.warning(f"⚠️ [请求中断] req_id={req_id}")
             print("[INFO] 用户中断等待，已停止本次请求。")
@@ -158,6 +170,7 @@ def rpc(
     timeout: float = DEFAULT_TIMEOUT,
     client_private_key_bytes=None,
     allow_no_server_pubkey_response: bool = False,
+    reply_topic: str = REPLY_TOPIC,
 ):
     """Execute code through a lazily started shared MQTT client."""
     global _default_client
@@ -176,6 +189,7 @@ def rpc(
         timeout=timeout,
         client_private_key_bytes=client_private_key_bytes,
         allow_no_server_pubkey_response=allow_no_server_pubkey_response,
+        reply_topic=reply_topic,
     )
 
 

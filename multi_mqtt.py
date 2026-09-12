@@ -85,19 +85,27 @@ BROKER_LIST = [
 客户端接收结果时：客户端收到回复，看到 payload 里没有 "code" 字段，就会直接跳过验签逻辑，走原来的普通流程（去重 -> 打印结果）。
 '''
 
-def stime(format='%Y-%m-%d__%H.%M.%S',ms_splitor='__.'):
-    """可读毫秒级时间戳"""
-    ft = time.time()
-    return time.strftime(format, time.localtime(ft)) + ms_splitor + f"{ft:.3f}".split('.')[1]
+
+def stime(ms=0, format='%Y-%m-%d__%H.%M.%S', ms_splitor='__.'):
+    """可读毫秒级时间戳。ms 传整数毫秒；不传则取当前 UTC 毫秒。"""
+    if not ms:
+        ms = utc_ms()
+    elif isinstance(ms, float) and ms < 1e11:
+        # 看起来是 time.time() 的秒级浮点，转成整数毫秒
+        ms = round(ms * 1000)
+    else:
+        ms = int(ms)
+    sec, milli = divmod(ms, 1000)
+    return time.strftime(format, time.localtime(sec)) + ms_splitor + f"{milli:03d}"
 
 def utc_ms():
     """Return the current UTC Unix timestamp in integer milliseconds."""
     return time.time_ns() // 1_000_000
 
-def get_req_id():
+def get_req_id(ms=0):
     """生成格式：req_YYYY-MM-DD__HH.MM.SS__.毫秒_随机Hash"""
-    hash_str = hashlib.md5(f"{time.time()}_{random.random()}".encode()).hexdigest()[:6]
-    return f"{stime(format='%Y%m%d_%H%M%S',ms_splitor='.')} {hash_str}"
+    # hash_str = hashlib.md5(f"{time.time()}_{random.random()}".encode()).hexdigest()[:6]
+    return f"{stime(ms=ms,format='%Y%m%d_%H%M%S',ms_splitor='.')}"
 
 AES_KEY = b"12345678901234567890123456789012"
 def process_cipher(data, decrypt=False, enabled=False, key=AES_KEY):
