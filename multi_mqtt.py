@@ -242,7 +242,7 @@ def get_standard_pem_bytes(key_input) -> bytes:
     # 2. 如果是文件路径，读取内容；否则转为 bytes
     raw_bytes = b""
     if isinstance(key_input, str):
-        if os.path.isfile(key_input):
+        if not key_input.startswith("-----") and len(key_input) < 255 and os.path.isfile(key_input):
             with open(key_input, "rb") as f:
                 raw_bytes = f.read()
         else:
@@ -305,7 +305,7 @@ def get_standard_public_pem_bytes(key_input) -> bytes:
 
     raw_bytes = b""
     if isinstance(key_input, str):
-        if os.path.isfile(key_input):
+        if not key_input.startswith("-----") and len(key_input) < 255 and os.path.isfile(key_input):
             with open(key_input, "rb") as f:
                 raw_bytes = f.read()
         else:
@@ -363,7 +363,6 @@ def get_standard_public_pem_bytes(key_input) -> bytes:
     except Exception:
         # 如果解析失败，可能已经是其他格式，直接返回
         return raw_bytes
-
 
 # =========================================================================
 # [新增解耦功能] 网络质量统计模型与管理模块（默认不占额外内存，极其轻量）
@@ -448,24 +447,37 @@ class ConnectionQualityStats:
         with self.lock:
             stat = self.stats.setdefault(host, BrokerStat())
             now = time.time()
+            
+            # [修复盲区]: 只有之前是断开状态，才去结算离线时间，防止重连过程重复计算
+            if not stat.is_connected:
+                if stat.last_disconnect_time > 0:
+                    offline_duration = now - stat.last_disconnect_time
+                    stat.total_offline_time += offline_duration
+                    if offline_duration > stat.max_offline_time:
+                        stat.max_offline_time = offline_duration
+                elif stat.created_at > 0:
+                    offline_duration = now - stat.created_at
+                    stat.total_offline_time += offline_duration
+                    if offline_duration > stat.max_offline_time:
+                        stat.max_offline_time = offline_duration
+
             stat.is_connected = True
             stat.last_connect_time = now
-            if stat.last_disconnect_time > 0:
-                offline_duration = now - stat.last_disconnect_time
-                stat.total_offline_time += offline_duration
-                if offline_duration > stat.max_offline_time:
-                    stat.max_offline_time = offline_duration
 
     def on_disconnect(self, host):
         if not self.enabled: return
         with self.lock:
             stat = self.stats.setdefault(host, BrokerStat())
             now = time.time()
-            stat.is_connected = False
+            
+            # [修复盲区]: 只有之前是在线状态，才结算在线时间并增加掉线计数，防止重连失败时被狂刷
+            if stat.is_connected:
+                if stat.last_connect_time > 0:
+                    stat.total_online_time += (now - stat.last_connect_time)
+                stat.is_connected = False
+                stat.disconnect_count += 1
+                
             stat.last_disconnect_time = now
-            stat.disconnect_count += 1
-            if stat.last_connect_time > 0:
-                stat.total_online_time += (now - stat.last_connect_time)
 
     def record_ping_send(self, host, mid):
         if not self.enabled: return
@@ -485,33 +497,93 @@ class ConnectionQualityStats:
                     stat.update_latency(latency_ms)
                 stat.pending_ping_mid = None
                 
-    def get_report(self):
+    def get_report(self, sort="rel", reverse=True):
+        """
+        获取网络连接质量统计报告
+        :param sort: 排序指标 (可选: 'broker', 'rel', 'avg', 'min', 'max', 'drops', 'max_off')
+        :param reverse: 是否降序排列 (默认 True)
+        """
         lines = ["\n" + "="*90]
         header = f"{'Broker':<30} | {'Rel(%)':<6} | {'Avg(ms)':<7} | {'Min':<5} | {'Max':<5} | {'Drops':<5} | {'MaxOff(s)':<9} | {'Last Drop':<10}"
         lines.append(header)
         lines.append("-" * 90)
+        
         with self.lock:
-            # 按可靠性从高到低，同等可靠性按延迟从低到高排序
-            sorted_stats = sorted(self.stats.items(), key=lambda item: (-item[1].reliability, item[1].avg_latency))
-            for host, stat in sorted_stats:
-                rel = f"{stat.reliability:.1f}"
-                avg = f"{stat.avg_latency:.1f}" if stat.latency_count > 0 else "-"
-                min_l = f"{stat.latency_min:.1f}" if stat.latency_count > 0 else "-"
-                max_l = f"{stat.latency_max:.1f}" if stat.latency_count > 0 else "-"
-                drops = str(stat.disconnect_count)
-                max_off = f"{stat.max_offline_time:.1f}"
+            current_time = time.time()
+            display_stats = []
+            
+            # 1. 数据预处理（计算实时动态指标）
+            for host, stat in self.stats.items():
+                is_conn = stat.is_connected
+                max_off = stat.max_offline_time
+                total_off = getattr(stat, 'total_offline_time', 0.0)
                 
-                if stat.last_disconnect_time > 0:
-                    last_drop = time.strftime("%H:%M:%S", time.localtime(stat.last_disconnect_time))
+                # 修复盲区：如果当前处于断线状态，加上正在发生的离线时间
+                if not is_conn and stat.last_disconnect_time > 0:
+                    current_off_duration = current_time - stat.last_disconnect_time
+                    max_off = max(max_off, current_off_duration)
+                    total_off += current_off_duration
+                
+                # 动态计算最新可靠性
+                total_time = current_time - stat.created_at
+                if total_time > 0:
+                    rel = max(0.0, 100.0 * (1.0 - (total_off / total_time)))
                 else:
-                    last_drop = "-"
+                    rel = 100.0
+
+                display_stats.append({
+                    'host': host,
+                    'is_conn': is_conn,
+                    'rel': rel,
+                    'avg': stat.avg_latency if stat.latency_count > 0 else -1.0,
+                    'min': stat.latency_min if stat.latency_count > 0 else -1.0,
+                    'max': stat.latency_max if stat.latency_count > 0 else -1.0,
+                    'drops': stat.disconnect_count,
+                    'max_off': max_off,
+                    'last_drop_ts': stat.last_disconnect_time
+                })
+
+            # 2. 排序逻辑
+            def sort_key(item):
+                k = sort.lower()
+                if k == "broker": return item['host']
+                elif k in ("rel", "reliability"): return item['rel']
+                elif k in ("avg", "avg_latency"): return item['avg'] if item['avg'] >= 0 else (-1 if reverse else float('inf'))
+                elif k in ("min", "latency_min"): return item['min'] if item['min'] >= 0 else (-1 if reverse else float('inf'))
+                elif k in ("max", "latency_max"): return item['max'] if item['max'] >= 0 else (-1 if reverse else float('inf'))
+                elif k in ("drops", "disconnect_count"): return item['drops']
+                elif k in ("max_off", "max_offline_time"): return item['max_off']
+                else: return item['rel'] # 默认按可靠性
+
+            # 执行多级排序：主指标优先，次要指标为平均延迟，最后为名字
+            sorted_stats = sorted(
+                display_stats, 
+                key=lambda x: (sort_key(x), -x['avg'], x['host']), 
+                reverse=reverse
+            )
+            
+            # 3. 渲染输出
+            for item in sorted_stats:
+                rel_str = f"{item['rel']:.1f}"
+                avg_str = f"{item['avg']:.1f}" if item['avg'] >= 0 else "-"
+                min_str = f"{item['min']:.1f}" if item['min'] >= 0 else "-"
+                max_str = f"{item['max']:.1f}" if item['max'] >= 0 else "-"
+                drops_str = str(item['drops'])
+                max_off_str = f"{item['max_off']:.1f}"
                 
-                status_marker = "🟢" if stat.is_connected else "🔴"
-                row = f"{status_marker} {host:<28} | {rel:>6} | {avg:>7} | {min_l:>5} | {max_l:>5} | {drops:>5} | {max_off:>9} | {last_drop:>10}"
+                if item['last_drop_ts'] > 0:
+                    # 将时间戳转换为时分秒
+                    last_drop_str = time.strftime("%H:%M:%S", time.localtime(item['last_drop_ts']))
+                else:
+                    last_drop_str = "-"
+                
+                status_marker = "🟢" if item['is_conn'] else "🔴"
+                row = f"{status_marker} {item['host']:<28} | {rel_str:>6} | {avg_str:>7} | {min_str:>5} | {max_str:>5} | {drops_str:>5} | {max_off_str:>9} | {last_drop_str:>10}"
                 lines.append(row)
+                
         lines.append("="*90)
         return "\n".join(lines)
-
+        
     def _monitor_loop(self):
         """修复了原有的睡眠阻塞逻辑，通过秒级步进分开判断统计报告与Ping的时机"""
         sleep_step = 6
@@ -582,16 +654,20 @@ class MultiMQTTManager:
             client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
             client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
 
-            # [调整] 开启自动重连退避策略，将 max_delay 拉长至 max_reconnect_delay (默认1小时) 防止重连风暴发热
+            # [修复思路执行]: 利用 userdata 完美隔离上下文，完全抛弃闭包
+            client.user_data_set(host)
+
+            # 开启自动重连退避策略，将 max_delay 拉长至 max_reconnect_delay (默认1小时) 防止重连风暴发热
             client.reconnect_delay_set(min_delay=1, max_delay=self.max_reconnect_delay)
 
-            client.on_connect = self._make_on_connect(host)
-            client.on_disconnect = self._make_on_disconnect(host)
-            client.on_message = self._make_on_message(host)
-            client.on_publish = self._make_on_publish(host)  # [新增] 挂钩测速回调
+            # 统一绑定类方法，不再动态创建工厂函数
+            client.on_connect = self._on_connect
+            client.on_disconnect = self._on_disconnect
+            client.on_message = self._on_message
+            client.on_publish = self._on_publish
 
             try:
-                # [调整] 传入 keepalive 参数让底层操作系统来维持 TCP 连接 (默认60s)
+                # 传入 keepalive 参数让底层操作系统来维持 TCP 连接 (默认60s)
                 client.connect_async(host, port, keepalive=self.keepalive)
                 client.loop_start()
                 self.clients[host] = client
@@ -604,106 +680,95 @@ class MultiMQTTManager:
         if self.enable_stats:
             self.stats.start(self.clients)
 
-    def _make_on_connect(self, host):
-        def on_connect(client, userdata, flags, rc, properties=None):
-            if rc == 0:
-                if self.log_connection:
-                    logger.info(f"✅ [已连接] Broker: {host}")
-                self.stats.on_connect(host)  # [接入统计]
-                with self.lock:
-                    for topic in self.subscribed_topics:
-                        client.subscribe(topic)
-            else:
-                if self.log_connection:
-                    logger.warning(f"❌ [连接失败] Broker: {host}, rc={rc}")
-        return on_connect
+    # ================= [基于 Userdata 的统一回调] =================
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
+        host = userdata  # 优雅获取隔离的独立上下文
+        if rc == 0:
+            if self.log_connection:
+                logger.info(f"✅ [已连接] Broker: {host}")
+            self.stats.on_connect(host)  # [接入统计]
+            with self.lock:
+                for topic in self.subscribed_topics:
+                    client.subscribe(topic)
+        else:
+            if self.log_connection:
+                logger.warning(f"❌ [连接失败] Broker: {host}, rc={rc}")
 
-    def _make_on_disconnect(self, host):
-        def on_disconnect(client, userdata, flags, rc, properties=None):
-            self.stats.on_disconnect(host)  # [接入统计]
-            if rc != 0:
-                if self.log_connection:
-                    logger.warning(f"⚠️ [意外断开] Broker: {host} (rc={rc})，自动尝试重连...")
-        return on_disconnect
+    def _on_disconnect(self, client, userdata, flags, rc, properties=None):
+        host = userdata
+        self.stats.on_disconnect(host)  # [接入统计]
+        if rc != 0:
+            if self.log_connection:
+                logger.warning(f"⚠️ [意外断开] Broker: {host} (rc={rc})，自动尝试重连...")
 
-    def _make_on_publish(self, host):
-        # 兼容 paho-mqtt 各版本的 on_publish 函数签名
-        def on_publish(client, userdata, mid, *args, **kwargs):
-            if self.enable_stats:
-                self.stats.on_publish_ack(host, mid)
-        return on_publish
+    def _on_publish(self, client, userdata, mid, *args, **kwargs):
+        host = userdata
+        if self.enable_stats:
+            self.stats.on_publish_ack(host, mid)
 
-    def _make_on_message(self, host):
-        def on_message(client, userdata, msg):
-            try:
-                raw_payload = msg.payload.decode('utf-8')
-                data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
+    def _on_message(self, client, userdata, msg):
+        host = userdata
+        try:
+            raw_payload = msg.payload.decode('utf-8')
+            data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
 
-                req_id = data.get("req_id")
-                # 去重判定：首胜丢弃逻辑 网络层行为放最前 (无论是原生 req_id 还是附带签名的 req_id，直接全量存入 Cache 用于 30 秒内去重)
-                if req_id and not self.dedup_cache.add_if_not_exists(req_id):
-                    return
-                
-                
-                
-                # logger.info(f"""📩 收到消息 {data} 来自 {host}  {self.server_public_key_bytes}
-                # {self.log_messages}  cb{self.message_callback}""")
-                # --- [新增] ECDSA 验证防重放核心逻辑 ---
-                # 只有当用户启用了签名(传入了公钥) 并且当前数据是下发命令("code"存在)时，才触发验签
-                if "code" in data:
-                    if not self.server_public_key_bytes:
-                        logger.debug(
-                                    "ℹ️ [%s] 服务器未配置公钥，跳过验签检查。req_id=%s | has_code=%s",
-                                    host,req_id,("code" in data),  )
-                    else:
-                        if not req_id or "|" not in req_id:
-                            logger.warning(f"⚠️ [{host}] 拒绝执行: 缺少 ECDSA 签名结构 (req_id格式不符) | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
-                            return
+            req_id = data.get("req_id")
+            # 去重判定：首胜丢弃逻辑 网络层行为放最前 (无论是原生 req_id 还是附带签名的 req_id，直接全量存入 Cache 用于 30 秒内去重)
+            if req_id and not self.dedup_cache.add_if_not_exists(req_id):
+                return
+            
+            # --- [新增] ECDSA 验证防重放核心逻辑 ---
+            # 只有当用户启用了签名(传入了公钥) 并且当前数据是下发命令("code"存在)时，才触发验签
+            if "code" in data:
+                if not self.server_public_key_bytes:
+                    logger.debug(
+                                "ℹ️ [%s] 服务器未配置公钥，跳过验签检查。req_id=%s | has_code=%s",
+                                host,req_id,("code" in data),  )
+                else:
+                    if not req_id or "|" not in req_id:
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: 缺少 ECDSA 签名结构 (req_id格式不符) | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
+                        return
 
-                        base_req_id, sig_hex = req_id.rsplit("|", 1)
-                        logger.info(
-                            "🔑 [%s] 请求已签名，开始验签: req_id=%s | base_req_id=%s | signature_len=%d | server_pubkey=%s",
-                            host,
-                            req_id,
-                            base_req_id,
-                            len(sig_hex),
-                            _describe_public_key(self.server_public_key_bytes),
-                        )
+                    base_req_id, sig_hex = req_id.rsplit("|", 1)
+                    logger.info(
+                        "🔑 [%s] 请求已签名，开始验签: req_id=%s | base_req_id=%s | signature_len=%d | server_pubkey=%s",
+                        host,
+                        req_id,
+                        base_req_id,
+                        len(sig_hex),
+                        _describe_public_key(self.server_public_key_bytes),
+                    )
 
-                        msg_ts = int(data.get("timestamp", 0))
-                        now_ms = utc_ms()
-                        ttl_ms = self.dedup_cache.ttl * 1000
-                        if abs(now_ms - msg_ts) > ttl_ms:
-                            logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {now_ms} {msg_ts} {ttl_ms}")
-                            return
+                    msg_ts = int(data.get("timestamp", 0))
+                    now_ms = utc_ms()
+                    ttl_ms = self.dedup_cache.ttl * 1000
+                    if abs(now_ms - msg_ts) > ttl_ms:
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {now_ms} {msg_ts} {ttl_ms}")
+                        return
 
-                        code_str = str(data.get("code", ""))
-                        ts_str = str(data.get("timestamp", ""))
-                        sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
+                    code_str = str(data.get("code", ""))
+                    ts_str = str(data.get("timestamp", ""))
+                    sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
 
-                        try:
-                            vk = ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes)
-                            vk.verify(bytes.fromhex(sig_hex), sign_msg, hashfunc=hashlib.sha256)
-                            logger.info("✅ [%s] ECDSA 验签成功，允许执行: req_id=%s", host, base_req_id)
-                        except Exception:
-                            logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 | req_id={req_id} | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
-                            return
-                
-                # 没有code 字段，没有 可能是客户端收到服务器的信息
-                
-                # ----------------------------------------
+                    try:
+                        vk = ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes)
+                        vk.verify(bytes.fromhex(sig_hex), sign_msg, hashfunc=hashlib.sha256)
+                        logger.info("✅ [%s] ECDSA 验签成功，允许执行: req_id=%s", host, base_req_id)
+                    except Exception:
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 | req_id={req_id} | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
+                        return
+            
+            # ----------------------------------------
 
+            if self.log_messages:
+                logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}")
 
-                if self.log_messages:
-                    logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}")
-
-                if self.message_callback:
-                    # 只在真正的签名校验路径中才剥离 req_id 的签名尾巴。
-                    # 对于普通回包，req_id 的形态本身就能表示“无公钥服务端原样返回了签名参数”或“可信服务端已去签名返回”。
-                    self.message_callback(msg.topic, data, host)
-            except Exception:
-                logger.exception("处理 MQTT 消息失败 [%s]", host)
-        return on_message
+            if self.message_callback:
+                # 只在真正的签名校验路径中才剥离 req_id 的签名尾巴。
+                # 对于普通回包，req_id 的形态本身就能表示“无公钥服务端原样返回了签名参数”或“可信服务端已去签名返回”。
+                self.message_callback(msg.topic, data, host)
+        except Exception:
+            logger.exception("处理 MQTT 消息失败 [%s]", host)
 
     def subscribe(self, topic: str):
         with self.lock:
@@ -723,13 +788,7 @@ class MultiMQTTManager:
         
         if current_priv_key and "code" in payload_dict:
             assert "timestamp" in payload_dict
-            # 防重放所需的必要字段 就2个 ，其实可以只要一个
             
-            # if "timestamp" not in payload_dict:
-                # payload_dict["timestamp"] = utc_ms()
-            # if "req_id" not in payload_dict:
-                # payload_dict["req_id"] = get_req_id()
-                
             base_req_id = str(payload_dict["req_id"])
             code_str = str(payload_dict.get("code", ""))
             ts_str = str(payload_dict["timestamp"])
