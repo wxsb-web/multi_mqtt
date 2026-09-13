@@ -957,9 +957,9 @@ class MultiMQTTManager:
                     try:
                         # [修复-⑥] 直接复用缓存对象，不再每次 from_pem
                         self.server_vk.verify(bytes.fromhex(sig_hex), sign_msg, hashfunc=hashlib.sha256)
-                        logger.info("✅ [%s] ECDSA 验签成功，允许执行: req_id=%s", host, base_req_id)
+                        logger.debug("✅ [%s] ECDSA 验签成功，允许执行: req_id=%s", host, base_req_id)
                     except Exception:
-                        logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 | req_id={req_id} | server_pubkey={_describe_public_key(self.server_public_key_bytes,short_text=True)}")
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 , req_id={req_id} , server_pubkey={_describe_public_key(self.server_public_key_bytes,short_text=True)}")
                         return
             
             # ------------------------------------------------------------------

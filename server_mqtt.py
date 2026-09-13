@@ -30,13 +30,12 @@ class MQTTServer:
         server_pubkey = self.mqtt_net.server_public_key_bytes
 
         logger.info(
-            "⚡ [%s] [服务端处理请求] req_id=%s (首发节点: %s) | has_code=%s | has_server_pubkey=%s | server_pubkey=%s",
+            "⚡ [%s] [服务端处理请求] req_id=%s (首发节点: %s) , has_code=%s , has_server_pubkey=%s ",
             stime(),
             req_id,
             rx_broker,
             bool(code),
             bool(server_pubkey),
-            server_pubkey,
         )
 
         execution = self.executor.execute(code)
@@ -64,7 +63,7 @@ class MQTTServer:
         time.sleep(2)
         self.mqtt_net.subscribe(self.request_topic)
         logger.info(
-            "🚀 [%s] 服务端已就绪，正在监听: %s | reply_topic=%s | mqtt_pub_key=%s | 验签=%s",
+            "🚀 [%s] 服务端已就绪，正在监听: %s , reply_topic=%s , mqtt_pub_key=%s , 验签=%s",
             stime(),
             self.request_topic,
             self.reply_topic,
@@ -94,7 +93,7 @@ def start(config):# 为了导出给 Chaquopy 调用
     time.sleep(2)
     server.mqtt_net.subscribe(server.request_topic)
     logger.info(
-        "🚀 [%s] 服务端已就绪，正在监听: %s | reply_topic=%s | mqtt_pub_key=%s | 验签=%s",
+        "🚀 [%s] 服务端已就绪，正在监听: %s , reply_topic=%s , mqtt_pub_key=%s , 验签=%s",
         stime(),
         server.request_topic,
         server.reply_topic,
