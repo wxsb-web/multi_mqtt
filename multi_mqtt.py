@@ -875,6 +875,8 @@ class MultiMQTTManager:
         """
         host = userdata
         try:
+            if self.log_messages:
+                logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}  {msg} {msg.payload}")    
             raw_payload = msg.payload.decode('utf-8')
             data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
             # [增加类型校验防御]: 确保 data 为字典类型
@@ -893,7 +895,7 @@ class MultiMQTTManager:
             elif isinstance(raw_req_id, str):
                 req_id = raw_req_id
             else:
-                req_id = str(raw_req_id)
+                req_id = str(raw_req_id)    
             # ------------------------------------------------------------------
             # [修复-N4] req_id 长度上限校验。
             # req_id 最终会写入 TTLCache（TTL=30 秒）。公共 broker 上任何节点
@@ -906,6 +908,11 @@ class MultiMQTTManager:
                     f"⚠️ [{host}] 拒绝处理: req_id 长度超限 (len={len(req_id)} > {self.MAX_REQ_ID_LEN})"
                 )
                 return
+            # [安全] 去重放到验签之前，但是 伪造 req_id 污染缓存造成 DoS 这是已知问题 不修复
+            if req_id and not self.dedup_cache.add_if_not_exists(req_id):
+                return
+            
+                
             # --- ECDSA 验证防重放核心逻辑 ---
             if "code" in data:
                 # [修复-S3] fail-closed：公钥配置了但解析失败 → 直接拒绝
@@ -955,11 +962,7 @@ class MultiMQTTManager:
                     except Exception:
                         logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 | req_id={req_id} | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
                         return
-            # [安全] 去重放到验签之后，避免伪造 req_id 污染缓存造成 DoS
-            if req_id and not self.dedup_cache.add_if_not_exists(req_id):
-                return
-            if self.log_messages:
-                logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}")
+            
             # ------------------------------------------------------------------
             # [修复-③] 不再同步调用 self.message_callback（会阻塞 paho 网络线程）。
             # 改为入队，交由独立的 MQTTMsgDispatch 线程串行消费。
