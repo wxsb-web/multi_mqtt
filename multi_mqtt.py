@@ -371,7 +371,7 @@ def get_standard_public_pem_bytes(key_input) -> bytes:
 # =========================================================================
 # [新增解耦功能] 网络质量统计模型与管理模块（默认不占额外内存，极其轻量）
 class BrokerStat:
-    """单一节点的数据模型（完全摒弃历史数组，保证O(1)极低内存开销）"""
+    """单一节点的数据模型 保证O(1)极低内存开销）"""
     # [轻量化] __slots__ 避免每个实例再挂一份 __dict__，配合"极其轻量"的设计目标
     __slots__ = (
         "disconnect_count", "last_disconnect_time", "last_connect_time",
@@ -940,13 +940,6 @@ class MultiMQTTManager:
                 
             # --- ECDSA 验证防重放核心逻辑 ---
             if "code" in data:
-                # [修复-S3] fail-closed：公钥配置了但解析失败 → 直接拒绝
-                if self._server_vk_invalid:
-                    logger.warning(
-                        f"⚠️ [{host}] 拒绝执行: 服务端公钥配置无效 (fail-closed) | "
-                        f"server_pubkey={_describe_public_key(self.server_public_key_bytes)}"
-                    )
-                    return
                 if self.server_vk is None:
                     # [修复-⑥] 使用 __init__ 中已缓存的验签对象
                     logger.debug(
@@ -1021,7 +1014,7 @@ class MultiMQTTManager:
         if self.enable_stats:
             ping_interval = self.stats.PING_INTERVAL
             print_interval = self.stats.print_interval
-            next_ping_at = time.time() + ping_interval
+            next_ping_at = time.time() #+ ping_interval #首次 Ping 不要等
             next_print_at = (time.time() + print_interval) if print_interval > 0 else float('inf')
         else:
             next_ping_at = next_print_at = float('inf')
