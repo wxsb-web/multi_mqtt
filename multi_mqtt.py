@@ -30,7 +30,7 @@ def ensure_dependencies():
         sys.exit(1)
 ensure_dependencies()
 
-import ast,json,time,os,uuid,hashlib,random,logging,base64,struct,threading,queue
+import ast,json,time,os,uuid,hashlib,logging,base64,struct,threading,queue
 import ecdsa  # [新增]
 from collections import OrderedDict
 from paho.mqtt import client as mqtt_client
@@ -98,7 +98,7 @@ def get_req_id(ms=0):
     """ get_req_id 的返回值只精确到了毫秒，如果单片机在同一毫秒内连发两条不同状态，后一条会被 TTLCache 误杀丢弃。
 这是设计好行为。我不需要1毫秒发两个请求
     """
-    # hash_str = hashlib.md5(f"{time.time()}_{random.random()}".encode()).hexdigest()[:6]
+    # import random hash_str = hashlib.md5(f"{time.time()}_{random.random()}".encode()).hexdigest()[:6]
     return f"{stime(ms=ms,format='%Y%m%d_%H%M%S',ms_splitor='.')}"
 
 AES_KEY = b"12345678901234567890123456789012"
@@ -279,7 +279,7 @@ def _describe_public_key(value: bytes | str | None) -> str:
         data = value if isinstance(value, (bytes, bytearray)) else str(value).encode('utf-8')
         if not data:
             return "空值"
-        text = data.decode('utf-8', 'replace').strip()
+        text = data.decode('utf-8', 'replace').replace('\n',' ').strip()
         if b"BEGIN PUBLIC KEY" in data or b"BEGIN EC PUBLIC KEY" in data:
             return f"已配置(type=PEM, len={len(data)}, value={text})"
         if b"ecdsa-sha2-nistp256" in data:
@@ -707,7 +707,7 @@ class MultiMQTTManager:
     # 因此 join 必须设超时，避免 stop() 被回调拖死导致整个进程无法退出。
     DISPATCH_JOIN_TIMEOUT = 5.0
 
-    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60, max_reconnect_delay=3600):
+    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600):
         self.brokers = brokers
         self.keepalive = keepalive
         self.max_reconnect_delay = max_reconnect_delay
@@ -724,19 +724,10 @@ class MultiMQTTManager:
         # ------------------------------------------------------------------
         # [修复-S3] 区分两种"没有 server_vk"的情况：
         #   (a) 从未配置公钥 → 跳过验签（向下兼容，允许无签名模式）
-        #   (b) 配置了公钥但解析失败 → fail-closed，拒绝所有 code 请求
+        #   (b) 配置了公钥但解析失败 → raise error
         # 用 _server_vk_invalid 标志区分，避免拼错 PEM 时静默失去验签能力。
         self._server_vk_invalid = False
-        try:
-            self.server_vk = (
-                ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes)
-                if self.server_public_key_bytes else None
-            )
-        except Exception:
-            logger.exception("[S3] 解析服务端公钥失败：所有带 code 的请求将被拒绝 (fail-closed)")
-            self.server_vk = None
-            if self.server_public_key_bytes:
-                self._server_vk_invalid = True
+        self.server_vk = ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes) if self.server_public_key_bytes else None
         try:
             self.client_sk = (
                 ecdsa.SigningKey.from_pem(self.client_private_key_bytes)
@@ -764,7 +755,7 @@ class MultiMQTTManager:
         #   - 停止后 start() 会 clear()，可安全复用于"停→启"场景。
         self._stop_event = threading.Event()
         # [修复-N4] 消息处理异常日志的限流状态：host -> (last_log_time, suppressed_count)
-        self._msg_err_log_state = {}
+        self._msg_err_log_state = {} # 因为mqtt服务需要一直运行，不存在 频繁 start stop情况  每会话重置
         # [修复-③] 异步分发相关：业务回调不再运行在 paho 网络线程里
         # 注意：需确保文件顶部有 `import queue`
         self._msg_queue = queue.Queue(maxsize=self.MSG_QUEUE_MAXSIZE)

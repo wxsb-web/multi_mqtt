@@ -36,7 +36,7 @@ class MQTTServer:
             rx_broker,
             bool(code),
             bool(server_pubkey),
-            "已配置" if server_pubkey else "未配置",
+            server_pubkey,
         )
 
         execution = self.executor.execute(code)
