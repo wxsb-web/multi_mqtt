@@ -436,10 +436,15 @@ class ConnectionQualityStats:
     # 防止 pending_pings 因极端网络状况无限膨胀。
     PING_TTL = 120
 
-    def __init__(self, enabled=True, print_interval=3600):
+    # [修复-N1] __init__ 新增 lock 参数：
+    #   - 传 None（默认）→ 本类自建一把锁，用于独立使用场景；
+    #   - 由 MultiMQTTManager 传入 → 与 manager 共享同一把锁，
+    #     保证 self.clients_ref（就是 manager.clients 同一个 dict）
+    #     的读取与 manager 的 clients 写入使用同一把锁，彻底消除跨锁竞态。
+    def __init__(self, enabled=True, print_interval=3600, lock=None):
         self.enabled = enabled
         self.stats = {}
-        self.lock = threading.Lock()
+        self.lock = lock if lock is not None else threading.Lock()
         self.print_interval = print_interval
         self.running = False
         self.thread = None
@@ -665,6 +670,9 @@ class ConnectionQualityStats:
 
     def _send_pings(self):
         """[原逻辑抽离] 遍历已连接的 broker 发送 QoS1 Ping，单点异常不互相影响"""
+        # [修复-N1] 使用 self.lock（在 MultiMQTTManager 场景下就是 manager.lock），
+        # 与 manager.stop() 里 `with self.lock: self.clients.clear()` 使用同一把锁。
+        # 两边互斥，不会再出现"另一个线程正在 clear 时这边 list() 迭代"的 RuntimeError。
         with self.lock:
             clients_snapshot = list(self.clients_ref.items())
         for host, client in clients_snapshot:
@@ -726,16 +734,25 @@ class MultiMQTTManager:
             logger.exception("解析客户端私钥失败，签名功能将被禁用")
             self.client_sk = None
         # ------------------------------------------------------------------
+        # [修复-N1] 先创建统一锁，并把它传给 stats，两处共享同一把锁。
+        # manager.clients 与 stats.clients_ref 是同一个 dict，
+        # 使用同一把锁后，任何一方读写都会正确互斥，消除跨锁竞态。
+        self.lock = threading.Lock()
         # --- [统计功能] ---
         self.enable_stats = enable_stats
         self.log_connection = log_connection if log_connection is not None else not enable_stats
-        self.stats = ConnectionQualityStats(enabled=self.enable_stats)
+        self.stats = ConnectionQualityStats(enabled=self.enable_stats, lock=self.lock)
         # ------------------
         self.dedup_cache = TTLCache(ttl_seconds=30)
         self.message_callback = None
         self.subscribed_topics = set()
-        self.lock = threading.Lock()
-        self._stopping = False
+        # [修复-N2/N3] 用 threading.Event 代替 _stopping 布尔标志：
+        #   - _dispatch_loop 用它作为退出信号（不再依赖哨兵 None）；
+        #   - _on_disconnect 用它判断"主动停止 / 意外断开"；
+        #   - 停止后 start() 会 clear()，可安全复用于"停→启"场景。
+        self._stop_event = threading.Event()
+        # [修复-N4] 消息处理异常日志的限流状态：host -> (last_log_time, suppressed_count)
+        self._msg_err_log_state = {}
         # [修复-③] 异步分发相关：业务回调不再运行在 paho 网络线程里
         # 注意：需确保文件顶部有 `import queue`
         self._msg_queue = queue.Queue(maxsize=self.MSG_QUEUE_MAXSIZE)
@@ -745,13 +762,37 @@ class MultiMQTTManager:
         """设置上层回调，签名: fn(topic, data_dict, rx_broker)"""
         self.message_callback = callback
 
+    # [修复-N4] 消息处理异常的限流日志：每 host 每秒最多 1 条。
+    # 被抑制的条数会在下次放行时以"过去1秒内另有 N 条同类异常被省略"输出。
+    def _log_msg_error(self, host, exc):
+        now = time.time()
+        state = self._msg_err_log_state.get(host)
+        if state is None:
+            # 首次：立即打印并建立状态
+            self._msg_err_log_state[host] = (now, 0)
+            logger.error("处理消息失败 [%s]: %s", host, exc)
+            return
+        last_time, suppressed = state
+        if now - last_time >= 1.0:
+            # 距上次打印已满 1 秒：放行；若有抑制条数则一并输出
+            if suppressed > 0:
+                logger.error("处理消息失败 [%s]: %s (过去1秒内另有 %d 条同类异常被省略)",
+                             host, exc, suppressed)
+            else:
+                logger.error("处理消息失败 [%s]: %s", host, exc)
+            self._msg_err_log_state[host] = (now, 0)
+        else:
+            # 1 秒内重复：抑制，仅累加计数
+            self._msg_err_log_state[host] = (last_time, suppressed + 1)
+
     def start(self):
         """启动与所有 Broker 的连接并启用后台自动断线重连"""
         with self.lock:
             if self.clients:
                 logger.warning("MultiMQTTManager.start() 重复调用，已忽略")
                 return
-            self._stopping = False
+            # [修复-N2/N3] 清除停止信号，保证"停→启"可复用同一 manager
+            self._stop_event.clear()
         # [修复-③] 先启动分发线程，再启动底层连接，避免消息入队而无人消费
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_loop, daemon=True, name="MQTTMsgDispatch"
@@ -804,8 +845,9 @@ class MultiMQTTManager:
 
     def _on_disconnect(self, client, userdata, flags, rc, properties=None):
         host = userdata
-        # [修复-④] 主动 stop 场景：结算"最后一段在线时长"，但不计入掉线
-        if self._stopping:
+        # [修复-④][修复-N2/N3] 主动 stop 场景：结算"最后一段在线时长"，但不计入掉线。
+        # 用 _stop_event 替代 _stopping 布尔标志，读写都在 Event 内部加锁，线程安全。
+        if self._stop_event.is_set():
             self.stats.finalize_for_shutdown(host)
             return
         self.stats.on_disconnect(host)
@@ -911,24 +953,29 @@ class MultiMQTTManager:
                         "⚠️ [%s] 消息分发队列已满(%d)，丢弃消息 topic=%s",
                         host, self.MSG_QUEUE_MAXSIZE, msg.topic,
                     )
-        except Exception:
-            logger.exception("处理 MQTT 消息失败 [%s]", host)
+        except Exception as e:
+            # [修复-N4] 高频异常日志限流：每 host 每秒最多 1 条。
+            # 不再打印堆栈（logger.exception），避免 5 个公共 broker 的
+            # 大量畸形消息把 ERROR + 堆栈刷爆磁盘，反向阻塞 paho 网络线程。
+            self._log_msg_error(host, e)
 
     def _dispatch_loop(self):
         """
-        [修复-③] 独立的分发线程：串行消费队列，把业务回调与 paho 网络线程解耦。
-        使用哨兵 None 优雅退出：stop() 时入队一个 None。
+        [修复-N2/N3] 独立的分发线程：串行消费队列，把业务回调与 paho 网络线程解耦。
+        退出机制改用 threading.Event：
+        - 不再需要 stop() 里 put_nowait(None) 的哨兵（避免队列满时哨兵丢失）；
+        - stop() 里的 join() 可以无限等待，因为 _stop_event 设置后本线程最多
+          等一次 queue.get(timeout=1.0) 超时就会退出，不会出现僵尸线程；
+        - 因此也不会出现"旧线程未退、start() 又起新线程共享同一队列"的双线程抢消息。
         """
-        while True:
+        while not self._stop_event.is_set():
             try:
                 item = self._msg_queue.get(timeout=1.0)
             except queue.Empty:
-                # 队列空闲时允许 stop() 通过 _stopping 快速收尾
-                if self._stopping:
-                    return
+                # 队列空闲：回到循环顶部重新检查 _stop_event
                 continue
-            # [修复-⑧] 即使拿到了正常消息，一旦被要求停止，也立刻抛弃并退出
-            if self._stopping or item is None:
+            # [修复-⑧] 拿到消息后先看停止信号：一旦要求停止，立刻抛弃并退出
+            if self._stop_event.is_set():
                 return
             topic, data, host = item
             try:
@@ -1008,9 +1055,11 @@ class MultiMQTTManager:
                 c.publish(topic, payload_str, qos=0)
 
     def stop(self):
-        # [修复-④] 提前置位 _stopping，让 on_disconnect 走"主动停止"分支：
-        # 结算最后一段在线时长，但不增加掉线计数
-        self._stopping = True
+        # [修复-④][修复-N2/N3] 用 _stop_event 替代 _stopping：
+        # - Event 读写线程安全；
+        # - _dispatch_loop 用 wait/get 感知它，无需再发哨兵 None；
+        # - 停止后 start() 会 clear()，可安全复用于"停→启"。
+        self._stop_event.set()
         if self.enable_stats:
             self.stats.stop()
         with self.lock:
@@ -1022,14 +1071,10 @@ class MultiMQTTManager:
                 c.disconnect()
             except Exception:
                 logger.debug("关闭 MQTT client 时出现异常", exc_info=True)
-        # [修复-③] 发送哨兵，通知分发线程退出
-        try:
-            self._msg_queue.put_nowait(None)
-        except queue.Full:
-            # 队列满时，_dispatch_loop 会在 idle 分支根据 _stopping 自行退出
-            pass
+        # [修复-N2/N3] 无限等待：_stop_event 已设置，分发线程最多 1 次 get 超时就退出，
+        # 不会死锁；也不用再担心"旧线程成为僵尸 + start() 起新线程共享同一队列"。
         t = self._dispatch_thread
         if t and t.is_alive():
-            t.join(timeout=5.0)
+            t.join()
         self._dispatch_thread = None
-        logger.info("所有 MQTT 连接已安全关闭")        
+        logger.info("所有 MQTT 连接已安全关闭")
