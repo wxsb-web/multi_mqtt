@@ -1,0 +1,20 @@
+
+D:\test\github\multi_mqtt>chcp 65001  1>nul 2>&1 
+
+D:\test\github\multi_mqtt>cd /d "D:\test\github\git.bat\" 
+
+D:\test\github\git.bat>set "PY_PATH=C:\QGB\miniforge3\python.exe" 
+
+D:\test\github\git.bat>set "GIT_PATH=C:\QGB\PortableGit\bin\git.exe" 
+
+D:\test\github\git.bat>rem Leave BRANCH unset so git_logic.py follows the repository's current branch. 
+
+D:\test\github\git.bat>set "SIZE_THRESHOLD=104857600" 
+
+D:\test\github\git.bat>"C:\QGB\miniforge3\python.exe" "D:\test\github\git.bat\git_logic.py" push https://qgbcs:***REMOVED***@github.com/qgbcs/multi_mqtt/master -r 999 --repo-path D:\test\github\multi_mqtt -m 修复并发安全与验签降级共 6 处隐患  S1 publish_broadcast 迭代 self.clients.items() 未快照，与 stop() 中 clients.clear() 存在 RuntimeError 竞态，改为锁内取快照后锁外遍历；S2 ConnectionQualityStats.start() 用新 BrokerStat() 覆盖已由 _on_connect 创建的实例导致首连状态与在线时长丢失，改用 setdefault 保留既有实例；S3 公钥配置了但解析失败时静默降级为"跳过验签"，改为新增 _server_vk_invalid 标志 fail-closed 拒绝所有带 code 请求；M1 _on_connect 持 self.lock 调用 client.subscribe() 可能阻塞全局锁，改为锁内仅取 topics 快照、锁外订阅；M2 subscribe() 同样在锁内做 c.subscribe() I/O 阻塞 stop() 优雅退出，改为锁内更新 subscribed_topics 并快照 clients、锁外遍历订阅；M4 record_ping_send 单字段 pending_ping_mid 在 600s 周期与 QoS1 重传重叠时相互覆盖致前次 ping 延迟样本丢失，改用 pending_pings: dict[mid - 按 mid 精确匹配弹出并加 PING_TTL=120 定期清理防膨胀 
+2026-09-13 20:43:08 | INFO    | �ֿ�·��: D:\test\github\multi_mqtt
+2026-09-13 20:43:08 | INFO    | Git����: C:\QGB\PortableGit\bin\git.exe
+2026-09-13 20:43:08 | INFO    | �ļ�����: 100.00 MB (104857600 �ֽ�)
+2026-09-13 20:43:08 | INFO    | Զ�̵�ַ: https://qgbcs:***@github.com/qgbcs/multi_mqtt.git
+2026-09-13 20:43:08 | INFO    | ��֧: master
+2026-09-13 20:43:08 | INFO    | ���ӳ�ʱ: 45s | ������ֵ: 10B/s | ���ٳ�ʱ: 60s

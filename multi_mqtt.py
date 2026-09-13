@@ -358,19 +358,17 @@ def get_standard_public_pem_bytes(key_input) -> bytes:
         # 如果解析失败，可能已经是其他格式，直接返回
         return raw_bytes
 
-        
 # =========================================================================
 # [新增解耦功能] 网络质量统计模型与管理模块（默认不占额外内存，极其轻量）
 # =========================================================================
 class BrokerStat:
     """单一节点的数据模型（完全摒弃历史数组，保证O(1)极低内存开销）"""
-
     # [轻量化] __slots__ 避免每个实例再挂一份 __dict__，配合"极其轻量"的设计目标
     __slots__ = (
         "disconnect_count", "last_disconnect_time", "last_connect_time",
         "max_offline_time", "total_online_time", "total_offline_time",
         "is_connected", "latency_min", "latency_max", "latency_sum",
-        "latency_count", "pending_ping_mid", "pending_ping_time", "created_at",
+        "latency_count", "pending_pings", "created_at",
     )
 
     def __init__(self):
@@ -381,23 +379,20 @@ class BrokerStat:
         self.total_online_time = 0.0
         self.total_offline_time = 0.0
         self.is_connected = False
-
         # 延迟指标滚动记录
         self.latency_min = float('inf')
         self.latency_max = 0.0
         self.latency_sum = 0.0
         self.latency_count = 0
-
-        # 发送 QoS1 Ping 时的上下文记录
-        self.pending_ping_mid = None
-        self.pending_ping_time = 0.0
+        # [修复-M4] 发送 QoS1 Ping 时的上下文记录。
+        # 用 dict[mid] = send_time 保存"所有未确认的 ping"，
+        # 而不是单一 mid/time 字段——避免周期重叠时相互覆盖。
+        self.pending_pings = {}
         self.created_at = time.time()
 
     def update_latency(self, latency_ms):
-        if latency_ms < self.latency_min:
-            self.latency_min = latency_ms
-        if latency_ms > self.latency_max:
-            self.latency_max = latency_ms
+        if latency_ms < self.latency_min: self.latency_min = latency_ms
+        if latency_ms > self.latency_max: self.latency_max = latency_ms
         self.latency_sum += latency_ms
         self.latency_count += 1
 
@@ -420,26 +415,26 @@ class BrokerStat:
         if total <= 0:
             # 极端情况（时钟回拨 / 刚创建）：退化为二值判断
             return 100.0 if self.is_connected else 0.0
-
         # 从未成功连上过 → 可靠性就是 0%
         if self.last_connect_time == 0 and not self.is_connected:
             return 0.0
-
         offline = self.total_offline_time
         # 当前仍处于离线：把"正在发生的离线"也计入
         if not self.is_connected and self.last_disconnect_time > 0:
             offline += (now - self.last_disconnect_time)
-
         rel = 100.0 * (1.0 - (offline / total))
         return max(0.0, min(100.0, rel))
 
 
 class ConnectionQualityStats:
     """网络连接质量统筹管理器，可方便开启与关闭"""
-
     # [可配置] Ping 周期（秒）。原代码硬编码在 _monitor_loop 里，
     # 现抽出为类属性：保留默认 600，也不影响 __init__ 签名（便于 diff）。
     PING_INTERVAL = 600
+    # [修复-M4] 单条 ping 记录的最长存活时间：超过该时长仍未收到 ACK，
+    # 认为该 ping 已经彻底丢失（QoS1 重传也救不回来），从待确认表中清除，
+    # 防止 pending_pings 因极端网络状况无限膨胀。
+    PING_TTL = 120
 
     def __init__(self, enabled=True, print_interval=3600):
         self.enabled = enabled
@@ -457,9 +452,14 @@ class ConnectionQualityStats:
                 return  # 幂等保护：防止重复 start 导致多份监控线程
             self.clients_ref = clients_ref
             for host in self.clients_ref.keys():
-                self.stats[host] = BrokerStat()
+                # [修复-S2] 用 setdefault 而不是直接赋值。
+                # MultiMQTTManager.start() 里 client.loop_start() 是非阻塞的，
+                # 极快的 broker（如 broker.codenow.cn 建连仅 110ms）可能在
+                # stats.start() 之前就触发 _on_connect 创建好 BrokerStat，
+                # 直接赋值会把这份"已连接"状态用全新的未连接对象覆盖，
+                # 导致初次连接的状态被静默丢弃。
+                self.stats.setdefault(host, BrokerStat())
             self.running = True
-
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="StatsPingThread")
         self.thread.start()
 
@@ -476,7 +476,6 @@ class ConnectionQualityStats:
         with self.lock:
             stat = self.stats.setdefault(host, BrokerStat())
             now = time.time()
-
             # [修复首连算入离线时长的Bug]: 仅在有过真实掉线记录(last_disconnect_time > 0)时才结算离线时长
             if not stat.is_connected:
                 if stat.last_disconnect_time > 0:
@@ -484,7 +483,6 @@ class ConnectionQualityStats:
                     stat.total_offline_time += offline_duration
                     if offline_duration > stat.max_offline_time:
                         stat.max_offline_time = offline_duration
-
             stat.is_connected = True
             stat.last_connect_time = now
 
@@ -493,7 +491,6 @@ class ConnectionQualityStats:
         with self.lock:
             stat = self.stats.setdefault(host, BrokerStat())
             now = time.time()
-
             if stat.is_connected:
                 # 正常从在线变为离线：结算在线时间，必然增加1次掉线
                 if stat.last_connect_time > 0:
@@ -527,19 +524,31 @@ class ConnectionQualityStats:
         if not self.enabled: return
         with self.lock:
             stat = self.stats.setdefault(host, BrokerStat())
-            stat.pending_ping_mid = mid
-            stat.pending_ping_time = time.time()
+            now = time.time()
+            # [修复-M4] 按 mid 写入待确认表，多个 in-flight ping 互不干扰。
+            # 之前的单一字段在周期重叠时会相互覆盖，导致先发 ping 的延迟样本丢失。
+            stat.pending_pings[mid] = now
+            # 顺手清理超时未确认的旧条目，防止极端网络下 dict 无限增长
+            if len(stat.pending_pings) > 1:
+                expired = [m for m, t in stat.pending_pings.items() if now - t > self.PING_TTL]
+                for m in expired:
+                    stat.pending_pings.pop(m, None)
 
     def on_publish_ack(self, host, mid):
         """挂钩到底层 on_publish 回调计算 QoS 1 的精准 RTT 延迟"""
         if not self.enabled: return
         with self.lock:
             stat = self.stats.get(host)
-            if stat and stat.pending_ping_mid is not None and stat.pending_ping_mid == mid:
-                latency_ms = (time.time() - stat.pending_ping_time) * 1000.0
-                if 0.0 <= latency_ms < 10000.0:  # 剔除由于断线堆积重发导致的超长异常延迟(>10s)
-                    stat.update_latency(latency_ms)
-                stat.pending_ping_mid = None
+            if not stat: return
+            # [修复-M4] 按 mid 精确匹配并原子弹出：
+            # - 命中：计算本次延迟后即刻删除，避免同一 mid 被重复计入
+            # - 未命中：说明该 ACK 不是我们发的 ping（例如业务消息的 QoS1 ACK），直接忽略
+            sent_at = stat.pending_pings.pop(mid, None)
+            if sent_at is None:
+                return
+            latency_ms = (time.time() - sent_at) * 1000.0
+            if 0.0 <= latency_ms < 10000.0:  # 剔除由于断线堆积重发导致的超长异常延迟(>10s)
+                stat.update_latency(latency_ms)
 
     def get_report(self, sort="rel", reverse=True):
         """
@@ -559,27 +568,22 @@ class ConnectionQualityStats:
         :param reverse: 是否降序排列（默认 True）
         """
         columns = ["broker", "rel", "avg", "min", "max", "drops", "max_off", "last_drop"]
-
         lines = ["\n" + "=" * 90]
         lines.append(
             f"{'broker':<30} | {'rel':>6} | {'avg':>7} | {'min':>5} | "
             f"{'max':>5} | {'drops':>5} | {'max_off':>9} | {'last_drop':>10}"
         )
         lines.append("-" * 90)
-
         with self.lock:
             display_stats = []
-
             # 1. 数据预处理
             for host, stat in self.stats.items():
                 is_conn = stat.is_connected
                 rel = stat.reliability  # [统一口径] 复用 BrokerStat 的属性，避免双份实现漂移
-
                 # max_off 额外把"当前正在发生的离线"并入展示
                 max_off = stat.max_offline_time
                 if not is_conn and stat.last_disconnect_time > 0:
                     max_off = max(max_off, time.time() - stat.last_disconnect_time)
-
                 display_stats.append({
                     "broker":    host,
                     "rel":       rel,
@@ -591,38 +595,27 @@ class ConnectionQualityStats:
                     "last_drop": stat.last_disconnect_time,
                     "is_conn":   is_conn,
                 })
-
             # 2. [修复排序Bug]: 修正无延迟数据(-1.0)在多级排序下被排在前面的问题
             def sort_key(item):
                 k = sort.lower()
                 if k not in columns:
                     k = "rel"
-
                 val = item[k]
                 # 主指标无数据处理：始终沉底
                 if k in ("avg", "min", "max") and val < 0:
                     primary_val = float("-inf") if reverse else float("inf")
                 else:
                     primary_val = val
-
                 # 二级指标 avg 延迟处理（无数据时始终沉底）
                 avg_val = item["avg"]
                 if avg_val < 0:
                     secondary_val = float("-inf") if reverse else float("inf")
                 else:
                     secondary_val = -avg_val if reverse else avg_val
-
                 # 末级：已连接优先
                 conn_rank = 0 if item["is_conn"] else 1
-
                 return (primary_val, secondary_val, conn_rank, item["broker"])
-
-            sorted_stats = sorted(
-                display_stats,
-                key=sort_key,
-                reverse=reverse,
-            )
-
+            sorted_stats = sorted(display_stats, key=sort_key, reverse=reverse)
             # 3. 渲染输出
             for item in sorted_stats:
                 rel_str = f"{item['rel']:.1f}"
@@ -631,14 +624,10 @@ class ConnectionQualityStats:
                 max_str = f"{item['max']:.1f}" if item["max"] >= 0 else "-"
                 drops_str = str(item["drops"])
                 max_off_str = f"{item['max_off']:.1f}"
-
                 if item["last_drop"] > 0:
-                    last_drop_str = time.strftime(
-                        "%H:%M:%S", time.localtime(item["last_drop"])
-                    )
+                    last_drop_str = time.strftime("%H:%M:%S", time.localtime(item["last_drop"]))
                 else:
                     last_drop_str = "-"
-
                 status_marker = "🟢" if item["is_conn"] else "🔴"
                 row = (
                     f"{status_marker} {item['broker']:<28} | "
@@ -653,23 +642,19 @@ class ConnectionQualityStats:
         """修复了原有的睡眠阻塞逻辑，通过秒级步进分开判断统计报告与Ping的时机"""
         sleep_step = 6
         ping_interval = self.PING_INTERVAL   # [可配置] 使用类属性，保留默认 10 分钟
-
         # [稳定性] 使用绝对时间戳驱动，避免 sleep 漂移导致周期累积误差
         now = time.time()
         next_ping_at = now                    # 启动后立刻先测一次
         next_print_at = (now + self.print_interval) if self.print_interval > 0 else None
-
         while self.running:
             time.sleep(sleep_step)
             if not self.running:
                 break
             now = time.time()
-
             # 1. 检测是否需要发送 PING 指令来测距
             if now >= next_ping_at:
                 next_ping_at = now + ping_interval
                 self._send_pings()
-
             # 2. 检测是否需要打印输出报告
             if next_print_at is not None and now >= next_print_at:
                 next_print_at = now + self.print_interval
@@ -682,7 +667,6 @@ class ConnectionQualityStats:
         """[原逻辑抽离] 遍历已连接的 broker 发送 QoS1 Ping，单点异常不互相影响"""
         with self.lock:
             clients_snapshot = list(self.clients_ref.items())
-
         for host, client in clients_snapshot:
             stat = self.stats.get(host)
             if not stat or not stat.is_connected:
@@ -700,7 +684,6 @@ class ConnectionQualityStats:
 
 # =========================================================================
 class MultiMQTTManager:
-
     # [修复-③] 消息分发队列上限：满则丢弃并告警，绝不阻塞 paho 网络线程
     MSG_QUEUE_MAXSIZE = 10000
 
@@ -713,22 +696,27 @@ class MultiMQTTManager:
         self.enable_crypto = enable_crypto  # 默认关闭加密
         self.server_public_key_bytes = get_standard_public_pem_bytes(server_public_key_bytes)
         self.client_private_key_bytes = get_standard_pem_bytes(client_private_key_bytes)
-
         # ------------------------------------------------------------------
         # [修复-⑥ 严重性能瓶颈] ECDSA 密钥对象仅在初始化时解析一次并缓存。
         # 原实现在 _on_message / publish_broadcast 里每次都调用 from_pem，
         # 而 PEM 解析属于 CPU-Bound 的椭圆曲线底层数学运算，一旦并发上来，
         # CPU 会被瞬间打满并引发严重延迟。这里只解析一次，后续直接复用对象。
         # ------------------------------------------------------------------
+        # [修复-S3] 区分两种"没有 server_vk"的情况：
+        #   (a) 从未配置公钥 → 跳过验签（向下兼容，允许无签名模式）
+        #   (b) 配置了公钥但解析失败 → fail-closed，拒绝所有 code 请求
+        # 用 _server_vk_invalid 标志区分，避免拼错 PEM 时静默失去验签能力。
+        self._server_vk_invalid = False
         try:
             self.server_vk = (
                 ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes)
                 if self.server_public_key_bytes else None
             )
         except Exception:
-            logger.exception("解析服务端公钥失败，验签功能将被禁用")
+            logger.exception("[S3] 解析服务端公钥失败：所有带 code 的请求将被拒绝 (fail-closed)")
             self.server_vk = None
-
+            if self.server_public_key_bytes:
+                self._server_vk_invalid = True
         try:
             self.client_sk = (
                 ecdsa.SigningKey.from_pem(self.client_private_key_bytes)
@@ -738,19 +726,16 @@ class MultiMQTTManager:
             logger.exception("解析客户端私钥失败，签名功能将被禁用")
             self.client_sk = None
         # ------------------------------------------------------------------
-
         # --- [统计功能] ---
         self.enable_stats = enable_stats
         self.log_connection = log_connection if log_connection is not None else not enable_stats
         self.stats = ConnectionQualityStats(enabled=self.enable_stats)
         # ------------------
-
         self.dedup_cache = TTLCache(ttl_seconds=30)
         self.message_callback = None
         self.subscribed_topics = set()
         self.lock = threading.Lock()
         self._stopping = False
-
         # [修复-③] 异步分发相关：业务回调不再运行在 paho 网络线程里
         # 注意：需确保文件顶部有 `import queue`
         self._msg_queue = queue.Queue(maxsize=self.MSG_QUEUE_MAXSIZE)
@@ -767,25 +752,20 @@ class MultiMQTTManager:
                 logger.warning("MultiMQTTManager.start() 重复调用，已忽略")
                 return
             self._stopping = False
-
         # [修复-③] 先启动分发线程，再启动底层连接，避免消息入队而无人消费
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_loop, daemon=True, name="MQTTMsgDispatch"
         )
         self._dispatch_thread.start()
-
         for host, port in self.brokers:
             client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
             client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
-
             client.user_data_set(host)
             client.reconnect_delay_set(min_delay=1, max_delay=self.max_reconnect_delay)
-
             client.on_connect = self._on_connect
             client.on_disconnect = self._on_disconnect
             client.on_message = self._on_message
             client.on_publish = self._on_publish
-
             try:
                 client.connect_async(host, port, keepalive=self.keepalive)
                 client.loop_start()
@@ -799,7 +779,6 @@ class MultiMQTTManager:
                 except Exception:
                     pass
                 logger.error(f"连接初始化失败 [{host}]: {e}")
-
         if self.enable_stats:
             self.stats.start(self.clients)
 
@@ -810,9 +789,14 @@ class MultiMQTTManager:
             if self.log_connection:
                 logger.info(f"✅ [已连接] Broker: {host}")
             self.stats.on_connect(host)
+            # [修复-M1] 锁内只做快照，锁外遍历 subscribe。
+            # client.subscribe() 是 paho 的内部操作，若 socket 发送缓冲区满
+            # 可能产生阻塞；持锁调用会卡住 stats.get_report()、
+            # publish_broadcast、stop() 等所有需要 self.lock 的路径。
             with self.lock:
-                for topic in self.subscribed_topics:
-                    client.subscribe(topic)
+                topics_snapshot = list(self.subscribed_topics)
+            for topic in topics_snapshot:
+                client.subscribe(topic)
         else:
             if self.log_connection:
                 logger.warning(f"❌ [连接失败] Broker: {host}, rc={rc}")
@@ -824,7 +808,6 @@ class MultiMQTTManager:
         if self._stopping:
             self.stats.finalize_for_shutdown(host)
             return
-
         self.stats.on_disconnect(host)
         if rc != 0:
             if self.log_connection:
@@ -844,12 +827,10 @@ class MultiMQTTManager:
         try:
             raw_payload = msg.payload.decode('utf-8')
             data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
-
             # [增加类型校验防御]: 确保 data 为字典类型
             if not isinstance(data, dict):
                 logger.warning(f"⚠️ [{host}] 收到无效非字典消息格式，忽略处理")
                 return
-
             # ------------------------------------------------------------------
             # [修复-①] req_id 类型归一化
             # MQTT payload 属于不可信外部输入。若恶意节点发送 {"req_id": 12345}，
@@ -863,9 +844,15 @@ class MultiMQTTManager:
                 req_id = raw_req_id
             else:
                 req_id = str(raw_req_id)
-
             # --- ECDSA 验证防重放核心逻辑 ---
             if "code" in data:
+                # [修复-S3] fail-closed：公钥配置了但解析失败 → 直接拒绝
+                if self._server_vk_invalid:
+                    logger.warning(
+                        f"⚠️ [{host}] 拒绝执行: 服务端公钥配置无效 (fail-closed) | "
+                        f"server_pubkey={_describe_public_key(self.server_public_key_bytes)}"
+                    )
+                    return
                 if self.server_vk is None:
                     # [修复-⑥] 使用 __init__ 中已缓存的验签对象
                     logger.debug(
@@ -881,19 +868,13 @@ class MultiMQTTManager:
                             f"server_pubkey={_describe_public_key(self.server_public_key_bytes)}"
                         )
                         return
-
                     base_req_id, sig_hex = req_id.rsplit("|", 1)
                     logger.info(
                         "🔑 [%s] 请求已签名，开始验签: req_id=%s | base_req_id=%s | signature_len=%d | server_pubkey=%s",
-                        host,
-                        req_id,
-                        base_req_id,
-                        len(sig_hex),
+                        host, req_id, base_req_id, len(sig_hex),
                         _describe_public_key(self.server_public_key_bytes),
                     )
-
                     code_str = str(data.get("code", ""))
-
                     # ------------------------------------------------------
                     # [修复-⑦] 安全整型清洗 timestamp：
                     # 收发两端统一为 str(int(float(ts)))，避免浮点字符串如
@@ -904,9 +885,7 @@ class MultiMQTTManager:
                         ts_str = str(int(float(data.get("timestamp", 0))))
                     except (ValueError, TypeError):
                         ts_str = "0"
-
                     sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
-
                     try:
                         # [修复-⑥] 直接复用缓存对象，不再每次 from_pem
                         self.server_vk.verify(bytes.fromhex(sig_hex), sign_msg, hashfunc=hashlib.sha256)
@@ -914,14 +893,11 @@ class MultiMQTTManager:
                     except Exception:
                         logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 | req_id={req_id} | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
                         return
-
             # [安全] 去重放到验签之后，避免伪造 req_id 污染缓存造成 DoS
             if req_id and not self.dedup_cache.add_if_not_exists(req_id):
                 return
-
             if self.log_messages:
                 logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}")
-
             # ------------------------------------------------------------------
             # [修复-③] 不再同步调用 self.message_callback（会阻塞 paho 网络线程）。
             # 改为入队，交由独立的 MQTTMsgDispatch 线程串行消费。
@@ -951,11 +927,9 @@ class MultiMQTTManager:
                 if self._stopping:
                     return
                 continue
-
             # [修复-⑧] 即使拿到了正常消息，一旦被要求停止，也立刻抛弃并退出
             if self._stopping or item is None:
                 return
-
             topic, data, host = item
             try:
                 if self.message_callback:
@@ -965,17 +939,21 @@ class MultiMQTTManager:
                 logger.exception("消息分发回调执行失败 [%s] topic=%s", host, topic)
 
     def subscribe(self, topic: str):
+        # [修复-M2] 锁内只做状态更新 + 快照，锁外遍历 subscribe。
+        # 与 M1 同源：持锁调用 c.subscribe() 一旦阻塞，
+        # stop() 里 `with self.lock: self.clients.clear()` 会被卡住，
+        # 导致整个进程无法优雅退出。
         with self.lock:
             self.subscribed_topics.add(topic)
-            for host, c in self.clients.items():
-                if c.is_connected():
-                    c.subscribe(topic)
+            clients_snapshot = list(self.clients.items())
+        for host, c in clients_snapshot:
+            if c.is_connected():
+                c.subscribe(topic)
 
     def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None):
         """广播传输消息"""
         # [修复副作用Bug]: 对传入的 payload_dict 进行浅拷贝，防止修改上层数据
         out_payload = payload_dict.copy()
-
         # ------------------------------------------------------------------
         # [修复-⑥ 严重性能瓶颈] 签名对象也从缓存里取，不再每次 from_pem。
         # 若调用方临时传入 client_private_key_bytes，则视为"一次性覆盖"，
@@ -989,7 +967,6 @@ class MultiMQTTManager:
                 sk = None
         else:
             sk = self.client_sk
-
         if sk is not None and "code" in out_payload:
             # ------------------------------------------------------------------
             # [修复-②] 原先使用 payload_dict["req_id"] 裸下标，
@@ -1006,10 +983,8 @@ class MultiMQTTManager:
                 raise ValueError(
                     "publish_broadcast: 报文包含 'code' 且已配置私钥时，必须提供 'timestamp' 字段"
                 )
-
             base_req_id = str(out_payload["req_id"])
             code_str = str(out_payload.get("code", ""))
-
             # ------------------------------------------------------
             # [修复-⑦] 发送端做与接收端一致的整型清洗，
             # 保证两侧拼出的 sign_msg 完全一致，避免浮点尾差导致验签失败。
@@ -1018,17 +993,17 @@ class MultiMQTTManager:
                 ts_str = str(int(float(out_payload["timestamp"])))
             except (ValueError, TypeError):
                 ts_str = "0"
-
             sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
-
             # [修复-⑥] 直接复用缓存对象，不再每次 from_pem
             signature = sk.sign(sign_msg, hashfunc=hashlib.sha256)
-
             # 写回 out_payload（副本），绝不修改调用方原始的 payload_dict
             out_payload["req_id"] = f"{base_req_id}|{signature.hex()}"
-
         payload_str = process_cipher(out_payload, decrypt=False, enabled=self.enable_crypto)
-        for host, c in self.clients.items():
+        # [修复-S1] 遍历前先快照，避免与 stop() 里的 self.clients.clear() 竞态。
+        # 否则并发场景下会命中 RuntimeError: dictionary changed size during iteration。
+        with self.lock:
+            clients_snapshot = list(self.clients.items())
+        for host, c in clients_snapshot:
             if c.is_connected():
                 c.publish(topic, payload_str, qos=0)
 
@@ -1036,31 +1011,25 @@ class MultiMQTTManager:
         # [修复-④] 提前置位 _stopping，让 on_disconnect 走"主动停止"分支：
         # 结算最后一段在线时长，但不增加掉线计数
         self._stopping = True
-
         if self.enable_stats:
             self.stats.stop()
-
         with self.lock:
             clients_snapshot = list(self.clients.values())
             self.clients.clear()
-
         for c in clients_snapshot:
             try:
                 c.loop_stop()
                 c.disconnect()
             except Exception:
                 logger.debug("关闭 MQTT client 时出现异常", exc_info=True)
-
         # [修复-③] 发送哨兵，通知分发线程退出
         try:
             self._msg_queue.put_nowait(None)
         except queue.Full:
             # 队列满时，_dispatch_loop 会在 idle 分支根据 _stopping 自行退出
             pass
-
         t = self._dispatch_thread
         if t and t.is_alive():
             t.join(timeout=5.0)
         self._dispatch_thread = None
-
-        logger.info("所有 MQTT 连接已安全关闭")
+        logger.info("所有 MQTT 连接已安全关闭")        
