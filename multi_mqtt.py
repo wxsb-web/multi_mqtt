@@ -103,7 +103,9 @@ def utc_ms():
     return time.time_ns() // 1_000_000
 
 def get_req_id(ms=0):
-    """生成格式：req_YYYY-MM-DD__HH.MM.SS__.毫秒_随机Hash"""
+    """ get_req_id 的返回值只精确到了毫秒，如果单片机在同一毫秒内连发两条不同状态，后一条会被 TTLCache 误杀丢弃。
+这是设计好行为。我不需要1毫秒发两个请求
+    """
     # hash_str = hashlib.md5(f"{time.time()}_{random.random()}".encode()).hexdigest()[:6]
     return f"{stime(ms=ms,format='%Y%m%d_%H%M%S',ms_splitor='.')}"
 
@@ -470,15 +472,20 @@ class ConnectionQualityStats:
             stat = self.stats.setdefault(host, BrokerStat())
             now = time.time()
             
-            # [修复盲区]: 只有之前是在线状态，才结算在线时间并增加掉线计数，防止重连失败时被狂刷
             if stat.is_connected:
+                # 正常从在线变为离线：结算在线时间，必然增加1次掉线
                 if stat.last_connect_time > 0:
                     stat.total_online_time += (now - stat.last_connect_time)
                 stat.is_connected = False
                 stat.disconnect_count += 1
-                
+            else:
+                # [关键修复]: 初始连接失败或持续重连失败期间，is_connected 为 False。
+                # 为了既能记录掉线次数，又防止底层高频重连导致 Drops 狂刷，加入1秒的防抖机制。
+                # 只要是第一次失败，或者距离上次断开超过 1 秒，就记录为一次掉线。
+                if stat.last_disconnect_time == 0 or (now - stat.last_disconnect_time) > 1.0:
+                    stat.disconnect_count += 1    
             stat.last_disconnect_time = now
-
+            
     def record_ping_send(self, host, mid):
         if not self.enabled: return
         with self.lock:
@@ -500,30 +507,46 @@ class ConnectionQualityStats:
     def get_report(self, sort="rel", reverse=True):
         """
         获取网络连接质量统计报告
-        :param sort: 排序指标 (可选: 'broker', 'rel', 'avg', 'min', 'max', 'drops', 'max_off')
-        :param reverse: 是否降序排列 (默认 True)
+
+        统一指标名（排序键 / 数据键 / 表头 完全一致，全部小写）：
+            broker    - Broker 地址
+            rel       - 可靠性(%)
+            avg       - 平均延迟(ms)
+            min       - 最小延迟(ms)
+            max       - 最大延迟(ms)
+            drops     - 掉线次数
+            max_off   - 最大离线时长(s)
+            last_drop - 最后一次掉线时间
+
+        :param sort: 排序指标，取值 broker / rel / avg / min / max / drops / max_off
+        :param reverse: 是否降序排列（默认 True）
         """
-        lines = ["\n" + "="*90]
-        header = f"{'Broker':<30} | {'Rel(%)':<6} | {'Avg(ms)':<7} | {'Min':<5} | {'Max':<5} | {'Drops':<5} | {'MaxOff(s)':<9} | {'Last Drop':<10}"
-        lines.append(header)
+        # 表头列名与内部指标名完全一致
+        columns = ["broker", "rel", "avg", "min", "max", "drops", "max_off", "last_drop"]
+
+        lines = ["\n" + "=" * 90]
+        lines.append(
+            f"{'broker':<30} | {'rel':>6} | {'avg':>7} | {'min':>5} | "
+            f"{'max':>5} | {'drops':>5} | {'max_off':>9} | {'last_drop':>10}"
+        )
         lines.append("-" * 90)
-        
+
         with self.lock:
             current_time = time.time()
             display_stats = []
-            
-            # 1. 数据预处理（计算实时动态指标）
+
+            # 1. 数据预处理：用统一指标名构造字典
             for host, stat in self.stats.items():
                 is_conn = stat.is_connected
                 max_off = stat.max_offline_time
-                total_off = getattr(stat, 'total_offline_time', 0.0)
-                
-                # 修复盲区：如果当前处于断线状态，加上正在发生的离线时间
+                total_off = getattr(stat, "total_offline_time", 0.0)
+
+                # 当前处于断线状态时，把正在发生的离线时间并入
                 if not is_conn and stat.last_disconnect_time > 0:
                     current_off_duration = current_time - stat.last_disconnect_time
                     max_off = max(max_off, current_off_duration)
                     total_off += current_off_duration
-                
+
                 # 动态计算最新可靠性
                 total_time = current_time - stat.created_at
                 if total_time > 0:
@@ -532,56 +555,62 @@ class ConnectionQualityStats:
                     rel = 100.0
 
                 display_stats.append({
-                    'host': host,
-                    'is_conn': is_conn,
-                    'rel': rel,
-                    'avg': stat.avg_latency if stat.latency_count > 0 else -1.0,
-                    'min': stat.latency_min if stat.latency_count > 0 else -1.0,
-                    'max': stat.latency_max if stat.latency_count > 0 else -1.0,
-                    'drops': stat.disconnect_count,
-                    'max_off': max_off,
-                    'last_drop_ts': stat.last_disconnect_time
+                    "broker":    host,
+                    "rel":       rel,
+                    "avg":       stat.avg_latency if stat.latency_count > 0 else -1.0,
+                    "min":       stat.latency_min if stat.latency_count > 0 else -1.0,
+                    "max":       stat.latency_max if stat.latency_count > 0 else -1.0,
+                    "drops":     stat.disconnect_count,
+                    "max_off":   max_off,
+                    "last_drop": stat.last_disconnect_time,
+                    "is_conn":   is_conn,
                 })
 
-            # 2. 排序逻辑
+            # 2. 排序逻辑：排序键名与数据键名一致
             def sort_key(item):
                 k = sort.lower()
-                if k == "broker": return item['host']
-                elif k in ("rel", "reliability"): return item['rel']
-                elif k in ("avg", "avg_latency"): return item['avg'] if item['avg'] >= 0 else (-1 if reverse else float('inf'))
-                elif k in ("min", "latency_min"): return item['min'] if item['min'] >= 0 else (-1 if reverse else float('inf'))
-                elif k in ("max", "latency_max"): return item['max'] if item['max'] >= 0 else (-1 if reverse else float('inf'))
-                elif k in ("drops", "disconnect_count"): return item['drops']
-                elif k in ("max_off", "max_offline_time"): return item['max_off']
-                else: return item['rel'] # 默认按可靠性
+                if k not in columns:
+                    k = "rel"
+                # 延迟类指标无数据(-1.0)时，让其排在末尾
+                if k in ("avg", "min", "max"):
+                    v = item[k]
+                    if v < 0:
+                        return float("-inf") if reverse else float("inf")
+                    return v
+                return item[k]
 
-            # 执行多级排序：主指标优先，次要指标为平均延迟，最后为名字
+            # 多级排序：主指标 -> 平均延迟 -> broker 名
             sorted_stats = sorted(
-                display_stats, 
-                key=lambda x: (sort_key(x), -x['avg'], x['host']), 
-                reverse=reverse
+                display_stats,
+                key=lambda x: (sort_key(x), -x["avg"], x["broker"]),
+                reverse=reverse,
             )
-            
-            # 3. 渲染输出
+
+            # 3. 渲染输出：列名与数据键名一致
             for item in sorted_stats:
                 rel_str = f"{item['rel']:.1f}"
-                avg_str = f"{item['avg']:.1f}" if item['avg'] >= 0 else "-"
-                min_str = f"{item['min']:.1f}" if item['min'] >= 0 else "-"
-                max_str = f"{item['max']:.1f}" if item['max'] >= 0 else "-"
-                drops_str = str(item['drops'])
+                avg_str = f"{item['avg']:.1f}" if item["avg"] >= 0 else "-"
+                min_str = f"{item['min']:.1f}" if item["min"] >= 0 else "-"
+                max_str = f"{item['max']:.1f}" if item["max"] >= 0 else "-"
+                drops_str = str(item["drops"])
                 max_off_str = f"{item['max_off']:.1f}"
-                
-                if item['last_drop_ts'] > 0:
-                    # 将时间戳转换为时分秒
-                    last_drop_str = time.strftime("%H:%M:%S", time.localtime(item['last_drop_ts']))
+
+                if item["last_drop"] > 0:
+                    last_drop_str = time.strftime(
+                        "%H:%M:%S", time.localtime(item["last_drop"])
+                    )
                 else:
                     last_drop_str = "-"
-                
-                status_marker = "🟢" if item['is_conn'] else "🔴"
-                row = f"{status_marker} {item['host']:<28} | {rel_str:>6} | {avg_str:>7} | {min_str:>5} | {max_str:>5} | {drops_str:>5} | {max_off_str:>9} | {last_drop_str:>10}"
+
+                status_marker = "🟢" if item["is_conn"] else "🔴"
+                row = (
+                    f"{status_marker} {item['broker']:<28} | "
+                    f"{rel_str:>6} | {avg_str:>7} | {min_str:>5} | {max_str:>5} | "
+                    f"{drops_str:>5} | {max_off_str:>9} | {last_drop_str:>10}"
+                )
                 lines.append(row)
-                
-        lines.append("="*90)
+
+        lines.append("=" * 90)
         return "\n".join(lines)
         
     def _monitor_loop(self):
@@ -693,6 +722,8 @@ class MultiMQTTManager:
         else:
             if self.log_connection:
                 logger.warning(f"❌ [连接失败] Broker: {host}, rc={rc}")
+            # [关键修复]: rc != 0 代表 MQTT 协议层拒绝，主动触发一次掉线统计
+            self.stats.on_disconnect(host)
 
     def _on_disconnect(self, client, userdata, flags, rc, properties=None):
         host = userdata
@@ -713,7 +744,7 @@ class MultiMQTTManager:
             data = process_cipher(raw_payload, decrypt=True, enabled=self.enable_crypto)
 
             req_id = data.get("req_id")
-            # 去重判定：首胜丢弃逻辑 网络层行为放最前 (无论是原生 req_id 还是附带签名的 req_id，直接全量存入 Cache 用于 30 秒内去重)
+            # 去重判定：首胜丢弃逻辑 网络层行为放最前  去掉绝对时间戳校验，只依赖 req_id + TTLCache 防重放
             if req_id and not self.dedup_cache.add_if_not_exists(req_id):
                 return
             
@@ -739,12 +770,12 @@ class MultiMQTTManager:
                         _describe_public_key(self.server_public_key_bytes),
                     )
 
-                    msg_ts = int(data.get("timestamp", 0))
-                    now_ms = utc_ms()
-                    ttl_ms = self.dedup_cache.ttl * 1000
-                    if abs(now_ms - msg_ts) > ttl_ms:
-                        logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {now_ms} {msg_ts} {ttl_ms}")
-                        return
+                    # msg_ts = int(data.get("timestamp", 0))
+                    # now_ms = utc_ms()
+                    # ttl_ms = self.dedup_cache.ttl * 1000
+                    # if abs(now_ms - msg_ts) > ttl_ms:
+                        # logger.warning(f"⚠️ [{host}] 拒绝执行: 消息时间戳已过期，拦截防重放 {now_ms} {msg_ts} {ttl_ms}")
+                        # return
 
                     code_str = str(data.get("code", ""))
                     ts_str = str(data.get("timestamp", ""))
