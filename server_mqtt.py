@@ -17,6 +17,7 @@ class MQTTServer:
         manager_args = {
             "log_messages": False,# 每个broker不打印原始消息
             "server_public_key_bytes": server_public_key_bytes,
+            enable_stats=True,
         }
         manager_args["brokers"] = brokers
         self.mqtt_net = MultiMQTTManager(**manager_args)
@@ -71,10 +72,12 @@ class MQTTServer:
             _describe_public_key(self.mqtt_net.server_public_key_bytes),
             '启用' if self.mqtt_net.server_public_key_bytes else '关闭（接收所有消息）',
         )
-
+        
+        logger.info("[连接质量统计报告]" + self.mqtt_net.stats.get_report())
+        
         try:
             while True:
-                time.sleep(1)
+                time.sleep(2)
         except KeyboardInterrupt:
             self.mqtt_net.stop()
 

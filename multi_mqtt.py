@@ -281,7 +281,7 @@ def _describe_public_key(value: bytes | str | None,short_text=False) -> str:
             return "空值"
         text = data.decode('utf-8', 'replace').replace('\n',' ').strip()
         if b"BEGIN PUBLIC KEY" in data or b"BEGIN EC PUBLIC KEY" in data:
-            if short_text:text=text[27:40]
+            if short_text:text=text[27:40]+'...'
             return f"已配置(type=PEM, len={len(data)}, value={text})"
         if b"ecdsa-sha2-nistp256" in data:
             return f"已配置(type=OpenSSH, len={len(data)}, value={text})"
@@ -556,7 +556,7 @@ class ConnectionQualityStats:
             if 0.0 <= latency_ms < 10000.0:  # 剔除由于断线堆积重发导致的超长异常延迟(>10s)
                 stat.update_latency(latency_ms)
 
-    def get_report(self, sort="rel", reverse=True):
+    def get_report(self, sort="min", reverse=True):
         """
         获取网络连接质量统计报告
 
@@ -653,9 +653,6 @@ class ConnectionQualityStats:
         next_ping_at = now                    # 启动后立刻先测一次
         next_print_at = (now + self.print_interval) if self.print_interval > 0 else None
         while self.running:
-            time.sleep(sleep_step)
-            if not self.running:
-                break
             now = time.time()
             # 1. 检测是否需要发送 PING 指令来测距
             if now >= next_ping_at:
@@ -668,7 +665,8 @@ class ConnectionQualityStats:
                     logger.info("📡 [连接质量统计报告]" + self.get_report())
                 except Exception:
                     logger.exception("生成连接质量统计报告失败")
-
+            time.sleep(sleep_step)
+            if not self.running:break
     def _send_pings(self):
         """[原逻辑抽离] 遍历已连接的 broker 发送 QoS1 Ping，单点异常不互相影响"""
         # [修复-N1] 使用 self.lock（在 MultiMQTTManager 场景下就是 manager.lock），
@@ -939,7 +937,7 @@ class MultiMQTTManager:
                         )
                         return
                     base_req_id, sig_hex = req_id.rsplit("|", 1)
-                    logger.info(
+                    logger.debug(
                         "🔑 [%s] 请求已签名，开始验签: req_id=%s | base_req_id=%s | signature_len=%d | server_pubkey=%s",
                         host, req_id, base_req_id, len(sig_hex),
                         _describe_public_key(self.server_public_key_bytes,short_text=True),
