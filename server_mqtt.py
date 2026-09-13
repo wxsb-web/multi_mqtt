@@ -15,7 +15,7 @@ class MQTTServer:
         self.request_topic = request_topic
         self.reply_topic = reply_topic
         manager_args = {
-            "log_messages": True,
+            "log_messages": False,# 每个broker不打印原始消息
             "server_public_key_bytes": server_public_key_bytes,
         }
         manager_args["brokers"] = brokers
