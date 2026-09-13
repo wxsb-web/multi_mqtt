@@ -120,19 +120,28 @@ def process_cipher(data, decrypt=False, enabled=False, key=AES_KEY):
         return base64.b64encode(nonce + ciphertext).decode('utf-8')
 
 class TTLCache:
-    """轻量级内存去重缓存"""
-    def __init__(self, ttl_seconds=30):
+    """轻量级内存去重缓存（[修复-容量上限] 新增 max_size，超限按 FIFO 淘汰）"""
+    # [修复] 默认 max_size=50000。原先无上限：30 秒 TTL 内的瞬时峰值可能被恶意
+    # 灌入海量不同 req_id（即使每条只有 512 字节上限），连发百万级也能顶爆内存。
+    # 加上限后，超过时按 OrderedDict 插入顺序淘汰最老条目，保证内存有界。
+    def __init__(self, ttl_seconds=30, max_size=50000):
         self.ttl = ttl_seconds
+        self.max_size = max_size
         self.cache = OrderedDict()
         self.lock = threading.Lock()
 
     def add_if_not_exists(self, key: str) -> bool:
         now = time.time()
         with self.lock:
+            # 1. 先按 TTL 滚出过期条目（从队首开始）
             while self.cache and next(iter(self.cache.values())) < now - self.ttl:
                 self.cache.popitem(last=False)
+            # 2. 命中：直接返回 False，不更新位置（去重语义）
             if key in self.cache:
                 return False
+            # 3. [修复-容量上限] 容量已满：FIFO 淘汰最老条目，保证内存有界
+            if len(self.cache) >= self.max_size:
+                self.cache.popitem(last=False)
             self.cache[key] = now
             return True
 
@@ -361,7 +370,6 @@ def get_standard_public_pem_bytes(key_input) -> bytes:
 
 # =========================================================================
 # [新增解耦功能] 网络质量统计模型与管理模块（默认不占额外内存，极其轻量）
-# =========================================================================
 class BrokerStat:
     """单一节点的数据模型（完全摒弃历史数组，保证O(1)极低内存开销）"""
     # [轻量化] __slots__ 避免每个实例再挂一份 __dict__，配合"极其轻量"的设计目标
@@ -448,14 +456,15 @@ class ConnectionQualityStats:
         self.lock = lock if lock is not None else threading.Lock()
         self.print_interval = print_interval
         self.running = False
-        self.thread = None
+        # [合并线程] 不再维护独立监控线程，相关属性已删除
         self.clients_ref = {}
 
     def start(self, clients_ref):
+        """[合并线程] 仅初始化，不启动独立线程。由 MultiMQTTManager 的分发线程统一驱动。"""
         if not self.enabled: return
         with self.lock:
             if self.running:
-                return  # 幂等保护：防止重复 start 导致多份监控线程
+                return  # 幂等保护：防止重复 start
             self.clients_ref = clients_ref
             for host in self.clients_ref.keys():
                 # [修复-S2] 用 setdefault 而不是直接赋值。
@@ -466,16 +475,10 @@ class ConnectionQualityStats:
                 # 导致初次连接的状态被静默丢弃。
                 self.stats.setdefault(host, BrokerStat())
             self.running = True
-        self.thread = threading.Thread(target=self._monitor_loop, daemon=True, name="StatsPingThread")
-        self.thread.start()
 
     def stop(self):
+        """[合并线程] 仅修改标志位，无需等待线程退出。"""
         self.running = False
-        # [稳定性] 等待线程真正退出，避免关闭后仍访问已释放资源
-        t = self.thread
-        if t and t.is_alive():
-            t.join(timeout=10.0)
-        self.thread = None
 
     def on_connect(self, host):
         if not self.enabled: return
@@ -644,37 +647,25 @@ class ConnectionQualityStats:
         lines.append("=" * 90)
         return "\n".join(lines)
 
-    def _monitor_loop(self):
-        """修复了原有的睡眠阻塞逻辑，通过秒级步进分开判断统计报告与Ping的时机"""
-        sleep_step = 6
-        ping_interval = self.PING_INTERVAL   # [可配置] 使用类属性，保留默认 10 分钟
-        # [稳定性] 使用绝对时间戳驱动，避免 sleep 漂移导致周期累积误差
-        now = time.time()
-        next_ping_at = now                    # 启动后立刻先测一次
-        next_print_at = (now + self.print_interval) if self.print_interval > 0 else None
-        while self.running:
-            now = time.time()
-            # 1. 检测是否需要发送 PING 指令来测距
-            if now >= next_ping_at:
-                next_ping_at = now + ping_interval
-                self._send_pings()
-            # 2. 检测是否需要打印输出报告
-            if next_print_at is not None and now >= next_print_at:
-                next_print_at = now + self.print_interval
-                try:
-                    logger.info("📡 [连接质量统计报告]" + self.get_report())
-                except Exception:
-                    logger.exception("生成连接质量统计报告失败")
-            time.sleep(sleep_step)
-            if not self.running:break
+    # [合并线程] _monitor_loop 已彻底删除，其逻辑合并到 MultiMQTTManager._dispatch_loop 中
+
     def _send_pings(self):
         """[原逻辑抽离] 遍历已连接的 broker 发送 QoS1 Ping，单点异常不互相影响"""
+        # [修复-5] 若 stats 已被 stop() 关闭，立即退出，避免在关闭过程中继续发 Ping。
+        # paho 的 publish(qos=1) 本身是非阻塞的（只入内存队列），但为防御极端情况，
+        # 这里加一道"软中断"：每轮循环检查 self.running，一旦 stop() 触发立即返回，
+        # 避免长时间占用分发线程导致 join 超时。
+        if not self.running:
+            return
         # [修复-N1] 使用 self.lock（在 MultiMQTTManager 场景下就是 manager.lock），
         # 与 manager.stop() 里 `with self.lock: self.clients.clear()` 使用同一把锁。
         # 两边互斥，不会再出现"另一个线程正在 clear 时这边 list() 迭代"的 RuntimeError。
         with self.lock:
             clients_snapshot = list(self.clients_ref.items())
         for host, client in clients_snapshot:
+            # [修复-5] 每个 host 之间也检查一次，中途被打断立即返回
+            if not self.running:
+                return
             stat = self.stats.get(host)
             if not stat or not stat.is_connected:
                 continue
@@ -745,11 +736,12 @@ class MultiMQTTManager:
         self.log_connection = log_connection if log_connection is not None else not enable_stats
         self.stats = ConnectionQualityStats(enabled=self.enable_stats, lock=self.lock)
         # ------------------
-        self.dedup_cache = TTLCache(ttl_seconds=30)
+        # [修复-容量上限] 传入 max_size，防止去重缓存在 TTL 窗口内被灌爆内存
+        self.dedup_cache = TTLCache(ttl_seconds=30, max_size=50000)
         self.message_callback = None
         self.subscribed_topics = set()
         # [修复-N2/N3] 用 threading.Event 代替 _stopping 布尔标志：
-        #   - _dispatch_loop 用它作为退出信号（不再依赖哨兵 None）；
+        #   - _dispatch_loop 用它作为退出信号；
         #   - _on_disconnect 用它判断"主动停止 / 意外断开"；
         #   - 停止后 start() 会 clear()，可安全复用于"停→启"场景。
         self._stop_event = threading.Event()
@@ -793,8 +785,32 @@ class MultiMQTTManager:
             if self.clients:
                 logger.warning("MultiMQTTManager.start() 重复调用，已忽略")
                 return
+            # [修复-5] 检查旧 dispatch 线程是否真正退出。
+            # stop() 里的 join 有 5s 超时，若上层 message_callback 长时间阻塞，
+            # 旧线程可能还活着；此时若贸然启动新线程，两个线程会共抢同一个
+            # _msg_queue，出现重复消费、顺序错乱、毒药丸被误吞等诡异行为。
+            old_thread = self._dispatch_thread
+            if old_thread is not None and old_thread.is_alive():
+                logger.error(
+                    "上一次的分发线程尚未退出（可能有 message_callback 阻塞），"
+                    "拒绝启动新的分发线程以免双线程抢队列。请稍后重试或排查阻塞回调。"
+                )
+                return
             # [修复-N2/N3] 清除停止信号，保证"停→启"可复用同一 manager
             self._stop_event.clear()
+            # [修复-2] 排空可能残留的旧毒药丸。
+            # 场景：上一次 stop() 时线程恰好正在处理回调，毒药丸塞进队列后无人消费，
+            # 一直留到现在。若不清空，新线程 get() 到的第一个元素就是 None，
+            # 会立刻 return，导致整个分发改线彻底瘫痪。
+            drained = 0
+            while True:
+                try:
+                    self._msg_queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    break
+            if drained:
+                logger.debug("start() 排空了 %d 条残留消息（含可能的旧毒药丸）", drained)
         # [修复-③] 先启动分发线程，再启动底层连接，避免消息入队而无人消费
         self._dispatch_thread = threading.Thread(
             target=self._dispatch_loop, daemon=True, name="MQTTMsgDispatch"
@@ -874,6 +890,16 @@ class MultiMQTTManager:
         """
         host = userdata
         try:
+            # ------------------------------------------------------------------
+            # [修复-4] 过滤自身发出的 QoS1 Ping 回声。
+            # 我们自己 publish 到 multi_mqtt/ping_rtt/{host} 的空 payload 消息，
+            # 会通过本地订阅链路（尤其订阅了 "#" 或 "multi_mqtt/#" 时）回到本
+            # 回调。空字符串解码后 "" 会让 json.loads("") 抛 JSONDecodeError，
+            # 每 PING_INTERVAL（默认 600s）就刷一条 ERROR 日志噪音。
+            # 这里直接 return，不进后续解析/验签/去重/入队链路。
+            # ------------------------------------------------------------------
+            if msg.topic.startswith("multi_mqtt/ping_rtt/"):
+                return
             if self.log_messages:
                 logger.info(f"📩 收到消息 [{msg.topic}] 来自 {host}  {msg} {msg.payload}")    
             raw_payload = msg.payload.decode('utf-8')
@@ -983,29 +1009,70 @@ class MultiMQTTManager:
 
     def _dispatch_loop(self):
         """
-        [修复-N2/N3] 独立的分发线程：串行消费队列，把业务回调与 paho 网络线程解耦。
-        退出机制改用 threading.Event：
-        - 不再需要 stop() 里 put_nowait(None) 的哨兵（避免队列满时哨兵丢失）；
-        - stop() 里的 join() 可以限时等待，因为 _stop_event 设置后本线程最多
-          等一次 queue.get(timeout=1.0) 超时就会退出；
-        - 因此也不会出现"旧线程未退、start() 又起新线程共享同一队列"的双线程抢消息。
+        [合并线程] 独立的分发线程：串行消费队列，并统一驱动 Stats 的 Ping 与报告打印。
+        核心思想：事件驱动的动态超时 + 毒药丸退出。
+        - 当 enable_stats 为 False 时，wait_time = None，线程无限期阻塞在 get() 上，
+          完全零轮询，直到有消息或毒药丸到来。
+        - 当 enable_stats 为 True 时，动态计算距离下一次 Ping / 打印报告的时间，
+          仅在该时间到达或有消息时才唤醒 CPU，实现深度休眠。
+        - stop() 会向队列投递 None（毒药丸），瞬间唤醒阻塞的 get()，实现 0 延迟退出。
         """
+        # 初始化 Stats 的时间线
+        if self.enable_stats:
+            ping_interval = self.stats.PING_INTERVAL
+            print_interval = self.stats.print_interval
+            next_ping_at = time.time() + ping_interval
+            next_print_at = (time.time() + print_interval) if print_interval > 0 else float('inf')
+        else:
+            next_ping_at = next_print_at = float('inf')
+
         while not self._stop_event.is_set():
+            now = time.time()
+            
+            # 动态计算还要睡多久。如果不开启 stats，wait_time 就是 None (无限期阻塞)
+            if self.enable_stats:
+                wait_time = min(next_ping_at - now, next_print_at - now)
+                wait_time = max(0.1, wait_time)  # 兜底防负数
+            else:
+                wait_time = None 
+
             try:
-                item = self._msg_queue.get(timeout=1.0)
+                # 只有超时（该发Ping了）或有真实消息时，CPU 才会从 idle 唤醒
+                item = self._msg_queue.get(timeout=wait_time)
+                
+                # 收到 stop() 发来的“毒药丸”
+                if item is None:
+                    return
+                    
+                # 正常分发消息
+                topic, data, host = item
+                try:
+                    if self.message_callback:
+                        self.message_callback(topic, data, host)
+                except Exception:
+                    logger.exception("消息分发回调执行失败 [%s] topic=%s", host, topic)
+                    
             except queue.Empty:
-                # 队列空闲：回到循环顶部重新检查 _stop_event
-                continue
-            # [修复-⑧] 拿到消息后先看停止信号：一旦要求停止，立刻抛弃并退出
+                # 触发了超时，说明什么消息都没来，单纯是 Stats 的时间到了，跳出交给下面处理
+                pass
+
             if self._stop_event.is_set():
                 return
-            topic, data, host = item
-            try:
-                if self.message_callback:
-                    self.message_callback(topic, data, host)
-            except Exception:
-                # 单条消息回调异常不能影响其他消息，也不能杀死分发线程
-                logger.exception("消息分发回调执行失败 [%s] topic=%s", host, topic)
+
+            # 执行合并进来的 Stats 逻辑 (如果被消息提前唤醒，时间不够则不会执行)
+            if self.enable_stats:
+                now = time.time()
+                if now >= next_ping_at:
+                    # [修复-5] _send_pings 内部已加 running 检查，中途 stop 会尽快返回
+                    self.stats._send_pings()
+                    next_ping_at = now + ping_interval
+                
+                if now >= next_print_at:
+                    try:
+                        logger.info("📡 [连接质量统计报告]" + self.stats.get_report())
+                    except Exception:
+                        logger.exception("生成连接质量统计报告失败")
+                    next_print_at = now + print_interval
 
     def subscribe(self, topic: str):
         # [修复-M2] 锁内只做状态更新 + 快照，锁外遍历 subscribe。
@@ -1079,9 +1146,50 @@ class MultiMQTTManager:
     def stop(self):
         # [修复-④][修复-N2/N3] 用 _stop_event 替代 _stopping：
         # - Event 读写线程安全；
-        # - _dispatch_loop 用 wait/get 感知它，无需再发哨兵 None；
         # - 停止后 start() 会 clear()，可安全复用于"停→启"。
         self._stop_event.set()
+
+        # ------------------------------------------------------------------
+        # [修复-2/3 毒药丸投递]
+        # 目标：确保 _dispatch_loop 无论当前处于哪种等待状态都能被瞬间唤醒。
+        # 原先直接 put_nowait(None) 有两个隐患：
+        #   (a) 队列已满（10000 条积压）时 put_nowait 会抛 Full 被吞掉，
+        #       导致深度休眠（wait_time=None）的分发线程无法被唤醒，
+        #       只能依赖下一次有新消息才有机会检查 _stop_event；
+        #   (b) 若线程此刻正在处理回调，毒药丸会永远留在队列中，
+        #       下一次 start() 起新线程时被当作第一条消息吃掉 → 秒退。
+        # 修复方案：
+        #   1. 先清空整个队列（把积压消息与任何历史残留一并丢弃），
+        #      此时队列必然为空；
+        #   2. 再 put_nowait(None)，保证毒药丸 100% 进入队列；
+        #   3. 若仍有极端并发（paho 线程恰好瞬间填满）导致 Full，
+        #      则再清一次并重试一次，仍失败则记录告警。
+        # start() 中也会做一次兜底排空，双保险。
+        # ------------------------------------------------------------------
+        try:
+            while True:
+                try:
+                    self._msg_queue.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self._msg_queue.put_nowait(None)
+            except queue.Full:
+                # 极端竞态：清空后瞬间被 paho 线程填满。重试一次。
+                while True:
+                    try:
+                        self._msg_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                try:
+                    self._msg_queue.put_nowait(None)
+                except queue.Full:
+                    logger.warning(
+                        "毒药丸投递失败（队列持续满载），分发线程将依赖 _stop_event 自然退出"
+                    )
+        except Exception:
+            logger.debug("投递毒药丸时出现异常", exc_info=True)
+
         if self.enable_stats:
             self.stats.stop()
         with self.lock:
@@ -1093,17 +1201,20 @@ class MultiMQTTManager:
                 c.disconnect()
             except Exception:
                 logger.debug("关闭 MQTT client 时出现异常", exc_info=True)
-        # [修复-N3] 限时等待：_stop_event 已设置，正常路径下分发线程最多 1 次 get
-        # 超时就退出；但如果上层 message_callback 阻塞（例如 IO 或 sleep），
-        # 线程可能长时间无法返回。因此这里必须设置 join 超时，超时后打告警，
-        # 避免 stop() 被上层回调拖死导致整个进程无法退出。
+        # [修复-N3] 限时等待：_stop_event 已设置且毒药丸已投递，正常路径下分发线程会立刻退出；
+        # 但如果上层 message_callback 阻塞（例如 IO 或 sleep），线程可能长时间无法返回。
+        # 因此这里必须设置 join 超时，超时后打告警，避免 stop() 被上层回调拖死导致整个进程无法退出。
         t = self._dispatch_thread
         if t and t.is_alive():
             t.join(timeout=self.DISPATCH_JOIN_TIMEOUT)
             if t.is_alive():
                 logger.warning(
-                    "⚠️ 分发线程未在 %.1f 秒内退出，可能有 message_callback 阻塞",
+                    "⚠️ 分发线程未在 %.1f 秒内退出，可能有 message_callback 阻塞；"
+                    "下次 start() 前请先确认旧线程已结束，否则会被拒绝启动",
                     self.DISPATCH_JOIN_TIMEOUT,
                 )
-        self._dispatch_thread = None
+        # 注意：只有线程确认退出才把它置 None；否则保留引用，
+        # 让下一次 start() 能通过 is_alive() 检查并拒绝启动（[修复-5]）。
+        if t is not None and not t.is_alive():
+            self._dispatch_thread = None
         logger.info("所有 MQTT 连接已安全关闭")
