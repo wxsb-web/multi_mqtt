@@ -14,13 +14,12 @@ class MQTTServer:
         # 实例化网络层管理器 (enable_crypto 默认为 False)
         self.request_topic = request_topic
         self.reply_topic = reply_topic
-        manager_args = {
-            "log_messages": False,# 每个broker不打印原始消息
-            "server_public_key_bytes": server_public_key_bytes,
-            enable_stats=True,
-        }
-        manager_args["brokers"] = brokers
-        self.mqtt_net = MultiMQTTManager(**manager_args)
+        
+        self.mqtt_net = MultiMQTTManager(
+            brokers=brokers,
+            log_messages=False,# 每个broker不打印原始消息
+            server_public_key_bytes=server_public_key_bytes,
+            enable_stats=True,)
         self.mqtt_net.set_on_message(self.handle_message)
         self.executor = PythonExecutor()
 
