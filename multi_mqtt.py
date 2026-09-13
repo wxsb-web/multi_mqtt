@@ -695,6 +695,18 @@ class MultiMQTTManager:
     # [修复-③] 消息分发队列上限：满则丢弃并告警，绝不阻塞 paho 网络线程
     MSG_QUEUE_MAXSIZE = 10000
 
+    # [修复-N4] 允许的最大 req_id 长度：超过直接拒绝。
+    # req_id 来源于 MQTT 明文 payload，公共 broker 上任何人可发；
+    # 若不限制长度，攻击者发送 10MB 的 req_id 会灌入 TTLCache（存活 30 秒），
+    # 短时间内连发数百条即可耗尽数百 MB 内存。
+    MAX_REQ_ID_LEN = 512
+
+    # [修复-N3] stop() 中等待分发线程退出的超时（秒）。
+    # _dispatch_loop 在 _stop_event 设置后最多一次 get 超时就退出，
+    # 但若上层 message_callback 阻塞（如数据库 IO、sleep），线程无法及时退出；
+    # 因此 join 必须设超时，避免 stop() 被回调拖死导致整个进程无法退出。
+    DISPATCH_JOIN_TIMEOUT = 5.0
+
     def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60, max_reconnect_delay=3600):
         self.brokers = brokers
         self.keepalive = keepalive
@@ -810,7 +822,12 @@ class MultiMQTTManager:
             try:
                 client.connect_async(host, port, keepalive=self.keepalive)
                 client.loop_start()
-                self.clients[host] = client
+                # [修复-N1] clients 写入必须持锁，与 subscribe() / publish_broadcast()
+                # / _send_pings() 中的快照读取互斥。否则 loop_start() 之后 paho 网络
+                # 线程立即开始跑，而其它线程可能正在 `list(self.clients.items())`，
+                # 就会命中 RuntimeError: dictionary changed size during iteration。
+                with self.lock:
+                    self.clients[host] = client
                 if self.log_connection:
                     logger.info(f"开启后台连接任务 -> {host}:{port}")
             except Exception as e:
@@ -886,6 +903,18 @@ class MultiMQTTManager:
                 req_id = raw_req_id
             else:
                 req_id = str(raw_req_id)
+            # ------------------------------------------------------------------
+            # [修复-N4] req_id 长度上限校验。
+            # req_id 最终会写入 TTLCache（TTL=30 秒）。公共 broker 上任何节点
+            # 都可以发送消息，若不限制长度，一条几十 MB 的 req_id 就能占住
+            # 内存直到过期；连发数百条即触发内存放大攻击。这里超过上限直接丢弃，
+            # 且不进入后续验签 / 去重流程。
+            # ------------------------------------------------------------------
+            if req_id is not None and len(req_id) > self.MAX_REQ_ID_LEN:
+                logger.warning(
+                    f"⚠️ [{host}] 拒绝处理: req_id 长度超限 (len={len(req_id)} > {self.MAX_REQ_ID_LEN})"
+                )
+                return
             # --- ECDSA 验证防重放核心逻辑 ---
             if "code" in data:
                 # [修复-S3] fail-closed：公钥配置了但解析失败 → 直接拒绝
@@ -964,8 +993,8 @@ class MultiMQTTManager:
         [修复-N2/N3] 独立的分发线程：串行消费队列，把业务回调与 paho 网络线程解耦。
         退出机制改用 threading.Event：
         - 不再需要 stop() 里 put_nowait(None) 的哨兵（避免队列满时哨兵丢失）；
-        - stop() 里的 join() 可以无限等待，因为 _stop_event 设置后本线程最多
-          等一次 queue.get(timeout=1.0) 超时就会退出，不会出现僵尸线程；
+        - stop() 里的 join() 可以限时等待，因为 _stop_event 设置后本线程最多
+          等一次 queue.get(timeout=1.0) 超时就会退出；
         - 因此也不会出现"旧线程未退、start() 又起新线程共享同一队列"的双线程抢消息。
         """
         while not self._stop_event.is_set():
@@ -1071,10 +1100,17 @@ class MultiMQTTManager:
                 c.disconnect()
             except Exception:
                 logger.debug("关闭 MQTT client 时出现异常", exc_info=True)
-        # [修复-N2/N3] 无限等待：_stop_event 已设置，分发线程最多 1 次 get 超时就退出，
-        # 不会死锁；也不用再担心"旧线程成为僵尸 + start() 起新线程共享同一队列"。
+        # [修复-N3] 限时等待：_stop_event 已设置，正常路径下分发线程最多 1 次 get
+        # 超时就退出；但如果上层 message_callback 阻塞（例如 IO 或 sleep），
+        # 线程可能长时间无法返回。因此这里必须设置 join 超时，超时后打告警，
+        # 避免 stop() 被上层回调拖死导致整个进程无法退出。
         t = self._dispatch_thread
         if t and t.is_alive():
-            t.join()
+            t.join(timeout=self.DISPATCH_JOIN_TIMEOUT)
+            if t.is_alive():
+                logger.warning(
+                    "⚠️ 分发线程未在 %.1f 秒内退出，可能有 message_callback 阻塞",
+                    self.DISPATCH_JOIN_TIMEOUT,
+                )
         self._dispatch_thread = None
         logger.info("所有 MQTT 连接已安全关闭")
