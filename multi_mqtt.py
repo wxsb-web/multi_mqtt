@@ -271,7 +271,7 @@ def get_standard_pem_bytes(key_input) -> bytes:
 
     return raw_bytes # 默认兜底返回
 
-def _describe_public_key(value: bytes | str | None) -> str:
+def _describe_public_key(value: bytes | str | None,short_text=False) -> str:
     """返回可直接写入日志的公钥摘要与详细值。"""
     if not value:
         return "未配置"
@@ -281,6 +281,7 @@ def _describe_public_key(value: bytes | str | None) -> str:
             return "空值"
         text = data.decode('utf-8', 'replace').replace('\n',' ').strip()
         if b"BEGIN PUBLIC KEY" in data or b"BEGIN EC PUBLIC KEY" in data:
+            if short_text:text=text[27:40]
             return f"已配置(type=PEM, len={len(data)}, value={text})"
         if b"ecdsa-sha2-nistp256" in data:
             return f"已配置(type=OpenSSH, len={len(data)}, value={text})"
@@ -934,14 +935,14 @@ class MultiMQTTManager:
                         logger.warning(
                             f"⚠️ [{host}] 拒绝执行: 缺少 ECDSA 签名结构 "
                             f"(req_id 类型={type(raw_req_id).__name__}) | "
-                            f"server_pubkey={_describe_public_key(self.server_public_key_bytes)}"
+                            f"server_pubkey={_describe_public_key(self.server_public_key_bytes,short_text=True)}"
                         )
                         return
                     base_req_id, sig_hex = req_id.rsplit("|", 1)
                     logger.info(
                         "🔑 [%s] 请求已签名，开始验签: req_id=%s | base_req_id=%s | signature_len=%d | server_pubkey=%s",
                         host, req_id, base_req_id, len(sig_hex),
-                        _describe_public_key(self.server_public_key_bytes),
+                        _describe_public_key(self.server_public_key_bytes,short_text=True),
                     )
                     code_str = str(data.get("code", ""))
                     # ------------------------------------------------------
@@ -960,7 +961,7 @@ class MultiMQTTManager:
                         self.server_vk.verify(bytes.fromhex(sig_hex), sign_msg, hashfunc=hashlib.sha256)
                         logger.info("✅ [%s] ECDSA 验签成功，允许执行: req_id=%s", host, base_req_id)
                     except Exception:
-                        logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 | req_id={req_id} | server_pubkey={_describe_public_key(self.server_public_key_bytes)}")
+                        logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 | req_id={req_id} | server_pubkey={_describe_public_key(self.server_public_key_bytes,short_text=True)}")
                         return
             
             # ------------------------------------------------------------------
