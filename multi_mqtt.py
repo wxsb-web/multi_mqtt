@@ -39,8 +39,23 @@ from paho.mqtt.enums import CallbackAPIVersion
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MultiMQTT")
 
+# =========================================================================
 # 预设公共 MQTT Broker 列表
+# -------------------------------------------------------------------------
+# 条目格式（两种，自动识别，向后兼容）：
+#   - (host, port)                       → 匿名连接（原逻辑）
+#   - (host, port, [username, password]) → 使用用户名/密码连接
+#     密码可为空字符串 "" （例如 demo.tbmq.io 允许空密码）
+#
+# 示例：
+#   BROKER_LIST = [
+#       ("broker.mqtt-dashboard.com", 1883),
+#       ("demo.tbmq.io", 1883, ["demo", ""]),           # 用户名 demo，密码为空
+#   ]
+# =========================================================================
 BROKER_LIST = [
+    ("mqtt.iotbhai.io", 1883),                  # RTT: 429.3 ms | 建连:  597.7 ms (个人站点？实际上不能用。当作测试也挺好)
+    ("broker.mqtt-dashboard.com", 1883),        # RTT: 307.1 ms | 建连:  465.6 ms (HiveMQ Dashboard，综合体验佳)
     ("mqtt.touchsocket.net", 1883),             # RTT:  29.5 ms | 建连:  293.4 ms (b 视频)
     ("broker.codenow.cn", 1883),                # RTT:  31.4 ms | 建连:  110.1 ms (CodeNow 国内公共MQTT)
     ("broker.emqx.io", 1883),                   # RTT: 282.9 ms | 建连:  620.4 ms (EMQX 国际)
@@ -48,11 +63,15 @@ BROKER_LIST = [
     ("test.mosquitto.org", 1883),               # RTT: 398.4 ms | 建连:  586.0 ms (Mosquitto 官方)
     ("broker-cn.emqx.io", 1883),                # RTT: 407.3 ms | 建连:  751.3 ms (EMQX 中国)
     ("broker.hivemq.com", 1883),                # RTT: 301.0 ms | 建连:12830.1 ms (HiveMQ 官方，建连极慢，收发快)
-    ("broker.mqtt-dashboard.com", 1883),        # RTT: 307.1 ms | 建连:  465.6 ms (HiveMQ Dashboard，综合体验佳)
     ("broker.mqtt.cool", 1883),                 # RTT: 425.4 ms | 建连:  594.8 ms (MQTT.Cool)
-    ("mqtt.iotbhai.io", 1883),                  # RTT: 429.3 ms | 建连:  597.7 ms (IoTbhai)
     ("mqtt.tyckr.io", 1883),                    # RTT: 436.0 ms | 建连:  596.2 ms (Tyckr)
     ("public-mqtt-broker.bevywise.com", 1883),  # RTT: 451.3 ms | 建连:  575.9 ms (Bevywise)
+    ("demo.tbmq.io", 1883, ["demo", ""]),       # ThingsBoard TBMQ可以，下面4个全部不能用
+    # ("public.mqtt.pro", 1883, ["ajbkvbp/demo", "OCDWjjOSlSexcWRG"]),        # MQTT.pro 公共沙箱，凭据定期轮换[reference:1]
+    # ("mqtt.flespi.io", 1883, ["stPwSVV73Eqw5LSv0iMXbc4EguS7JyuZR9lxU5uLxI5tiNM8ToTVqNpu85pFtJv9", ""]),                     # Flespi，将 YOUR_FLESPI_TOKEN 替换为注册后获取的 Token[reference:2]
+    # ("io.adafruit.com", 1883, ["nagecubic","aio_"+"EiZX7901W4K4INtv13RSH6jqkEKl"]),        # Adafruit IO，需注册获取 #改成"aio_"+" 不能直接push error: GH013: Repository rule violations found for refs/heads/master.  GITHUB PUSH PROTECTION
+    # ("mqtt.ably.io", 1883, ['yMJ3VQ.PxwimQ','Vw4oM1CCMxx0tm8xTIZtda72vNj3SmNkLbVPipSt5Ek']), # Ably，API Key 按 username:password 拆分填入[reference:4]
+
 ]
 
 '''
@@ -66,7 +85,6 @@ BROKER_LIST = [
  test.mosquitto.org        │   188,030,853 / 77,948 
 ───────────────────────────┴────────────────────────
 
-
 逻辑还是没有清晰  ，这次不写代码。  client 发送时候有私钥 可以签名， server 启动时候只有公钥 收到  再次回复   那返回信息又没有签名。  你的代码可以正确解析这种情况吗。   如果要实现完整加密，那又太复杂了  。  https ，ssh 密钥协商
 
 客户端发送指令时：由于你要让服务器执行代码，payload 里必然带有 "code": "import platform..."。客户端的发送函数一看到有 "code"，并且自己有私钥，就会主动触发签名。
@@ -74,7 +92,6 @@ BROKER_LIST = [
 服务端返回结果时：服务端的回复 payload 是 {"req_id": "...", "stdout": "...", "ok": True}。里面没有 "code" 字段。此时服务端的发送函数会直接跳过签名逻辑，把原封不动的 JSON 发回去。
 客户端接收结果时：客户端收到回复，看到 payload 里没有 "code" 字段，就会直接跳过验签逻辑，走原来的普通流程（去重 -> 打印结果）。
 '''
-
 
 def stime(ms=0, format='%Y-%m-%d__%H.%M.%S', ms_splitor='__.'):
     """可读毫秒级时间戳。ms 传整数毫秒；不传则取当前 UTC 毫秒。"""
@@ -779,6 +796,42 @@ class MultiMQTTManager:
             # 1 秒内重复：抑制，仅累加计数
             self._msg_err_log_state[host] = (last_time, suppressed + 1)
 
+    def _unpack_broker(self, entry):
+        """
+        [新增-用户名密码支持] 统一解包 broker 配置条目。
+        支持两种格式（向后兼容）：
+            (host, port)                       -> 匿名连接
+            (host, port, [username, password]) -> 用户名密码连接
+        返回 (host, port, username, password)，非法条目返回 None。
+        """
+        if not isinstance(entry, (tuple, list)):
+            logger.error("跳过非法 Broker 配置条目（非 tuple/list）: %r", entry)
+            return None
+        if len(entry) == 2:
+            host, port = entry
+            return (host, port, None, None)
+        if len(entry) == 3:
+            host, port, auth = entry
+            # auth 期望是 [username, password]；密码允许为 "" 或 None（表示空密码）
+            if isinstance(auth, (tuple, list)) and len(auth) >= 2:
+                username = auth[0]
+                password = auth[1]
+                if username is None:
+                    # 用户名为 None 视作匿名
+                    return (host, port, None, None)
+                # 密码为 None 时 paho 也接受（等价空密码）
+                return (host, port, str(username), "" if password is None else str(password))
+            if isinstance(auth, str):
+                # 兼容 (host, port, "user:pass") 这种简写
+                if ":" in auth:
+                    username, password = auth.split(":", 1)
+                    return (host, port, username, password)
+                return (host, port, auth, "")
+            logger.error("跳过非法 Broker 配置条目（auth 字段格式不支持）: %r", entry)
+            return None
+        logger.error("跳过非法 Broker 配置条目（长度不是 2 或 3）: %r", entry)
+        return None
+
     def start(self):
         """启动与所有 Broker 的连接并启用后台自动断线重连"""
         with self.lock:
@@ -816,10 +869,21 @@ class MultiMQTTManager:
             target=self._dispatch_loop, daemon=True, name="MQTTMsgDispatch"
         )
         self._dispatch_thread.start()
-        for host, port in self.brokers:
+        for broker_entry in self.brokers:
+            unpacked = self._unpack_broker(broker_entry)
+            if unpacked is None:
+                continue
+            host, port, username, password = unpacked
             client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
             client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
             client.user_data_set(host)
+            # [新增-用户名密码支持] 仅在配置了用户名时调用 username_pw_set；
+            # 未配置则保持原匿名连接逻辑不变。
+            if username is not None:
+                try:
+                    client.username_pw_set(username, password)
+                except Exception:
+                    logger.exception("设置 Broker [%s] 用户名密码失败，仍尝试匿名连接", host)
             client.reconnect_delay_set(min_delay=1, max_delay=self.max_reconnect_delay)
             client.on_connect = self._on_connect
             client.on_disconnect = self._on_disconnect
@@ -835,7 +899,8 @@ class MultiMQTTManager:
                 with self.lock:
                     self.clients[host] = client
                 if self.log_connection:
-                    logger.info(f"开启后台连接任务 -> {host}:{port}")
+                    auth_tag = f" user={username!r}" if username is not None else " (anonymous)"
+                    logger.info(f"开启后台连接任务 -> {host}:{port}{auth_tag}")
             except Exception as e:
                 # [稳定性] 半构造的 client 需要回收，避免 socket / 线程泄漏
                 try:
