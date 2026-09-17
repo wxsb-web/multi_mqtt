@@ -26,11 +26,11 @@ class PythonExecutor:
     因此公开 API（``__init__`` 和 ``execute``）只暴露一个 ``globals``
     参数；``locals_dict`` 在内部作为别名存在，以便两个名字都可被内省 /
     兼容使用。
-    
-ipy中可以验证 globals()==locals()
-Out[11]: True
 
-如果要函数内部执行 可以直接赋值  self.locals_dict 绕过   
+    ipy 中可以验证 globals() == locals()
+    Out[11]: True
+
+    如果要在函数内部 调用 PythonExecutor 执行时绕过共享命名空间，可以直接赋值 ``self.locals_dict``。
     """
 
     def __init__(self, globals=None, main_loop=None):
@@ -59,43 +59,50 @@ Out[11]: True
         ``globals`` 若提供，应是一个包含**请求级**上下文变量的映射。
         这些变量只在本次调用期间注入共享命名空间，执行完毕后会被还原
         （或删除），因此不会泄漏到持久的 REPL 状态中。
+
+        注意：整个“保存旧值 → 注入 → 执行 → 还原”的过程都在同一把
+        可重入锁内完成。否则并发请求会互相看到对方注入的上下文变量，
+        并且还原顺序错乱，导致请求级名字永久泄漏到持久命名空间里。
         """
         if not isinstance(code, str) or not code.strip():
             return {"r": "", "stdout": "", "ok": False, "error": "code is required"}
 
-        saved = {}
-        injected = []
-        if isinstance(globals, dict):
-            for k, v in globals.items():
-                if k in self.globals_dict:
-                    saved[k] = self.globals_dict[k]
-                self.globals_dict[k] = v
-                injected.append(k)
-
         output = io.StringIO()
-        try:
-            with self.lock:
-                with _redirect_stdout(output):
-                    result = self._execute(code)
-            return {
-                "r": result,
-                "stdout": output.getvalue(),
-                "ok": True,
-            }
-        except Exception:
-            return {
-                "r": None,
-                "stdout": output.getvalue(),
-                "ok": False,
-                "error": traceback.format_exc(),
-            }
-        finally:
-            # 还原 / 删除请求级名字。
-            for k in injected:
-                if k in saved:
-                    self.globals_dict[k] = saved[k]
-                else:
-                    self.globals_dict.pop(k, None)
+        # 整段注入 / 执行 / 还原都在锁内，避免并发下互相污染。
+        with self.lock:
+            saved = {}
+            injected = []
+            try:
+                if isinstance(globals, dict):
+                    for k, v in globals.items():
+                        if k in self.globals_dict:
+                            saved[k] = self.globals_dict[k]
+                        self.globals_dict[k] = v
+                        injected.append(k)
+
+                try:
+                    with _redirect_stdout(output):
+                        result = self._execute(code)
+                    return {
+                        "r": result,
+                        "stdout": output.getvalue(),
+                        "ok": True,
+                    }
+                except Exception:
+                    return {
+                        "r": None,
+                        "stdout": output.getvalue(),
+                        "ok": False,
+                        "error": traceback.format_exc(),
+                    }
+            finally:
+                # 还原 / 删除请求级名字。仍在锁内，保证其他线程不会在
+                # 我们还原到一半时观察到半成品命名空间。
+                for k in injected:
+                    if k in saved:
+                        self.globals_dict[k] = saved[k]
+                    else:
+                        self.globals_dict.pop(k, None)
 
     # ------------------------------------------------------------------ #
     # 内部执行逻辑
@@ -185,11 +192,20 @@ Out[11]: True
             future = asyncio.run_coroutine_threadsafe(coroutine, self.main_loop)
             return future.result()
 
+        # 新建 loop 时同步设置为当前线程的事件循环，否则协程内部若调用
+        # asyncio.get_event_loop()（不少第三方库会这么做）会拿到别的
+        # loop，甚至抛出 "no running event loop"。
         loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
             return loop.run_until_complete(coroutine)
         finally:
-            loop.close()
+            try:
+                loop.close()
+            finally:
+                # 还原为“当前线程没有事件循环”，避免把已关闭的 loop
+                # 留在 threading.local 里被后续代码误用。
+                asyncio.set_event_loop(None)
 
 
 class _redirect_stdout:
