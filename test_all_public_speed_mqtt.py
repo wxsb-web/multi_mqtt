@@ -22,6 +22,33 @@ BROKER_LIST = [
     # ("mq.tongxinmao.com", 1883, "同心猫 MQTT 18831 也无法连接"),
     ("mqtt.touchsocket.net", 1883,'b 视频'),  #好像又可以了 国内最快  这个不能正确转发消息，显示连接成功但是 没有反应
 ]
+#deepseek 2026年9月17日 全部不可用
+BROKER_LIST = [
+    ("mqtt.eclipseprojects.io", 1883, "Eclipse IoT 官方，部署在 Azure，支持 MQTT 3.1.1/5.0"),
+    ("public.mqtthq.com", 1883, "MQTTHQ 公共服务器，支持 WebSocket"),
+    ("broker.mqttx.io", 1883, "MQTTX 团队提供，支持 MQTT 3.1.1"),
+    ("public.cloud.shiftr.io", 1883, "Shiftr.io 提供，需注册免费账号获取凭证"),
+    ("io.adafruit.com", 1883, "Adafruit IO 平台，需注册免费账号并获取 API Key"),
+    ("mqtt.myqtthub.com", 1883, "MyQttHub 免费公共服务器，也提供免费私有实例"),
+    ("flespi.io", 1883, "Flespi 免费云 MQTT Broker，提供私有命名空间"),
+    ("mqtt.ably.io", 1883, "Ably 提供的 MQTT 适配器服务，全球分布式"),
+    ("public.mqtt.pro", 1883, "MQTT.pro 公共测试服务器，凭证定期轮换"),
+    ("mqtt.flespi.io", 1883, "Flespi MQTT Broker，支持 MQTT 5.0 与 REST API"),
+    ("node02.myqtthub.com", 1883, "MyQttHub 公共节点，支持 MQTT over WebSocket"),
+    ("cloudmqtt.com", 1883, "CloudMQTT 免费套餐，最多支持 10 个设备连接"),
+    ("aceautomation.ddns.net", 1883, "ACE Automation 测试 Broker，需联系获取密码"),
+    ("101b7a0.online-server.cloud", 1883, "ACE Automation 备用地址，可用性 99.99%"),
+    ("knotfree.net", 1883, "Knotfree.net 公共MQTT服务，支持MQTT 3.1/5.0，无需注册，通过Token认证"),
+    ("freemqtt.com", 1883, "Zunoy FreeMQTT 免费公共MQTT代理，无需注册，支持TCP/WebSocket/TLS"),
+    ("sas.theakiro.com", 1883, "Akiro MQTT Broker 免费SaaS实例，支持高并发连接"),
+    ("mqtt.presov.sk", 1883, "斯洛伐克Prešov市公共测试服务器，用户名/密码均为 public"),
+    ("mqtt.fluux.io", 1883, "Fluux公共MQTT服务器，支持TLS"),
+    ("mqtt.openmarine.net", 1883, "OpenMarine公共服务器（Beta阶段，无需认证）"),
+    ("iot.xpstem.com", 1883, "XPSTEM 公共MQTT服务器，无需认证，适合学习测试"),
+    ("broker.xmqtt.net", 1883, "XMQTT 公共服务器，在多个开源项目中被引用"),
+    ("demo.tbmq.io", 1883, "ThingsBoard TBMQ 提供的免费公共Broker，用户名 demo，密码为空"),
+    ("zunoy.com", 1883, "Zunoy FreeMQTT 免费公共Broker，无需注册，支持TCP/WebSocket/TLS"),
+]
 
 
 def test_single_broker(host, port, name, timeout=3.0):
