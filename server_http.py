@@ -138,8 +138,8 @@ class WebSocket:
 
 class RPCRequestHandler(BaseHTTPRequestHandler):
     key = ''
-    globals_dict = None
-    locals_dict = {}
+    # 复用一个持久化的执行器实例；请求级上下文通过 execute(globals=...) 注入。
+    executor = None
     favicon_bytes = None
     websocket_handler = None
     websocket_handlers = {}
@@ -237,10 +237,6 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "No code")
                 return
             code = urllib.parse.unquote(code_str)
-            exec_globals = self.globals_dict.copy() if self.globals_dict else {}
-            exec_globals['__name__'] = '__rpc_exec__'
-            exec_globals['request'] = self
-            exec_globals['q'] = self
 
             class ResponseWrapper:
                 def __init__(self):
@@ -258,35 +254,38 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                     self.headers[key] = value
 
             response = ResponseWrapper()
-            exec_globals['response'] = response
-            exec_globals['p'] = response
+
+            # 请求级上下文变量：执行期间临时注入，执行完自动还原，
+            # 不会污染执行器的持久命名空间。
+            context = {
+                'request': self,
+                'q': self,
+                'response': response,
+                'p': response,
+            }
+
+            executor = self.executor
             try:
                 with _stdout_lock:
                     old_stdout = sys.stdout
                     sys.stdout = io.StringIO()
                     try:
-                        executor = rpc_executor.PythonExecutor(
-                            globals_dict=exec_globals,
-                            locals_dict=self.locals_dict,
-                            main_loop=self.main_loop,
-                        )
-                        execution = executor.execute(code)
+                        execution = executor.execute(code, globals=context)
                         output = execution['stdout']
                         if not execution['ok']:
                             raise RuntimeError(execution['error'])
                     finally:
                         sys.stdout = old_stdout
 
+                namespace = executor.globals_dict
                 if response.data is not None:
                     result_obj = response.data
-                elif 'r' in self.locals_dict:
-                    result_obj = self.locals_dict['r']
-                elif 'r' in exec_globals:
-                    result_obj = exec_globals['r']
+                elif 'r' in namespace:
+                    result_obj = namespace['r']
                 elif output:
                     result_obj = output
                 else:
-                    result_obj = f"no 'r' variable, locals keys: {list(exec_globals.keys())}"
+                    result_obj = f"no 'r' variable, locals keys: {list(namespace.keys())}"
 
                 result_str = pretty_format(result_obj)
                 self.send_response(response.status)
@@ -328,13 +327,27 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     if not key:
         key = ''
     RPCRequestHandler.key = key
-    RPCRequestHandler.globals_dict = globals if globals else {}
-    RPCRequestHandler.locals_dict = locals if locals is not None else {}
     RPCRequestHandler.websocket_handler = websocket_handler
     RPCRequestHandler.websocket_path = websocket_path
     RPCRequestHandler.websocket_handlers = websocket_handlers or {}
     RPCRequestHandler.redirect_root = redirect_root
     RPCRequestHandler.main_loop = main_loop
+
+    # 构造持久命名空间：合并调用方传入的 globals / locals。
+    # 该命名空间只在服务器启动时构造一次，之后所有请求共享。
+    persistent_ns = {}
+    if globals:
+        persistent_ns.update(globals)
+    if locals:
+        persistent_ns.update(locals)
+    persistent_ns['__name__'] = '__rpc_exec__'
+
+    # 只创建一个 PythonExecutor，请求级上下文通过 execute(globals=...) 注入。
+    RPCRequestHandler.executor = rpc_executor.PythonExecutor(
+        globals=persistent_ns,
+        main_loop=main_loop,
+    )
+
     if favicon_rgb is None:
         favicon_rgb = (port // 100, port % 100, 0)
     RPCRequestHandler.favicon_bytes = get_bmp_bytes(rgb=favicon_rgb, size=favicon_size)

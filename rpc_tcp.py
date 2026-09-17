@@ -48,11 +48,11 @@ class TCPFrameProtocol:
 
 class TCPServer:
     def __init__(self, host='0.0.0.0', port=1166, 
-                 globals_dict=None, locals_dict=None,
+                 globals=None,
                  executor_pool_size=10):
         self.host = host
         self.port = port
-        self.globals_dict = globals_dict or {}
+        # self.globals_dict = globals_dict or {}
         self.locals_dict = locals_dict or {}
         
         # 请求-响应映射：等待中的请求
@@ -62,7 +62,7 @@ class TCPServer:
         
         # 执行器
         from rpc_executor import PythonExecutor
-        self.executor = PythonExecutor(globals_dict=globals_dict,locals_dict=locals_dict)
+        self.executor = PythonExecutor(globals=globals)#,locals_dict=locals_dict
         
         # 线程池处理业务逻辑
         self.worker_pool = ThreadPoolExecutor(max_workers=executor_pool_size)

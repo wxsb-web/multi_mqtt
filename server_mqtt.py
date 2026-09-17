@@ -9,7 +9,7 @@ REQUEST_TOPIC = "sys/device/request"
 DEFAULT_REPLY_TOPIC = "sys/device/response"
 
 class MQTTServer:
-    def __init__(self, server_public_key_bytes=None, brokers=BROKER_LIST,
+    def __init__(self,globals=None,server_public_key_bytes=None, brokers=BROKER_LIST,
                  request_topic=REQUEST_TOPIC, reply_topic=DEFAULT_REPLY_TOPIC):
         # 实例化网络层管理器 (enable_crypto 默认为 False)
         self.request_topic = request_topic
@@ -21,7 +21,7 @@ class MQTTServer:
             server_public_key_bytes=server_public_key_bytes,
             enable_stats=True,)
         self.mqtt_net.set_on_message(self.handle_message)
-        self.executor = PythonExecutor()
+        self.executor = PythonExecutor(globals=globals)
 
     def handle_message(self, topic, data, rx_broker):
         req_id = data.get("req_id")
