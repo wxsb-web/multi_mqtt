@@ -248,7 +248,6 @@ def start(config):
 
 if __name__ == "__main__":
     import argparse
-    import server_http
 
     parser = argparse.ArgumentParser(description="mqtt http rpc")
     parser.add_argument("--port", "-port", "-p", type=int, default=1177)
@@ -265,6 +264,7 @@ if __name__ == "__main__":
 
     gms = MQTTServer(globals=globals(),server_public_key_bytes=args.pub,)# 为什么放到 ghs后面定义 dir找不到变量？
     
+    import server_http
     ghs = server_http.start_rpc_server(
         port=args.port,
         ip=args.host,

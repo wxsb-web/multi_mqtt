@@ -9,8 +9,10 @@ def ensure_dependencies():
                if importlib.util.find_spec(module) is None]
     if not missing:
         return
-
-    index_url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    if 'PYTHONANYWHERE_DOMAIN' in os.environ:
+        index_url='https://pypi.org/simple'
+    else:    
+        index_url = "https://pypi.tuna.tsinghua.edu.cn/simple"
     print(f"[+] 正在使用清华源安装依赖: {', '.join(missing)}")
     command = [
         sys.executable,

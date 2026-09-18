@@ -22,6 +22,7 @@ BROKER_LIST = [
     # 新增，注意端口18831
     # ("mq.tongxinmao.com", 1883, "同心猫 MQTT 18831 也无法连接"),
     ("mqtt.touchsocket.net", 1883,'b 视频'),  #好像又可以了 国内最快  这个不能正确转发消息，显示连接成功但是 没有反应
+    ("public.cloud.shiftr.io",1883,'pyanywhere shiftr  2026年9月19日 连不上'),     
 ]
 #deepseek 2026年9月17日 全部不可用
 BROKER_LIST = [
