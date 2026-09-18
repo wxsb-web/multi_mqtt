@@ -482,7 +482,9 @@ def main():
     logger.info("启动 MQTT 节点连接管理程序...")
     manager.start()
     manager.subscribe("#")
-
+    
+    import server_http
+    ghs = server_http.start_rpc_server(port=6080,ip='0.0.0.0',globals=globals(),locals=locals())
     try:
         while True:
             time.sleep(1)
@@ -492,4 +494,6 @@ def main():
         manager.stop()
 
 if __name__ == "__main__":
+    
+    
     main()
