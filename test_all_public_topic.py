@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import time
@@ -203,6 +204,19 @@ class SnifferEngine:
         logger.info("数据库历史统计加载完毕！")
 
     def push(self, host: str, topic: str, payload: bytes):
+        """
+        [防御性修复] 这里的 payload 语义上必须是 bytes。
+        上游若误传 dict/str 等类型，直接在这里拦截并丢弃，避免
+        payload.decode 抛 AttributeError 把整条分发链路的 ERROR 日志刷爆。
+        """
+        if not isinstance(payload, (bytes, bytearray)):
+            # 不用 logger.exception（会打堆栈），避免刷屏
+            logger.warning(
+                "push() 收到非 bytes payload，已忽略: host=%s topic=%s type=%s",
+                host, topic, type(payload).__name__,
+            )
+            return
+
         if len(payload) > MAX_PAYLOAD_SAVE:
             payload = payload[:MAX_PAYLOAD_SAVE]
 
@@ -284,13 +298,21 @@ class SnifferEngine:
                 # 【修复】异常时确保 batch 数据不会导致重复处理，但保留诊断信息
                 logger.error(f"丢失 batch 记录数: {len(records)}")
 
+    # ---------------------------------------------------------------
+    # 【修复】原 `def generate_layout() -> Layout:` 缺少 self 参数，
+    # 且内部 `layout.split(...)`（水平切）与 `_display_loop` 里的
+    # `layout.split_column(...)`（垂直切）语义不一致，属于半成品死代码。
+    # 现改为 @staticmethod + 与 _display_loop 完全一致的三段垂直切分，
+    # 供外部/未来扩展复用。当前 _display_loop 仍内联构建（零行为变化）。
+    # ---------------------------------------------------------------
+    @staticmethod
     def generate_layout() -> Layout:
-        """构建 Rich 分屏界面"""
+        """构建 Rich 分屏界面（header / main / footer 三段垂直切分）"""
         layout = Layout()
-        layout.split(
+        layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="body", ratio=1),
-            Layout(name="logs", size=MAX_LOG_LINES + 2)
+            Layout(name="main", ratio=1),
+            Layout(name="footer", size=MAX_LOG_LINES + 2),
         )
         return layout
 
@@ -415,14 +437,35 @@ class SnifferEngine:
 # 4. MQTT 监听适配器
 # ==========================================
 class RawSnifferManager(MultiMQTTManager):
-    def _make_on_message(self, host):
-        def on_message(client, userdata, msg):
-            try:
-                if self.message_callback:
-                    self.message_callback(msg.topic, msg.payload, host)
-            except Exception:
-                pass
-        return on_message
+    """
+    纯原始嗅探器：**不做 JSON 解析 / 不做 ECDSA 验签 / 不做去重**，
+    直接把 msg.payload 原样（bytes）交给上层回调。
+
+    [为什么必须覆盖 _on_message]
+    基类 MultiMQTTManager._on_message 会执行 process_cipher(..., decrypt=True)，
+    其内部 json.loads(raw_payload) 会把 MQTT 报文解析成 dict，然后把这个 dict
+    交给 message_callback。上层 on_raw_message 的第二个参数名义上叫
+    payload_bytes，实际收到的是一个 dict —— engine.push 里 payload.decode()
+    立刻抛 AttributeError: 'dict' object has no attribute 'decode'，
+    在 _dispatch_loop 里被打印成"消息分发回调执行失败"刷屏。
+
+    且：嗅探器场景 99% 的 payload 不是 JSON（protobuf / 二进制 / 纯文本 /
+    空 payload），走基类路径要么解析失败被丢弃，要么即便解析成功也丢了原始
+    字节 —— 都违背嗅探器"抓原始报文"的初衷。
+
+    注意：覆盖时必须保留 multi_mqtt/ping_rtt/ 前缀过滤（enable_stats=True 时
+    基类会周期向该 topic 发空 payload，订阅 "#" 会把它们收回来污染统计）。
+    """
+    def _on_message(self, client, userdata, msg):
+        host = userdata
+        # 过滤自身 QoS1 Ping 回声
+        if msg.topic.startswith("multi_mqtt/ping_rtt/"):
+            return
+        try:
+            if self.message_callback:
+                self.message_callback(msg.topic, msg.payload, host)
+        except Exception:
+            logger.exception("原始消息回调处理失败 [%s] topic=%s", host, msg.topic)
 
 
 def main():
