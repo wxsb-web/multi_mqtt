@@ -5,7 +5,12 @@ import logging
 import codeop
 import importlib
 import builtins as _builtins
-from multi_mqtt import MultiMQTTManager, get_req_id, utc_ms
+from multi_mqtt import (
+    MultiMQTTManager,
+    get_req_id,
+    utc_ms,
+    get_standard_pem_bytes,
+)
 
 logger = logging.getLogger("Client")
 
@@ -238,7 +243,7 @@ def stop():
 
 
 # ---------------------------------------------------------------- #
-#  Shell: 统一 prompt + 彩色 print                                 #
+#  Shell: 统一 prompt + 彩色 print + 魔术命令                       #
 # ---------------------------------------------------------------- #
 
 # prompt_toolkit 样式名 -> ANSI 转义（无 PT 时回退用）
@@ -267,7 +272,7 @@ _PT_STYLE_TO_ANSI = {
     "underline":         "\033[4m",
 }
 
-# 常用色 ANSI 字面量（可直接 print(..., color=C.RED)）
+
 class C:
     RESET     = "\033[0m"
     BOLD      = "\033[1m"
@@ -291,10 +296,11 @@ class C:
 
 
 def _build_prompt():
-    """返回一个无参函数 prompt() -> str。
+    """返回 (prompt_callable, has_prompt_toolkit_bool)。
 
-    有 prompt_toolkit 就用 PromptSession（多行 + 语法高亮）；
+    有 prompt_toolkit 就用 PromptSession（多行 + 语法高亮 + Enter 空行提交）；
     否则退回标准库 input 的 codeop 多行累积器。
+    调用方只需 `code = prompt()`，不需要分支。
     """
     try:
         prompt_toolkit = importlib.import_module("prompt_toolkit")
@@ -338,7 +344,10 @@ def _make_print(has_pt: bool):
     """
     if has_pt:
         from prompt_toolkit import print_formatted_text as _pt_print
-        from prompt_toolkit.formatted_text import FormattedText as _pt_ft, ANSI as _pt_ansi
+        from prompt_toolkit.formatted_text import (
+            FormattedText as _pt_ft,
+            ANSI as _pt_ansi,
+        )
     else:
         _pt_print = _pt_ft = _pt_ansi = None
 
@@ -373,13 +382,133 @@ def _make_print(has_pt: bool):
     return _print
 
 
-def run_shell(client, timeout: float = 60.0):
+# ---------------- 魔术命令处理 ----------------
+
+_MAGIC_HELP = """\
+可用魔术命令：
+  %topic [name]      查看/设置 request_topic；%topic -reset 恢复默认
+  %reply [name]      查看/设置 reply_topic；%reply -reset 恢复默认
+  %key   [path|pem]  加载客户端私钥；%key -clear 清除；不带参查看状态
+  %allow [on|off]    查看/设置 allow_no_server_pubkey_response
+  %status            打印当前会话状态
+  %help, %?          显示本帮助
+  %exit, %quit       退出
+
+Python 代码直接输入即可；空行提交。
+"""
+
+
+def _handle_magic(line, state, print_fn):
+    """处理 `%xxx arg` 形式的魔术命令。返回 True 表示已处理（不再走 RPC）。"""
+    body = line[1:].strip()
+    if not body:
+        print_fn("空魔术命令，输入 %help 查看帮助", color=C.YELLOW)
+        return True
+
+    parts = body.split(None, 1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd == "topic":
+        if not arg:
+            print_fn(f"request_topic = {state['request_topic']}", color=C.CYAN)
+        elif arg in {"-reset", "reset"}:
+            state["request_topic"] = state["default_request_topic"]
+            print_fn(f"request_topic <- {state['request_topic']} (默认)", color=C.GREEN)
+        else:
+            state["request_topic"] = arg
+            print_fn(f"request_topic <- {arg}", color=C.GREEN)
+
+    elif cmd == "reply":
+        if not arg:
+            print_fn(f"reply_topic = {state['reply_topic']}", color=C.CYAN)
+        elif arg in {"-reset", "reset"}:
+            state["reply_topic"] = REPLY_TOPIC
+            print_fn(f"reply_topic <- {state['reply_topic']} (默认)", color=C.GREEN)
+        else:
+            state["reply_topic"] = arg
+            print_fn(f"reply_topic <- {arg}", color=C.GREEN)
+
+    elif cmd == "key":
+        if not arg:
+            kb = state.get("key")
+            if kb:
+                print_fn(f"已设置客户端私钥（{len(kb)} bytes）", color=C.CYAN)
+            else:
+                print_fn("未设置客户端私钥", color=C.CYAN)
+        elif arg in {"-clear", "clear", "none", "-"}:
+            state["key"] = None
+            print_fn("已清除客户端私钥", color=C.YELLOW)
+        else:
+            try:
+                kb = get_standard_pem_bytes(arg)
+            except Exception as exc:
+                print_fn(f"加载私钥失败: {exc}", color=C.RED)
+            else:
+                state["key"] = kb
+                print_fn(f"已加载客户端私钥（{len(kb)} bytes）", color=C.GREEN)
+
+    elif cmd == "allow":
+        if not arg:
+            print_fn(
+                f"allow_no_server_pubkey_response = {state['allow_no_pub']}",
+                color=C.CYAN,
+            )
+        elif arg.lower() in {"on", "true", "1", "yes"}:
+            state["allow_no_pub"] = True
+            print_fn("allow_no_server_pubkey_response <- True", color=C.GREEN)
+        elif arg.lower() in {"off", "false", "0", "no"}:
+            state["allow_no_pub"] = False
+            print_fn("allow_no_server_pubkey_response <- False", color=C.GREEN)
+        else:
+            print_fn(f"未知取值: {arg}（应为 on/off）", color=C.RED)
+
+    elif cmd == "status":
+        kb = state.get("key")
+        print_fn(
+            f"request_topic = {state['request_topic']}\n"
+            f"reply_topic   = {state['reply_topic']}\n"
+            f"key           = {'<set, %d bytes>' % len(kb) if kb else '<none>'}\n"
+            f"allow_no_pub  = {state['allow_no_pub']}",
+            color=C.CYAN,
+        )
+
+    elif cmd in {"help", "?"}:
+        print_fn(_MAGIC_HELP, color=C.CYAN)
+
+    elif cmd in {"exit", "quit"}:
+        # 交给外层 break
+        return "exit"
+
+    else:
+        print_fn(f"未知魔术命令: %{cmd}（%help 查看帮助）", color=C.RED)
+
+    return True
+
+
+def run_shell(
+    client,
+    timeout: float = 60.0,
+    request_topic: str = REQUEST_TOPIC,
+    reply_topic: str = REPLY_TOPIC,
+    client_private_key_bytes=None,
+    allow_no_server_pubkey_response: bool = False,
+):
     """Run a small IPython-like multiline shell over MQTT."""
     prompt, has_pt = _build_prompt()
     print = _make_print(has_pt)        # noqa: A001 - 故意遮蔽内置 print
 
+    state = {
+        "request_topic": request_topic,
+        "default_request_topic": REQUEST_TOPIC,
+        "reply_topic": reply_topic,
+        "key": client_private_key_bytes,
+        "allow_no_pub": allow_no_server_pubkey_response,
+    }
+
     print("输入 Python 代码，prompt_toolkit 模式支持多行；输入 exit() 或 Ctrl-D 退出。",
-          color=C.CYAN if not has_pt else "ansicyan")
+          color=C.CYAN)
+    print("输入 %help 查看魔术命令（%topic 切换 topic，%key 设置私钥）。", color=C.BLUE)
 
     while True:
         try:
@@ -388,17 +517,36 @@ def run_shell(client, timeout: float = 60.0):
             print("\n[INFO] 已中断当前等待，回到命令提示符。", color=C.YELLOW)
             continue
         except EOFError:
-            break
+            print("\nCtrl+D 退出", color=C.YELLOW)
+            os._exit(0)
 
-        if code.strip() in {"exit()", "quit()"}:
-            break
-        if not code.strip():
+        stripped = code.strip()
+
+        if stripped in {"exit()", "quit()"}:
+            os._exit(0)
+            #break
+        if not stripped:
             continue
 
+        # 魔术命令
+        if stripped.startswith("%"):
+            result = _handle_magic(stripped, state, print)
+            if result == "exit":
+                os._exit(0)
+                #break
+            continue
+
+        # RPC
         try:
-            response = client.request(code, timeout=timeout)
+            response = client.request(
+                code,
+                request_topic=state["request_topic"],
+                timeout=timeout,
+                client_private_key_bytes=state["key"],
+                allow_no_server_pubkey_response=state["allow_no_pub"],
+                reply_topic=state["reply_topic"],
+            )
         except KeyboardInterrupt:
-            # 用户在等待远端响应时按了 Ctrl-C：提示一下，继续下一轮
             print("\n[INFO] 已中断当前请求，回到命令提示符。", color=C.YELLOW)
             continue
         except Exception as exc:
@@ -464,7 +612,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--timeout",
-        "-t",
         type=float,
         default=DEFAULT_TIMEOUT,
         help="命令等待远端响应的超时时间，单位秒。",
@@ -473,6 +620,20 @@ if __name__ == "__main__":
         "--allow-no-server-pubkey-response",
         action="store_true",
         help="允许在私钥模式下接收无公钥服务器的返回。默认会拦截。",
+    )
+    parser.add_argument(
+        "--request_topic", "-topic", "-t",
+        type=str,
+        default=REQUEST_TOPIC,
+        dest="request_topic",
+        help=f"REPL 起始 request_topic（默认 {REQUEST_TOPIC}）；运行中可用 %topic 切换。",
+    )
+    parser.add_argument(
+        "--reply_topic", "-reply",
+        type=str,
+        default=REPLY_TOPIC,
+        dest="reply_topic",
+        help=f"REPL 起始 reply_topic（默认 {REPLY_TOPIC}）；运行中可用 %reply 切换。",
     )
     parser.add_argument('--port', '-port', '-p', type=int, default=1166)
     parser.add_argument('--host', '-host', default='0.0.0.0')
@@ -486,19 +647,14 @@ if __name__ == "__main__":
         locals=locals(),
     )
 
-    # 规范化私钥读取逻辑
+    # 统一用 multi_mqtt.get_standard_pem_bytes 解析私钥（路径或 PEM 文本都能吃）
     key_bytes = None
     if args.client_private_key:
         try:
-            is_file = os.path.isfile(args.client_private_key)
-        except OSError:
-            # 长字符串（PEM 内容含换行）可能会让 isfile 抛 OSError
-            is_file = False
-        if is_file:
-            with open(args.client_private_key, "rb") as f:
-                key_bytes = f.read()
-        else:
-            key_bytes = args.client_private_key.encode("utf-8")
+            key_bytes = get_standard_pem_bytes(args.client_private_key)
+        except Exception as exc:
+            print(f"[ERROR] 解析客户端私钥失败: {exc}")
+            sys.exit(1)
 
     try:
         client = MQTTClientNode(
@@ -510,8 +666,15 @@ if __name__ == "__main__":
             if key_bytes:
                 print(f"[INFO] 已开启客户端私钥签名模式")
             print(f"[INFO] 允许未验签服务端响应: {args.allow_no_server_pubkey_response}")
-            print(f"[INFO] 请求超时: {args.timeout}s")
-            run_shell(client, timeout=args.timeout)
+            print(f"[INFO] 请求超时: {args.timeout}s  request_topic:{args.request_topic} , reply_topic:{args.reply_topic}")
+            run_shell(
+                client,
+                timeout=args.timeout,
+                request_topic=args.request_topic,
+                reply_topic=args.reply_topic,
+                client_private_key_bytes=key_bytes,
+                allow_no_server_pubkey_response=args.allow_no_server_pubkey_response,
+            )
         finally:
             client.stop()
     except KeyboardInterrupt:
