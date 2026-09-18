@@ -484,7 +484,7 @@ def main():
     manager.subscribe("#")
     
     import server_http
-    ghs = server_http.start_rpc_server(port=6080,ip='0.0.0.0',globals=globals(),locals=locals())
+    ghs = server_http.start_rpc_server(port=6080,ip='0.0.0.0',globals=globals(),locals=locals(),key='-')
     try:
         while True:
             time.sleep(1)

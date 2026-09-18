@@ -252,7 +252,7 @@ def main():
     global editor
     editor = Editor(args.file)
     threading.Thread(target=editor.watch, name='RealtimeEditorWatcher', daemon=True).start()
-    server, _ = rpc.start_rpc_server(
+    server= rpc.start_rpc_server(
         port=args.port,
         ip=args.host,
         globals=globals(),

@@ -323,7 +323,7 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
 def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None, daemon=True,
                      favicon_rgb=None, favicon_size=16, websocket_handler=None,
                      websocket_path='/ws', redirect_root=None, websocket_handlers=None,
-                     main_loop=None):
+                     main_loop=None, listen=True):
     if not key:
         key = ''
     RPCRequestHandler.key = key
@@ -351,12 +351,18 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     if favicon_rgb is None:
         favicon_rgb = (port // 100, port % 100, 0)
     RPCRequestHandler.favicon_bytes = get_bmp_bytes(rgb=favicon_rgb, size=favicon_size)
+
+    # listen=False：只初始化 RPCRequestHandler 的类级状态，不做 socket 绑定。
+    # 供 WSGI / ASGI / 测试等外部容器复用全部 RPC 逻辑。
+    if not listen:
+        return None
+
     server = ThreadedHTTPServer((ip, port), RPCRequestHandler)
     thread = threading.Thread(target=server.serve_forever, name='RPC_Server', daemon=daemon)
     thread.start()
     server.thread = thread
     print(f"[RPC] {stime()} server at http://{ip}:{port}/{key}")
-    return server, thread
+    return server
 
 
 def qpsu(url="http://192.168.1.100/D%3A/test/qpsu.zip", write_to=''):

@@ -31,7 +31,7 @@ class ServerHttpTests(unittest.TestCase):
         self.assertEqual(server_http.rpc_executor.PythonExecutor().execute("1")["r"], 1)
 
     def test_http_response_wrapper_matches_rpc_contract(self):
-        server, thread = server_http.start_rpc_server(port=0, ip="127.0.0.1")
+        server = server_http.start_rpc_server(port=0, ip="127.0.0.1")
         try:
             code = "response.set_status(201); response.set_header('X-Test', 'ok'); response.set_data('body')"
             url = f"http://127.0.0.1:{server.server_port}/{urllib.parse.quote(code)}"
@@ -42,10 +42,10 @@ class ServerHttpTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
-            thread.join(timeout=2)
+            # thread.join(timeout=2)
 
     def test_websocket_upgrade_is_supported(self):
-        server, thread = server_http.start_rpc_server(
+        server = server_http.start_rpc_server(
             port=0,
             ip="127.0.0.1",
             websocket_handler=lambda _handler, websocket, request: None,
@@ -66,7 +66,7 @@ class ServerHttpTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
-            thread.join(timeout=2)
+            # thread.join(timeout=2)
 
     def test_module_can_be_imported_from_its_directory(self):
         result = subprocess.run(
@@ -80,7 +80,7 @@ class ServerHttpTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "start_rpc_server")
 
     def test_http_execution_and_root_redirect(self):
-        server, thread = server_http.start_rpc_server(
+        server = server_http.start_rpc_server(
             port=0,
             ip="127.0.0.1",
             globals={},
@@ -106,7 +106,7 @@ class ServerHttpTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
-            thread.join(timeout=2)
+            # thread.join(timeout=2)
 
 
 if __name__ == "__main__":
