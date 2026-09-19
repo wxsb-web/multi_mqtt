@@ -409,7 +409,7 @@ def _handle_magic(line, state, print_fn):
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if cmd == "topic":
+    if cmd in ["topic",'t','request_topic']:
         if not arg:
             print_fn(f"request_topic = {state['request_topic']}", color=C.CYAN)
         elif arg in {"-reset", "reset"}:
@@ -419,7 +419,7 @@ def _handle_magic(line, state, print_fn):
             state["request_topic"] = arg
             print_fn(f"request_topic <- {arg}", color=C.GREEN)
 
-    elif cmd == "reply":
+    elif cmd in ["reply",'reply_topic']:
         if not arg:
             print_fn(f"reply_topic = {state['reply_topic']}", color=C.CYAN)
         elif arg in {"-reset", "reset"}:
@@ -429,7 +429,7 @@ def _handle_magic(line, state, print_fn):
             state["reply_topic"] = arg
             print_fn(f"reply_topic <- {arg}", color=C.GREEN)
 
-    elif cmd == "key":
+    elif cmd in ["key",'k','private-key','private_key']:
         if not arg:
             kb = state.get("key")
             if kb:
@@ -448,7 +448,7 @@ def _handle_magic(line, state, print_fn):
                 state["key"] = kb
                 print_fn(f"已加载客户端私钥（{len(kb)} bytes）", color=C.GREEN)
 
-    elif cmd == "allow":
+    elif cmd in ["allow",'allow_no_server_pubkey_response']:
         if not arg:
             print_fn(
                 f"allow_no_server_pubkey_response = {state['allow_no_pub']}",
@@ -477,8 +477,9 @@ def _handle_magic(line, state, print_fn):
         print_fn(_MAGIC_HELP, color=C.CYAN)
 
     elif cmd in {"exit", "quit"}:
-        # 交给外层 break
-        return "exit"
+        os._exit(0)
+        # 不要交给外层 break
+        # return "exit"
 
     else:
         print_fn(f"未知魔术命令: %{cmd}（%help 查看帮助）", color=C.RED)
@@ -531,8 +532,8 @@ def run_shell(
         # 魔术命令
         if stripped.startswith("%"):
             result = _handle_magic(stripped, state, print)
-            if result == "exit":
-                os._exit(0)
+            # if result == "exit":
+                # os._exit(0)
                 #break
             continue
 
@@ -604,8 +605,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MQTT RPC client")
     parser.add_argument(
         "--client-private-key",
+        '--private_key',
         "--private-key",
-        "--key", '-key', '-pri',
+        "--key", '-key', '-pri','-k',
         dest="client_private_key",
         default=None,
         help="客户端私钥文件路径或 PEM 内容；启用后请求会带签名。",
