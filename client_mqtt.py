@@ -778,13 +778,7 @@ if __name__ == "__main__":
     parser.add_argument('--host', '-host', default='0.0.0.0')
     args = parser.parse_args()
 
-    import server_http
-    ghs = server_http.start_rpc_server(
-        port=args.port,
-        ip=args.host,
-        globals=globals(),
-        locals=locals(),
-    )
+    
 
     # 统一用 multi_mqtt.get_standard_pem_bytes 解析私钥（路径或 PEM 文本都能吃）
     key_bytes = None
@@ -796,18 +790,26 @@ if __name__ == "__main__":
             sys.exit(1)
 
     try:
-        client = MQTTClientNode(
+        _default_client = MQTTClientNode(
             client_private_key_bytes=key_bytes,
             allow_no_server_pubkey_response=args.allow_no_server_pubkey_response,
         )
-        client.start()
+        _default_client.start()
+        
+        import server_http
+        ghs = server_http.start_rpc_server(
+            port=args.port,
+            ip=args.host,
+            globals=globals(),
+            locals=locals(),
+        )
         try:
             if key_bytes:
                 print(f"[INFO] 已开启客户端私钥签名模式")
             print(f"[INFO] 允许未验签服务端响应: {args.allow_no_server_pubkey_response}")
             print(f"[INFO] 请求超时: {args.timeout}s  request_topic:{args.request_topic} , reply_topic:{args.reply_topic}")
             run_shell(
-                client,
+                _default_client,
                 timeout=args.timeout,
                 request_topic=args.request_topic,
                 reply_topic=args.reply_topic,
@@ -816,7 +818,7 @@ if __name__ == "__main__":
                 history_path=args.history,
             )
         finally:
-            client.stop()
+            _default_client.stop()
     except KeyboardInterrupt:
         print("\n[INFO] 用户中断，程序已体面退出。")
         sys.exit(0)
