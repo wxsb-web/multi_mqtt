@@ -217,7 +217,7 @@ class MQTTServer:
         return self
 
 
-def start(config):
+def start(config,globals=None):
     """
     为了导出给 Chaquopy 调用。
     非阻塞启动，返回 server 实例；调用方应保存返回值，避免对象被回收。
@@ -236,6 +236,7 @@ def start(config):
         server_public_key_bytes=config.get("mqtt_pub_key"),
         request_topic=request_topic,
         reply_topic=reply_topic,
+        globals=globals,
     )
 
     # logger.info(
