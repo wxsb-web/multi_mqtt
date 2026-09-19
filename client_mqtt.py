@@ -295,6 +295,40 @@ class C:
     BRIGHT_CYAN    = "\033[96m"
 
 
+def _get_clipboard_text() -> str:
+    """尽量通用地从剪贴板取文本，用于处理 Windows 老终端的粘贴按键。"""
+    # 1) pyperclip 最省事
+    try:
+        import pyperclip
+        return pyperclip.paste() or ""
+    except Exception:
+        pass
+    # 2) Windows 原生 API
+    if sys.platform == "win32":
+        try:
+            import win32clipboard
+            win32clipboard.OpenClipboard()
+            try:
+                return win32clipboard.GetClipboardData(
+                    win32clipboard.CF_UNICODETEXT
+                ) or ""
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            pass
+    # 3) tkinter 兜底
+    try:
+        import tkinter
+        r = tkinter.Tk()
+        r.withdraw()
+        try:
+            return r.clipboard_get() or ""
+        finally:
+            r.destroy()
+    except Exception:
+        return ""
+
+
 def _build_prompt():
     """返回 (prompt_callable, has_prompt_toolkit_bool)。
 
@@ -307,6 +341,7 @@ def _build_prompt():
         pt_key_binding = importlib.import_module("prompt_toolkit.key_binding")
         pt_lexers = importlib.import_module("prompt_toolkit.lexers")
         pt_styles = importlib.import_module("prompt_toolkit.styles")
+        pt_keys = importlib.import_module("prompt_toolkit.keys")
         pygments_lexers = importlib.import_module("pygments.lexers")
     except ImportError:
         return _fallback_code_input, False
@@ -319,7 +354,29 @@ def _build_prompt():
         if buffer.document.current_line_before_cursor.strip():
             buffer.insert_text("\n")
         else:
+            # 去掉末尾换行，避免历史记录里多出一个空行
+            cleaned = buffer.text.rstrip("\n")
+            if cleaned != buffer.text:
+                buffer.text = cleaned
             buffer.validate_and_handle()
+
+    # 现代终端的标准 bracket paste
+    @key_bindings.add(pt_keys.Keys.BracketedPaste)
+    def _on_bracketed_paste(event):
+        data = event.data.replace("\r\n", "\n").replace("\r", "\n")
+        event.current_buffer.insert_text(data)
+
+    # Windows 老终端把粘贴翻译成 Shift+Insert 的 xterm 序列 \x1b[2;2~
+    # 注意：不能写成 @key_bindings.add("\x1b[2;2~")，
+    # prompt_toolkit 的按键解析器只接受单字符或已知按键名，
+    # 否则会在注册时抛 ValueError: Invalid key。
+    # 拆成独立参数即被编译为一个按键序列绑定。
+    @key_bindings.add("escape", "[", "2", ";", "2", "~")
+    def _on_shift_insert_paste(event):
+        text = _get_clipboard_text()
+        if text:
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            event.current_buffer.insert_text(text)
 
     session = prompt_toolkit.PromptSession(
         lexer=pt_lexers.PygmentsLexer(pygments_lexers.PythonLexer),
@@ -436,7 +493,7 @@ def _handle_magic(line, state, print_fn):
                 print_fn(f"已设置客户端私钥（{len(kb)} bytes）", color=C.CYAN)
             else:
                 print_fn("未设置客户端私钥", color=C.CYAN)
-        elif arg in {"-clear", "clear", "none", "-"}:
+        elif arg in {"-clear", "clear", "none", "-",'-reset','reset'}:
             state["key"] = None
             print_fn("已清除客户端私钥", color=C.YELLOW)
         else:
@@ -448,7 +505,7 @@ def _handle_magic(line, state, print_fn):
                 state["key"] = kb
                 print_fn(f"已加载客户端私钥（{len(kb)} bytes）", color=C.GREEN)
 
-    elif cmd in ["allow",'allow_no_server_pubkey_response']:
+    elif cmd in ["allow",'allow_no_server_pubkey_response','a']:
         if not arg:
             print_fn(
                 f"allow_no_server_pubkey_response = {state['allow_no_pub']}",
