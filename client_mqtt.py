@@ -243,7 +243,7 @@ def stop():
 
 
 # ---------------------------------------------------------------- #
-#  Shell: 统一 prompt + 彩色 print + 魔术命令                       #
+#  Shell: 统一 prompt + 彩色 print + 魔术命令 + 磁盘历史             #
 # ---------------------------------------------------------------- #
 
 # prompt_toolkit 样式名 -> ANSI 转义（无 PT 时回退用）
@@ -329,12 +329,27 @@ def _get_clipboard_text() -> str:
         return ""
 
 
-def _build_prompt():
-    """返回 (prompt_callable, has_prompt_toolkit_bool)。
+def _normalize_history_path(path):
+    """展开 ~ 并尽力创建父目录；返回规范化后的路径或 None。"""
+    if not path:
+        return None
+    path = os.path.expanduser(str(path))
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+    except OSError:
+        pass
+    return path
 
-    有 prompt_toolkit 就用 PromptSession（多行 + 语法高亮 + Enter 空行提交）；
-    否则退回标准库 input 的 codeop 多行累积器。
-    调用方只需 `code = prompt()`，不需要分支。
+
+def _build_prompt(history_path=None):
+    """返回 (prompt_callable, has_prompt_toolkit_bool, hist_ctl)。
+
+    hist_ctl 是个字典：
+      - get() -> 当前历史文件路径或 None
+      - set(path) -> 切换历史文件（None 表示禁用磁盘历史）；返回规范化后的路径
+    有 prompt_toolkit 时使用 FileHistory 做磁盘持久化；无则仅记录路径。
     """
     try:
         prompt_toolkit = importlib.import_module("prompt_toolkit")
@@ -342,9 +357,20 @@ def _build_prompt():
         pt_lexers = importlib.import_module("prompt_toolkit.lexers")
         pt_styles = importlib.import_module("prompt_toolkit.styles")
         pt_keys = importlib.import_module("prompt_toolkit.keys")
+        pt_history = importlib.import_module("prompt_toolkit.history")
         pygments_lexers = importlib.import_module("pygments.lexers")
     except ImportError:
-        return _fallback_code_input, False
+        # 无 prompt_toolkit：仅记录路径，不做持久化
+        _state = {"path": _normalize_history_path(history_path)}
+
+        def _get():
+            return _state["path"]
+
+        def _set(p):
+            _state["path"] = _normalize_history_path(p)
+            return _state["path"]
+
+        return _fallback_code_input, False, {"get": _get, "set": _set}
 
     key_bindings = pt_key_binding.KeyBindings()
 
@@ -367,10 +393,9 @@ def _build_prompt():
         event.current_buffer.insert_text(data)
 
     # Windows 老终端把粘贴翻译成 Shift+Insert 的 xterm 序列 \x1b[2;2~
-    # 注意：不能写成 @key_bindings.add("\x1b[2;2~")，
-    # prompt_toolkit 的按键解析器只接受单字符或已知按键名，
-    # 否则会在注册时抛 ValueError: Invalid key。
-    # 拆成独立参数即被编译为一个按键序列绑定。
+    # 不能写 @key_bindings.add("\x1b[2;2~")：prompt_toolkit 的按键解析器
+    # 只接受单字符或已知按键名，否则注册时抛 ValueError: Invalid key。
+    # 拆成独立参数会被编译成一个按键序列绑定。
     @key_bindings.add("escape", "[", "2", ";", "2", "~")
     def _on_shift_insert_paste(event):
         text = _get_clipboard_text()
@@ -378,17 +403,34 @@ def _build_prompt():
             text = text.replace("\r\n", "\n").replace("\r", "\n")
             event.current_buffer.insert_text(text)
 
-    session = prompt_toolkit.PromptSession(
-        lexer=pt_lexers.PygmentsLexer(pygments_lexers.PythonLexer),
-        style=pt_styles.Style.from_dict({"prompt": "ansicyan"}),
-        multiline=True,
-        key_bindings=key_bindings,
-    )
+    session_state = {"session": None, "path": None}
+
+    def _rebuild(path):
+        norm = _normalize_history_path(path)
+        hist = pt_history.FileHistory(norm) if norm else pt_history.InMemoryHistory()
+        session = prompt_toolkit.PromptSession(
+            lexer=pt_lexers.PygmentsLexer(pygments_lexers.PythonLexer),
+            style=pt_styles.Style.from_dict({"prompt": "ansicyan"}),
+            multiline=True,
+            key_bindings=key_bindings,
+            history=hist,
+        )
+        session_state["session"] = session
+        session_state["path"] = norm
+        return norm
+
+    _rebuild(history_path)
 
     def prompt_with_pt():
-        return session.prompt(">>> ")
+        return session_state["session"].prompt(">>> ")
 
-    return prompt_with_pt, True
+    def _get():
+        return session_state["path"]
+
+    def _set(p):
+        return _rebuild(p)
+
+    return prompt_with_pt, True, {"get": _get, "set": _set}
 
 
 def _make_print(has_pt: bool):
@@ -447,6 +489,8 @@ _MAGIC_HELP = """\
   %reply [name]      查看/设置 reply_topic；%reply -reset 恢复默认
   %key   [path|pem]  加载客户端私钥；%key -clear 清除；不带参查看状态
   %allow [on|off]    查看/设置 allow_no_server_pubkey_response
+  %his [path]        查看/切换磁盘历史文件；%his -clear 关闭磁盘历史
+  %history [path]    %his 的别名，功能相同
   %status            打印当前会话状态
   %help, %?          显示本帮助
   %exit, %quit       退出
@@ -466,7 +510,7 @@ def _handle_magic(line, state, print_fn):
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if cmd in ["topic",'t','request_topic']:
+    if cmd in ["topic", 't', 'request_topic']:
         if not arg:
             print_fn(f"request_topic = {state['request_topic']}", color=C.CYAN)
         elif arg in {"-reset", "reset"}:
@@ -476,7 +520,7 @@ def _handle_magic(line, state, print_fn):
             state["request_topic"] = arg
             print_fn(f"request_topic <- {arg}", color=C.GREEN)
 
-    elif cmd in ["reply",'reply_topic']:
+    elif cmd in ["reply", 'reply_topic']:
         if not arg:
             print_fn(f"reply_topic = {state['reply_topic']}", color=C.CYAN)
         elif arg in {"-reset", "reset"}:
@@ -486,14 +530,14 @@ def _handle_magic(line, state, print_fn):
             state["reply_topic"] = arg
             print_fn(f"reply_topic <- {arg}", color=C.GREEN)
 
-    elif cmd in ["key",'k','private-key','private_key']:
+    elif cmd in ["key", 'k', 'private-key', 'private_key']:
         if not arg:
             kb = state.get("key")
             if kb:
                 print_fn(f"已设置客户端私钥（{len(kb)} bytes）", color=C.CYAN)
             else:
                 print_fn("未设置客户端私钥", color=C.CYAN)
-        elif arg in {"-clear", "clear", "none", "-",'-reset','reset'}:
+        elif arg in {"-clear", "clear", "none", "-", '-reset', 'reset'}:
             state["key"] = None
             print_fn("已清除客户端私钥", color=C.YELLOW)
         else:
@@ -505,7 +549,7 @@ def _handle_magic(line, state, print_fn):
                 state["key"] = kb
                 print_fn(f"已加载客户端私钥（{len(kb)} bytes）", color=C.GREEN)
 
-    elif cmd in ["allow",'allow_no_server_pubkey_response','a']:
+    elif cmd in ["allow", 'allow_no_server_pubkey_response', 'a']:
         if not arg:
             print_fn(
                 f"allow_no_server_pubkey_response = {state['allow_no_pub']}",
@@ -520,13 +564,37 @@ def _handle_magic(line, state, print_fn):
         else:
             print_fn(f"未知取值: {arg}（应为 on/off）", color=C.RED)
 
+    elif cmd in ["his", "history", "hist"]:
+        hist_ctl = state.get("hist_ctl")
+        if not arg:
+            cur = state.get("history_path")
+            print_fn(
+                f"history file = {cur if cur else '<disabled>'}",
+                color=C.CYAN,
+            )
+        elif arg in {"-clear", "clear", "none", "-", "-reset", "reset", "off"}:
+            if hist_ctl:
+                hist_ctl["set"](None)
+            state["history_path"] = None
+            print_fn("history file <- <disabled>", color=C.YELLOW)
+        else:
+            try:
+                new_path = hist_ctl["set"](arg) if hist_ctl else None
+            except Exception as exc:
+                print_fn(f"设置历史文件失败: {exc}", color=C.RED)
+            else:
+                state["history_path"] = new_path
+                print_fn(f"history file <- {new_path}", color=C.GREEN)
+
     elif cmd == "status":
         kb = state.get("key")
+        hist_path = state.get("history_path")
         print_fn(
             f"request_topic = {state['request_topic']}\n"
             f"reply_topic   = {state['reply_topic']}\n"
             f"key           = {'<set, %d bytes>' % len(kb) if kb else '<none>'}\n"
-            f"allow_no_pub  = {state['allow_no_pub']}",
+            f"allow_no_pub  = {state['allow_no_pub']}\n"
+            f"history file  = {hist_path if hist_path else '<disabled>'}",
             color=C.CYAN,
         )
 
@@ -551,9 +619,10 @@ def run_shell(
     reply_topic: str = REPLY_TOPIC,
     client_private_key_bytes=None,
     allow_no_server_pubkey_response: bool = False,
+    history_path=None,
 ):
     """Run a small IPython-like multiline shell over MQTT."""
-    prompt, has_pt = _build_prompt()
+    prompt, has_pt, hist_ctl = _build_prompt(history_path=history_path)
     print = _make_print(has_pt)        # noqa: A001 - 故意遮蔽内置 print
 
     state = {
@@ -562,11 +631,16 @@ def run_shell(
         "reply_topic": reply_topic,
         "key": client_private_key_bytes,
         "allow_no_pub": allow_no_server_pubkey_response,
+        "history_path": hist_ctl["get"](),
+        "hist_ctl": hist_ctl,
     }
 
     print("输入 Python 代码，prompt_toolkit 模式支持多行；输入 exit() 或 Ctrl-D 退出。",
           color=C.CYAN)
-    print("输入 %help 查看魔术命令（%topic 切换 topic，%key 设置私钥）。", color=C.BLUE)
+    print("输入 %help 查看魔术命令（%topic 切换 topic，%key 设置私钥，%his 设置历史文件）。",
+          color=C.BLUE)
+    if state["history_path"]:
+        print(f"[INFO] 历史文件: {state['history_path']}", color=C.GRAY)
 
     while True:
         try:
@@ -664,7 +738,7 @@ if __name__ == "__main__":
         "--client-private-key",
         '--private_key',
         "--private-key",
-        "--key", '-key', '-pri','-k',
+        "--key", '-key', '-pri', '-k',
         dest="client_private_key",
         default=None,
         help="客户端私钥文件路径或 PEM 内容；启用后请求会带签名。",
@@ -693,6 +767,12 @@ if __name__ == "__main__":
         default=REPLY_TOPIC,
         dest="reply_topic",
         help=f"REPL 起始 reply_topic（默认 {REPLY_TOPIC}）；运行中可用 %reply 切换。",
+    )
+    parser.add_argument(
+        "--history", "--history-file", "-H",
+        dest="history",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_history.db"),#默认 py 文件同目录
+        help="磁盘历史记录文件路径（支持 ~ 展开）；不设置则不持久化。运行中可用 %%his 切换。",
     )
     parser.add_argument('--port', '-port', '-p', type=int, default=1166)
     parser.add_argument('--host', '-host', default='0.0.0.0')
@@ -733,6 +813,7 @@ if __name__ == "__main__":
                 reply_topic=args.reply_topic,
                 client_private_key_bytes=key_bytes,
                 allow_no_server_pubkey_response=args.allow_no_server_pubkey_response,
+                history_path=args.history,
             )
         finally:
             client.stop()
