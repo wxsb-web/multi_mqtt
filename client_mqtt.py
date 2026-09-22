@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-import argparse, time, threading, os, sys, logging, codeop, importlib, builtins as _builtins
 from multi_mqtt import MultiMQTTManager, get_req_id, utc_ms, get_standard_pem_bytes,get_duplicated_kargs
+import argparse,time,threading,os, sys, logging, codeop, importlib,builtins as _builtins
 
 logger = logging.getLogger(__file__)
 from server_mqtt import REQUEST_TOPIC, DEFAULT_REPLY_TOPIC as REPLY_TOPIC
@@ -14,8 +14,8 @@ DEFAULT_TIMEOUT = 30
 alias_code         =('code', 'c')
 alias_request_topic=('request_topic', 'topic', 't')
 alias_reply_topic  =('reply_topic', 'reply')
-alias_private_key  =('private_key', 'private-key', 'key', 'k')
-alias_allow_no_pub =('allow_no_server_pubkey_response', 'allow', 'all', 'a')
+alias_private_key  =('private_key', 'private', 'key', 'k')
+alias_allow_no_pub =('allow_no_server_pubkey_response','allow_no_pub','allow', 'all', 'a')
 alias_history      =('history', 'history_file', 'his', 'hist')
 alias_status       =('status','s')
 alias_help         =('help','h','?')
@@ -198,7 +198,7 @@ def _get_clipboard_text() -> str:
         return pyperclip.paste() or ""
     except Exception:
         pass
-    if sys.platform == "win32":
+    if sys.platform=="win32":
         try:
             import win32clipboard
             win32clipboard.OpenClipboard()
@@ -336,8 +336,8 @@ Python 代码直接输入即可；空行提交。
 """
 
 _RESET_WORDS = {"-reset", "reset"}
-_HIST_CLEAR_WORDS = {"-clear", "clear", "none", "-", "-reset", "reset", "off"}
-_KEY_CLEAR_WORDS = {"-clear", "clear", "none", "-", "-reset", "reset"}
+_KEY_CLEAR_WORDS=_HIST_CLEAR_WORDS = {"-clear", "clear", "none", "-", "-reset", "reset", "off"}
+# _KEY_CLEAR_WORDS = {"-clear", "clear", "none", "-", "-reset", "reset"}
 
 def _handle_magic(line, state, print_fn):
     body = line[1:].strip()
@@ -371,7 +371,7 @@ def _handle_magic(line, state, print_fn):
     elif cmd in alias_private_key:
         if not arg:
             kb = state.get("key")
-            print_fn(f"已设置客户端私钥（{len(kb)} bytes）" if kb else "未设置客户端私钥", color=C.CYAN)
+            print_fn(f"查询到 已设置客户端私钥（{len(kb)} bytes）" if kb else "未设置客户端私钥", color=C.CYAN)
         elif arg in _KEY_CLEAR_WORDS:
             state["key"] = None
             print_fn("已清除客户端私钥", color=C.YELLOW)
@@ -426,7 +426,7 @@ def _handle_magic(line, state, print_fn):
             f"history file  = {hist_path if hist_path else '<disabled>'}",
             color=C.CYAN,
         )
-        if _default_client:print_fn(_default_client.mqtt_net.stats.get_report(is_windows_cmd=True))
+        if _default_client:print_fn(_default_client.mqtt_net.stats.get_report(is_windows_cmd=(sys.platform=="win32")))
 
     elif cmd in alias_help:
         print_fn(_MAGIC_HELP, color=C.CYAN)
@@ -581,7 +581,7 @@ if __name__ == "__main__":
             client_private_key_bytes=key_bytes,
             allow_no_server_pubkey_response=args.allow_no_server_pubkey_response,
         )
-        _default_client.mqtt_net.is_windows_cmd=True
+        _default_client.mqtt_net.is_windows_cmd=(sys.platform=="win32")
         _default_client.start()
 
         import server_http

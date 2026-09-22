@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from multi_mqtt import BROKER_LIST, MultiMQTTManager, stime, utc_ms, _describe_public_key
-import time
-import logging
+import time,logging,sys
 from rpc_executor import PythonExecutor, format_result
 
 logger = logging.getLogger("Server")
@@ -51,6 +50,7 @@ class MQTTServer:
             server_public_key_bytes=server_public_key_bytes,
             enable_stats=True,
         )
+        
         self.mqtt_net.set_on_message(self.handle_message)
         self.executor = PythonExecutor(globals=globals)
 
@@ -199,7 +199,7 @@ class MQTTServer:
         )
 
         time.sleep(2)
-        logger.info("[连接质量统计报告]%s", self.mqtt_net.stats.get_report())
+        logger.info("[连接质量统计报告]%s", self.mqtt_net.stats.get_report(is_windows_cmd=(sys.platform=="win32")))
         if not block:
             return self
         
@@ -264,7 +264,7 @@ if __name__ == "__main__":
     args.pub = _PUB if args.pub is None else " ".join(args.pub).encode("utf-8")
 
     gms = MQTTServer(globals=globals(),server_public_key_bytes=args.pub,)# 为什么放到 ghs后面定义 dir找不到变量？
-    
+    gms.mqtt_net.is_windows_cmd=(sys.platform=="win32")
     import server_http
     ghs = server_http.start_rpc_server(
         port=args.port,

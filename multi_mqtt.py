@@ -683,7 +683,8 @@ class ConnectionQualityStats:
         lines = ["\n" + "=" * 90]
         lines.append(
             f"{' ' * LEAD}"
-            f"{_dfit('broker', BROKER_W)} | {'rel':>6} | {'avg':>7} | {'min':>5} | "
+            f"{_dfit('broker', BROKER_W-1 if is_windows_cmd else BROKER_W)} | {'rel':>6} | {'avg':>7} | {'min':>5} | "
+            # 只有这样表头对齐 
             f"{'max':>5} | {'drops':>5} | {'max_off':>9} | {'last_drop':>10}"
         )
         lines.append("-" * 90)
