@@ -426,7 +426,7 @@ def _handle_magic(line, state, print_fn):
             f"history file  = {hist_path if hist_path else '<disabled>'}",
             color=C.CYAN,
         )
-        if _default_client:print_fn(_default_client.mqtt_net.stats.get_report())
+        if _default_client:print_fn(_default_client.mqtt_net.stats.get_report(is_windows_cmd=True))
 
     elif cmd in alias_help:
         print_fn(_MAGIC_HELP, color=C.CYAN)
@@ -581,6 +581,7 @@ if __name__ == "__main__":
             client_private_key_bytes=key_bytes,
             allow_no_server_pubkey_response=args.allow_no_server_pubkey_response,
         )
+        _default_client.mqtt_net.is_windows_cmd=True
         _default_client.start()
 
         import server_http

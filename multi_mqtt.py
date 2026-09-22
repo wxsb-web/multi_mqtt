@@ -592,8 +592,9 @@ class ConnectionQualityStats:
             latency_ms = (time.time() - sent_at) * 1000.0
             if 0.0 <= latency_ms < 10000.0:  # 剔除由于断线堆积重发导致的超长异常延迟(>10s)
                 stat.update_latency(latency_ms)
+#
 
-    def get_report(self, probe=True, sort="min", reverse=False, probe_timeout=3.0):
+    def get_report(self, probe=True, sort="min", reverse=False, probe_timeout=3.0, is_windows_cmd=False):
         """
         获取网络连接质量统计报告
 
@@ -608,10 +609,11 @@ class ConnectionQualityStats:
             last_drop - 最后一次掉线时间
 
         :param sort: 排序指标，取值 broker / rel / avg / min / max / drops / max_off
-        :param reverse: 是否降序排列（默认 True）
+        :param reverse: 是否降序排列（默认 False）
         :param probe: [新增] 为 True 时，先向所有已连接 Broker 发一轮 QoS1 Ping
                       并同步等待 ACK（或超时），把最新一轮 RTT 纳入统计后再渲染。
         :param probe_timeout: [新增] 单轮实时探测的最长同步等待秒数（仅在 probe=True 生效）。
+        :param is_windows_cmd: [新增] 是否为 Windows CMD 环境，若为 True 则使用 '+' / '-' 替代 Emoji，完美对齐 CMD。
         """
         # ------------------------------------------------------------------
         # 显示宽度辅助函数（定义在方法内部，避免污染模块命名空间）
@@ -621,7 +623,7 @@ class ConnectionQualityStats:
         def _dwidth(s):
             """字符串在终端里的显示宽度（emoji/CJK/全角 = 2，组合字符 = 0，其他 = 1）。"""
             w = 0
-            for ch in s:
+            for ch in str(s):
                 if unicodedata.combining(ch):
                     continue
                 if unicodedata.east_asian_width(ch) in ('W', 'F'):
@@ -665,15 +667,23 @@ class ConnectionQualityStats:
 
         columns = ["broker", "rel", "avg", "min", "max", "drops", "max_off", "last_drop"]
 
-        # 列宽常量（emoji 🟢/🔴 显示宽度为 2，加上其后一个空格共占 3 格）
-        MARK_W = 2                       # status_marker 的显示宽度
-        BROKER_W = 23                    # broker 列显示宽度
-        LEAD = MARK_W + 1                # "🟢 " 共 3 格
+        # 根据 is_windows_cmd 参数设定不同模式下的状态符号和字符宽度
+        if is_windows_cmd:
+            conn_marker = "+"
+            disc_marker = "-"
+            MARK_W = 1      # '+' / '-' 显示宽度为 1
+        else:
+            conn_marker = "🟢"
+            disc_marker = "🔴"
+            MARK_W = 2      # Emoji 显示宽度为 2
+
+        LEAD = MARK_W + 1   # 符号 + 后面 1 个空格
+        BROKER_W = 23       # broker 列统一显示宽度，不再使用硬编码微调
 
         lines = ["\n" + "=" * 90]
         lines.append(
             f"{' ' * LEAD}"
-            f"{_dfit('broker', BROKER_W-2)} | {'rel':>6} | {'avg':>7} | {'min':>5} | "#实测只有-2才能对齐为什么
+            f"{_dfit('broker', BROKER_W)} | {'rel':>6} | {'avg':>7} | {'min':>5} | "
             f"{'max':>5} | {'drops':>5} | {'max_off':>9} | {'last_drop':>10}"
         )
         lines.append("-" * 90)
@@ -684,41 +694,51 @@ class ConnectionQualityStats:
             for host, stat in self.stats.items():
                 is_conn = stat.is_connected
                 rel = stat.reliability  # [统一口径] 复用 BrokerStat 的属性
-                # max_off 额外把"当前正在发生的离线"并入展示
                 max_off = stat.max_offline_time
-                if not is_conn and stat.last_disconnect_time > 0:
-                    max_off = max(max_off, time.time() - stat.last_disconnect_time)
+                
+                # [修复Bug 4]: 安全获取 last_disconnect_time，防御 None 值
+                last_drop = getattr(stat, 'last_disconnect_time', 0.0) or 0.0
+
+                if not is_conn and last_drop > 0:
+                    max_off = max(max_off, time.time() - last_drop)
+
                 display_stats.append({
-                    "broker":    host,   # 长度由 _dfit 按显示宽度控制
+                    "broker":    host,
                     "rel":       rel,
                     "avg":       stat.avg_latency if stat.latency_count > 0 else -1.0,
                     "min":       stat.latency_min if stat.latency_count > 0 else -1.0,
                     "max":       stat.latency_max if stat.latency_count > 0 else -1.0,
                     "drops":     stat.disconnect_count,
                     "max_off":   max_off,
-                    "last_drop": stat.last_disconnect_time,
+                    "last_drop": last_drop,
                     "is_conn":   is_conn,
                 })
 
-            # 2. [修复排序Bug]: 修正无延迟数据(-1.0)在多级排序下被排在前面的问题
+            # 2. [修复Bug 2]: 修复二级排序逻辑与外层 reverse 抵消的问题
             def sort_key(item):
                 k = sort.lower()
                 if k not in columns:
                     k = "rel"
                 val = item[k]
-                # 主指标无数据处理：始终沉底
+
+                # 主指标无数据处理：无论正序反序，无数据项均沉底
                 if k in ("avg", "min", "max") and val < 0:
                     primary_val = float("-inf") if reverse else float("inf")
+                elif k == "broker":
+                    primary_val = str(val)
                 else:
                     primary_val = val
+
                 # 二级指标 avg 延迟处理（无数据时始终沉底）
                 avg_val = item["avg"]
                 if avg_val < 0:
                     secondary_val = float("-inf") if reverse else float("inf")
                 else:
-                    secondary_val = -avg_val if reverse else avg_val
-                # 末级：已连接优先
-                conn_rank = 0 if item["is_conn"] else 1
+                    secondary_val = avg_val  # 直接保持原值，由外层 reverse 统一决定方向
+
+                # 末级：已连接优先（根据 reverse 翻转权重）
+                conn_rank = (1 if item["is_conn"] else 0) if reverse else (0 if item["is_conn"] else 1)
+
                 return (primary_val, secondary_val, conn_rank, item["broker"])
 
             sorted_stats = sorted(display_stats, key=sort_key, reverse=reverse)
@@ -731,16 +751,16 @@ class ConnectionQualityStats:
                 max_str = f"{item['max']:.1f}" if item["max"] >= 0 else "-"
                 drops_str = str(item["drops"])
                 max_off_str = f"{item['max_off']:.1f}"
-                if item["last_drop"] > 0:
+
+                # [修复Bug 4]: 安全格式化时间，规避空值和非正值
+                if item["last_drop"] and item["last_drop"] > 0:
                     last_drop_str = time.strftime("%H:%M:%S", time.localtime(item["last_drop"]))
                 else:
                     last_drop_str = "-"
-                if item["is_conn"]:
-                    status_marker = "🟢" 
-                    bs=_dfit(item['broker'], BROKER_W)
-                else:
-                    status_marker ="🔴"
-                    bs=_dfit(item['broker'], BROKER_W-1) #实测windows命令行只有这样才能对齐
+
+                status_marker = conn_marker if item["is_conn"] else disc_marker
+                bs = _dfit(item['broker'], BROKER_W)
+
                 row = (
                     f"{status_marker} {bs}| "
                     f"{rel_str:>6} | {avg_str:>7} | {min_str:>5} | {max_str:>5} | "
@@ -866,6 +886,7 @@ class MultiMQTTManager:
         self._msg_err_log_state = {}
         self._msg_queue = queue.Queue(maxsize=self.MSG_QUEUE_MAXSIZE)
         self._dispatch_thread = None
+        self.is_windows_cmd=False
 
     def set_on_message(self, callback):
         """设置上层回调，签名: fn(topic, data_dict, rx_broker)"""
@@ -1135,7 +1156,7 @@ class MultiMQTTManager:
                 
                 if now >= next_print_at:
                     try:
-                        logger.info("📡 [连接质量统计报告]" + self.stats.get_report(probe=False))
+                        logger.info("📡 [连接质量统计报告]" + self.stats.get_report(probe=False,is_windows_cmd=self.is_windows_cmd))
                     except Exception:
                         logger.exception("生成连接质量统计报告失败")
                     next_print_at = now + print_interval
