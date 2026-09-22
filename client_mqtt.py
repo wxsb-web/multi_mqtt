@@ -238,6 +238,7 @@ def _build_prompt(history_path=None):
         pt_styles = importlib.import_module("prompt_toolkit.styles")
         pt_keys = importlib.import_module("prompt_toolkit.keys")
         pt_history = importlib.import_module("prompt_toolkit.history")
+        pt_filters = importlib.import_module("prompt_toolkit.filters")
         pygments_lexers = importlib.import_module("pygments.lexers")
     except ImportError:
         _state = {"path": _normalize_history_path(history_path)}
@@ -248,8 +249,9 @@ def _build_prompt(history_path=None):
         return _fallback_code_input, False, {"get": _get, "set": _set}
 
     key_bindings = pt_key_binding.KeyBindings()
+    is_searching = pt_filters.is_searching # 搜索状态过滤器，用于让 Enter 在搜索时放行默认绑定
 
-    @key_bindings.add("enter")
+    @key_bindings.add("enter", filter=~is_searching) # 非搜索状态下才走自定义逻辑；搜索时交还默认绑定处理
     def accept_on_empty_line(event):
         buffer = event.current_buffer
         if buffer.document.current_line_before_cursor.strip():
