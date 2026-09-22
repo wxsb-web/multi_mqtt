@@ -673,7 +673,7 @@ class ConnectionQualityStats:
         lines = ["\n" + "=" * 90]
         lines.append(
             f"{' ' * LEAD}"
-            f"{_dfit('broker', BROKER_W)} | {'rel':>6} | {'avg':>7} | {'min':>5} | "
+            f"{_dfit('broker', BROKER_W-2)} | {'rel':>6} | {'avg':>7} | {'min':>5} | "#实测只有-2才能对齐为什么
             f"{'max':>5} | {'drops':>5} | {'max_off':>9} | {'last_drop':>10}"
         )
         lines.append("-" * 90)
@@ -735,9 +735,14 @@ class ConnectionQualityStats:
                     last_drop_str = time.strftime("%H:%M:%S", time.localtime(item["last_drop"]))
                 else:
                     last_drop_str = "-"
-                status_marker = "🟢" if item["is_conn"] else "🔴"
+                if item["is_conn"]:
+                    status_marker = "🟢" 
+                    bs=_dfit(item['broker'], BROKER_W)
+                else:
+                    status_marker ="🔴"
+                    bs=_dfit(item['broker'], BROKER_W-1) #实测windows命令行只有这样才能对齐
                 row = (
-                    f"{status_marker} {_dfit(item['broker'], BROKER_W)} | "
+                    f"{status_marker} {bs}| "
                     f"{rel_str:>6} | {avg_str:>7} | {min_str:>5} | {max_str:>5} | "
                     f"{drops_str:>5} | {max_off_str:>9} | {last_drop_str:>10}"
                 )
