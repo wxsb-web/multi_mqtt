@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
-import argparse
-import time, threading, os, sys
-import logging
-import codeop
-import importlib
-import builtins as _builtins
-from multi_mqtt import (
-    MultiMQTTManager,
-    get_req_id,
-    utc_ms,
-    get_standard_pem_bytes,
-)
+import argparse, time, threading, os, sys, logging, codeop, importlib, builtins as _builtins
+from multi_mqtt import MultiMQTTManager, get_req_id, utc_ms, get_standard_pem_bytes,get_duplicated_kargs
 
 logger = logging.getLogger("Client")
 
@@ -209,10 +199,15 @@ def rpc(
     timeout: float = DEFAULT_TIMEOUT,
     client_private_key_bytes=None,
     allow_no_server_pubkey_response: bool = False,
-    reply_topic: str = REPLY_TOPIC,
+    reply_topic: str = REPLY_TOPIC,**ka
 ):
     """Execute code through a lazily started shared MQTT client."""
     global _default_client
+    code=get_duplicated_kargs(ka,'c',default=code)
+    request_topic=get_duplicated_kargs(ka,'request_topic','topic','t',default=request_topic)
+    client_private_key_bytes=get_duplicated_kargs(ka,'private_key','key','k',default=client_private_key_bytes)
+    allow_no_server_pubkey_response=get_duplicated_kargs(ka,'allow','all','a',default=allow_no_server_pubkey_response)
+    
     with _default_client_lock:
         if _default_client is None:
             _default_client = MQTTClientNode(
@@ -614,7 +609,7 @@ def _handle_magic(line, state, print_fn):
 
 def run_shell(
     client,
-    timeout: float = 60.0,
+    timeout: float = DEFAULT_TIMEOUT,
     request_topic: str = REQUEST_TOPIC,
     reply_topic: str = REPLY_TOPIC,
     client_private_key_bytes=None,

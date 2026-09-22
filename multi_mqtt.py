@@ -88,6 +88,27 @@ BROKER_LIST = [
 ───────────────────────────┴────────────────────────
 
 '''
+class _NotFoundSentinel:
+    __slots__=('msg',)
+    def __init__(self,msg='Not found matched kargs'):self.msg=msg
+    def __repr__(self):return f'No({self.msg!r})'
+    def __bool__(self):return False
+DEFAULT_get_duplicated_kargs=GET_DUPLICATED_KARGS_DEFAULT=_NotFoundSentinel()
+def get_duplicated_kargs(ka,*keys,default=GET_DUPLICATED_KARGS_DEFAULT,no_pop=False):
+    '''从 dict `ka` 按 keys 顺序取第一个存在的键: 找到一个返回其值; 多个且值(真值或去重后)不一致则 raise; 都没找到返回 default. 默认 pop 命中的 key, no_pop=True 则只读取.'''
+    if not ka:return default
+    if not isinstance(ka,dict):raise TypeError(f'ka should be a dict, but got {type(ka).__name__}: {ka!r}')
+    r=[]
+    for i in keys:
+        if not isinstance(i,str):raise TypeError(f'keys should be a list of str, but got {type(i).__name__}: {i!r}')
+        if i in ka:r.append(ka[i] if no_pop else ka.pop(i))
+    if not r:return default
+    if len(r)>1:
+        r=[x for x in r if x] or list(set(r))
+        if len(r)>1:raise ValueError('kargs 存在多个重复的 key',ka,keys)
+    if len(r)==1:return r[0]
+    raise ValueError('kargs matched keys len <> 1',ka,keys)
+# get_ka=get_multi_ka=getDuplicatedKargs=getKargsDuplicated=getKArgsDuplicated=get_kargs_duplicated=get_duplicated_kargs
 
 def stime(ms=0, format='%Y-%m-%d__%H.%M.%S', ms_splitor='__.'):
     """可读毫秒级时间戳。ms 传整数毫秒；不传则取当前 UTC 毫秒。"""
@@ -572,7 +593,7 @@ class ConnectionQualityStats:
             if 0.0 <= latency_ms < 10000.0:  # 剔除由于断线堆积重发导致的超长异常延迟(>10s)
                 stat.update_latency(latency_ms)
 
-    def get_report(self,probe=True,sort="min", reverse=False, probe_timeout=3.0):
+    def get_report(self, probe=True, sort="min", reverse=False, probe_timeout=3.0):
         """
         获取网络连接质量统计报告
 
@@ -590,11 +611,43 @@ class ConnectionQualityStats:
         :param reverse: 是否降序排列（默认 True）
         :param probe: [新增] 为 True 时，先向所有已连接 Broker 发一轮 QoS1 Ping
                       并同步等待 ACK（或超时），把最新一轮 RTT 纳入统计后再渲染。
-                      目的：让"实时探测"与"历史统计"共用同一套采样链路，
-                      避免另起一套探测逻辑造成口径漂移。
         :param probe_timeout: [新增] 单轮实时探测的最长同步等待秒数（仅在 probe=True 生效）。
-                              超时后无论是否收齐 ACK 都会继续渲染报告。
         """
+        # ------------------------------------------------------------------
+        # 显示宽度辅助函数（定义在方法内部，避免污染模块命名空间）
+        # ------------------------------------------------------------------
+        import unicodedata
+
+        def _dwidth(s):
+            """字符串在终端里的显示宽度（emoji/CJK/全角 = 2，组合字符 = 0，其他 = 1）。"""
+            w = 0
+            for ch in s:
+                if unicodedata.combining(ch):
+                    continue
+                if unicodedata.east_asian_width(ch) in ('W', 'F'):
+                    w += 2
+                else:
+                    w += 1
+            return w
+
+        def _dfit(s, width, ellipsis=''):
+            """按显示宽度把 s 截断 / 补齐到 width（截断时在末尾加省略号）。"""
+            s = str(s)
+            cur = _dwidth(s)
+            if cur <= width:
+                return s + ' ' * (width - cur)
+            ell_w = _dwidth(ellipsis)
+            out, w = [], 0
+            for ch in s:
+                cw = _dwidth(ch)
+                if w + cw + ell_w > width:
+                    break
+                out.append(ch)
+                w += cw
+            out.append(ellipsis)
+            w += ell_w
+            return ''.join(out) + ' ' * max(0, width - w)
+
         # [新增-实时探测]
         # 必须在进入 self.lock 之前完成探测：
         #   - _send_pings 内部也要获取 self.lock 做 clients 快照与 record_ping_send；
@@ -611,24 +664,32 @@ class ConnectionQualityStats:
                 logger.exception("实时探测执行失败，将基于历史统计生成报告")
 
         columns = ["broker", "rel", "avg", "min", "max", "drops", "max_off", "last_drop"]
+
+        # 列宽常量（emoji 🟢/🔴 显示宽度为 2，加上其后一个空格共占 3 格）
+        MARK_W = 2                       # status_marker 的显示宽度
+        BROKER_W = 23                    # broker 列显示宽度
+        LEAD = MARK_W + 1                # "🟢 " 共 3 格
+
         lines = ["\n" + "=" * 90]
         lines.append(
-            f"{'broker':<30} | {'rel':>6} | {'avg':>7} | {'min':>5} | "
+            f"{' ' * LEAD}"
+            f"{_dfit('broker', BROKER_W)} | {'rel':>6} | {'avg':>7} | {'min':>5} | "
             f"{'max':>5} | {'drops':>5} | {'max_off':>9} | {'last_drop':>10}"
         )
         lines.append("-" * 90)
+
         with self.lock:
             display_stats = []
             # 1. 数据预处理
             for host, stat in self.stats.items():
                 is_conn = stat.is_connected
-                rel = stat.reliability  # [统一口径] 复用 BrokerStat 的属性，避免双份实现漂移
+                rel = stat.reliability  # [统一口径] 复用 BrokerStat 的属性
                 # max_off 额外把"当前正在发生的离线"并入展示
                 max_off = stat.max_offline_time
                 if not is_conn and stat.last_disconnect_time > 0:
                     max_off = max(max_off, time.time() - stat.last_disconnect_time)
                 display_stats.append({
-                    "broker":    host,
+                    "broker":    host,   # 长度由 _dfit 按显示宽度控制
                     "rel":       rel,
                     "avg":       stat.avg_latency if stat.latency_count > 0 else -1.0,
                     "min":       stat.latency_min if stat.latency_count > 0 else -1.0,
@@ -638,6 +699,7 @@ class ConnectionQualityStats:
                     "last_drop": stat.last_disconnect_time,
                     "is_conn":   is_conn,
                 })
+
             # 2. [修复排序Bug]: 修正无延迟数据(-1.0)在多级排序下被排在前面的问题
             def sort_key(item):
                 k = sort.lower()
@@ -658,7 +720,9 @@ class ConnectionQualityStats:
                 # 末级：已连接优先
                 conn_rank = 0 if item["is_conn"] else 1
                 return (primary_val, secondary_val, conn_rank, item["broker"])
+
             sorted_stats = sorted(display_stats, key=sort_key, reverse=reverse)
+
             # 3. 渲染输出
             for item in sorted_stats:
                 rel_str = f"{item['rel']:.1f}"
@@ -673,14 +737,14 @@ class ConnectionQualityStats:
                     last_drop_str = "-"
                 status_marker = "🟢" if item["is_conn"] else "🔴"
                 row = (
-                    f"{status_marker} {item['broker']:<28} | "
+                    f"{status_marker} {_dfit(item['broker'], BROKER_W)} | "
                     f"{rel_str:>6} | {avg_str:>7} | {min_str:>5} | {max_str:>5} | "
                     f"{drops_str:>5} | {max_off_str:>9} | {last_drop_str:>10}"
                 )
                 lines.append(row)
+
         lines.append("=" * 90)
         return "\n".join(lines)
-
     # [合并线程] _monitor_loop 已彻底删除，其逻辑合并到 MultiMQTTManager._dispatch_loop 中
 
     def _send_pings(self, wait_timeout=0.0):

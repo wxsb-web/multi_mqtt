@@ -366,21 +366,34 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
 
 
 def qpsu(url="http://192.168.1.100/D%3A/test/qpsu.zip", write_to=''):
-    import urllib.request, zipfile, io, sys, importlib.abc, importlib.machinery
-    data = urllib.request.urlopen(url).read()
+    import urllib.request, zipfile, io, sys, importlib.abc, importlib.machinery, importlib
+
+    # 下载 zip 数据
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        data = resp.read()
+
+    # 可选：保存到本地
+    if write_to:
+        with open(write_to, 'wb') as f:
+            f.write(data)
+
     z = zipfile.ZipFile(io.BytesIO(data))
+    names = set(z.namelist())
 
     class ZipImporter(importlib.abc.PathEntryFinder):
         def __init__(self, zf):
             self.zf = zf
+            self.names = set(zf.namelist())
 
         def find_spec(self, fullname, path=None, target=None):
             pkg_path = fullname.replace('.', '/') + '/__init__.py'
-            if pkg_path in self.zf.namelist():
+            if pkg_path in self.names:
                 return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
+
             mod_path = fullname.replace('.', '/') + '.py'
-            if mod_path in self.zf.namelist():
+            if mod_path in self.names:
                 return importlib.machinery.ModuleSpec(fullname, self)
+
             return None
 
         def create_module(self, spec):
@@ -388,23 +401,38 @@ def qpsu(url="http://192.168.1.100/D%3A/test/qpsu.zip", write_to=''):
 
         def exec_module(self, module):
             fullname = module.__name__
+
             pkg_path = fullname.replace('.', '/') + '/__init__.py'
-            if pkg_path in self.zf.namelist():
-                code = self.zf.read(pkg_path).decode('utf-8')
-                module.__path__ = []
+            if pkg_path in self.names:
+                source = self.zf.read(pkg_path).decode('utf-8')
                 module.__file__ = f"<zip://{pkg_path}>"
+                module.__path__ = [f"<zip://{pkg_path}>"]
+                module.__loader__ = self
+                module.__package__ = fullname
+                code = compile(source, module.__file__, 'exec')
                 exec(code, module.__dict__)
                 return
+
             mod_path = fullname.replace('.', '/') + '.py'
-            code = self.zf.read(mod_path).decode('utf-8')
+            source = self.zf.read(mod_path).decode('utf-8')
             module.__file__ = f"<zip://{mod_path}>"
+            module.__loader__ = self
+            module.__package__ = fullname.rpartition('.')[0]
+            code = compile(source, module.__file__, 'exec')
             exec(code, module.__dict__)
 
-    sys.meta_path.insert(0, ZipImporter(z))
+    # 清理旧的 qgb 模块缓存，确保从新 zip 重新导入
+    for name in list(sys.modules):
+        if name == 'qgb' or name.startswith('qgb.'):
+            del sys.modules[name]
+
+    importer = ZipImporter(z)
+    sys.meta_path.insert(0, importer)
+    importlib.invalidate_caches()
+
     from qgb import py, U, T, N, F
     return py, U, T, N, F
-
-
+    
 if __name__ == '__main__':
     start_rpc_server(port=1144, key='', globals=globals(), locals=locals())
     input("Press Ctrl+C or anykey to stop\n")
