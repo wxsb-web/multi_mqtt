@@ -12,12 +12,12 @@ DEFAULT_TIMEOUT = 30
 #   2) CLI 参数    ->  _cli_opts(*alias_xxx)  自动生成 --x / -x / x_x / x-x
 #   3) %magic 命令 ->  cmd in alias_xxx
 alias_code         =('code', 'c')
-alias_request_topic=('request_topic', 'topic', 't')
+alias_request_topic=('request_topic', 'topic', 't','q')
 alias_reply_topic  =('reply_topic', 'reply')
 alias_private_key  =('private_key', 'private', 'key', 'k')
 alias_allow_no_pub =('allow_no_server_pubkey_response','allow_no_pub','allow', 'all', 'a')
 alias_history      =('history', 'history_file', 'his', 'hist')
-alias_status       =('status','s')
+alias_status       =('status','state','s')
 alias_help         =('help','h','?')
 alias_exit         =('exit', 'quit')
 
@@ -254,6 +254,13 @@ def _build_prompt(history_path=None):
     @key_bindings.add("enter", filter=~is_searching) # 非搜索状态下才走自定义逻辑；搜索时交还默认绑定处理
     def accept_on_empty_line(event):
         buffer = event.current_buffer
+        current_line = buffer.document.current_line
+        if current_line.lstrip().startswith('%'): # magic 命令：直接提交，不换行，光标在中间也提交
+            cleaned = buffer.text.rstrip("\n")
+            if cleaned != buffer.text:
+                buffer.text = cleaned
+            buffer.validate_and_handle()
+            return
         if buffer.document.current_line_before_cursor.strip():
             buffer.insert_text("\n")
         else:
@@ -423,6 +430,7 @@ def _handle_magic(line, state, print_fn):
         print_fn(
             f"request_topic = {state['request_topic']}\n"
             f"reply_topic   = {state['reply_topic']}\n"
+            f"timeout       = {state['timeout']}\n"
             f"key           = {'<set, %d bytes>' % len(kb) if kb else '<none>'}\n"
             f"allow_no_pub  = {state['allow_no_pub']}\n"
             f"history file  = {hist_path if hist_path else '<disabled>'}",
@@ -449,6 +457,7 @@ def run_shell(client, timeout: float = DEFAULT_TIMEOUT, request_topic: str = REQ
         "request_topic": request_topic,
         "default_request_topic": REQUEST_TOPIC,
         "reply_topic": reply_topic,
+        'timeout':timeout,
         "key": client_private_key_bytes,
         "allow_no_pub": allow_no_server_pubkey_response,
         "history_path": hist_ctl["get"](),
@@ -477,7 +486,7 @@ def run_shell(client, timeout: float = DEFAULT_TIMEOUT, request_topic: str = REQ
             continue
         try:
             response = client.request(
-                code, request_topic=state["request_topic"], timeout=timeout,
+                code, request_topic=state["request_topic"], timeout=state['timeout'],
                 client_private_key_bytes=state["key"],
                 allow_no_server_pubkey_response=state["allow_no_pub"],
                 reply_topic=state["reply_topic"],
