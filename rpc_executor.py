@@ -88,7 +88,7 @@ class PythonExecutor:
                         "stdout": output.getvalue(),
                         "ok": True,
                     }
-                except Exception:
+                except (Exception, SystemExit): # 修复点：增加捕获 SystemExit，防止直接 kill server
                     return {
                         "r": None,
                         "stdout": output.getvalue(),
