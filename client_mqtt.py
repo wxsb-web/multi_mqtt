@@ -20,6 +20,7 @@ alias_history      =('history', 'history_file', 'his', 'hist')
 alias_status       =('status','state','s')
 alias_help         =('help','h','?')
 alias_exit         =('exit', 'quit')
+alias_timeout      =('timeout','time','wait','second','sec')
 
 _default_client = None
 _default_client_lock = threading.Lock()
@@ -150,6 +151,7 @@ def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_
     request_topic=get_duplicated_kargs(ka,*alias_request_topic,default=request_topic)
     client_private_key_bytes=get_duplicated_kargs(ka,*alias_private_key,default=client_private_key_bytes)
     allow_no_server_pubkey_response=get_duplicated_kargs(ka,*alias_allow_no_pub,default=allow_no_server_pubkey_response)
+    timeout=get_duplicated_kargs(ka,*alias_timeout,default=timeout)
     with _default_client_lock:
         if _default_client is None:
             _default_client = MQTTClientNode(
@@ -405,6 +407,11 @@ def _handle_magic(line, state, print_fn):
         else:
             print_fn(f"未知取值: {arg}（应为 on/off）", color=C.RED)
 
+    elif cmd in alias_timeout:
+        try:
+            state['timeout']=float(arg)
+        except Exception as e:
+            print_fn(f'timeout 格式错误 {e}')
     elif cmd in alias_history:
         hist_ctl = state.get("hist_ctl")
         if not arg:
@@ -551,7 +558,7 @@ if __name__ == "__main__":
         help="客户端私钥文件路径或 PEM 内容；启用后请求会带签名。",
     )
     parser.add_argument(
-        "--timeout", type=float, default=DEFAULT_TIMEOUT,
+        *_cli_opts(*alias_timeout), type=float, default=DEFAULT_TIMEOUT,
         help="命令等待远端响应的超时时间，单位秒。",
     )
     parser.add_argument(
