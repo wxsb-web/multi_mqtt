@@ -232,3 +232,52 @@ def format_result(value):
     except ImportError:
         from pprint import pformat
         return pformat(value, width=120)
+#
+
+def http_import(url, save_to=''): # 定义核心导入函数
+    import urllib.request, zipfile, io, sys, importlib, importlib.abc, importlib.machinery, os # 导入必要标准库
+    if save_to and os.path.isdir(save_to): save_to = os.path.join(save_to, os.path.basename(url.split('?')[0].rstrip('/')) or 'module.py') # 若save_to为已存在文件夹则自动拼接URL文件名
+    class HttpImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader): # 继承标准查找与加载器接口实现自定义导入
+        def __init__(self, url, save_to): self.url, self.save_to = url, save_to; self._fetch() # 保存参数并在初始化时拉取一次数据
+        def _fetch(self): # 将网络请求与解析封装为方法，供初始化和reload触发
+            self.data = None # 初始化数据容器
+            if self.save_to and os.path.exists(self.save_to): # 遵循规则：如果有save_to且存在则直接读取
+                with open(self.save_to, 'rb') as f: self.data = f.read() # 读取本地缓存
+            else: # 否则发起网络请求
+                with urllib.request.urlopen(self.url, timeout=30) as resp: self.data = resp.read() # 获取最新网络字节流
+                if self.save_to: # 如果提供了保存路径则落盘
+                    with open(self.save_to, 'wb') as f: f.write(self.data) # 写入本地
+            self.is_zip, self.zf = False, None # 重置zip相关状态
+            try: # 尝试按zip格式解析数据
+                self.zf = zipfile.ZipFile(io.BytesIO(self.data)) # 将字节流载入内存zip结构
+                self.is_zip, self.names = True, set(self.zf.namelist()) # 成功解析则标记状态并缓存文件列表
+                roots = [n.split('/')[0] for n in self.names if not n.startswith('__') and ('/' in n or n.endswith('.py'))] # 提取包的根目录
+                self.mod_name = roots[0].replace('.py', '') if roots else 'unknown' # 锁定主包名
+            except Exception: # 解析zip失败则视为普通的单文件py代码
+                self.names = set() # 单文件清空names集合
+                self.mod_name = (os.path.basename(self.save_to) if self.save_to else self.url.split('?')[0].split('/')[-1]).replace('.py', '') # 从URL或文件路径直接提取模块名
+        def find_spec(self, fullname, path=None, target=None): # 拦截Python的import机制
+            if self.is_zip: # zip模式下的路径匹配逻辑
+                if fullname.replace('.', '/') + '/__init__.py' in self.names: return importlib.machinery.ModuleSpec(fullname, self, is_package=True) # 匹配到包
+                if fullname.replace('.', '/') + '.py' in self.names: return importlib.machinery.ModuleSpec(fullname, self) # 匹配到单文件模块
+            elif fullname == self.mod_name: return importlib.machinery.ModuleSpec(fullname, self) # 单文件模式精确匹配全名
+            return None # 规则不符交由其它加载器处理
+        def create_module(self, spec): return None # 返回None以沿用Python默认的模块创建机制
+        def exec_module(self, module): # 编译代码并注入到模块命名空间(reload时会重新调用)
+            if getattr(module, '_http_loaded', False): self._fetch() # 【核心修复点】通过自定义标记判断，仅在被 importlib.reload() 显式触发时才重新拉取最新数据，避免初次加载发出两次请求
+            fn = module.__name__ # 提取当前需要加载的完整模块名
+            if self.is_zip: # 处理zip内的代码读取
+                pkg_path = fn.replace('.', '/') + '/__init__.py' # 优先探测包初始化文件
+                if pkg_path in self.names: source, module.__file__, module.__path__, module.__package__ = self.zf.read(pkg_path).decode('utf-8'), f"<zip://{pkg_path}>", [f"<zip://{fn.replace('.','/')}>"], fn # 注入包特有元数据
+                else: source, module.__file__, module.__package__ = self.zf.read(fn.replace('.', '/') + '.py').decode('utf-8'), f"<zip://{fn.replace('.', '/')}.py>", fn.rpartition('.')[0] # 注入单文件特有元数据
+            else: source, module.__file__, module.__package__ = self.data.decode('utf-8'), f"<http://{fn}.py>", fn.rpartition('.')[0] # 单文件模式直接解码最新内存数据
+            module.__loader__ = self # 绑定当前加载器以完美支持 importlib.reload()
+            exec(compile(source, module.__file__, 'exec'), module.__dict__) # 编译最新代码并覆盖执行到模块字典
+            module._http_loaded = True # 标记该模块已完成初始加载，后续若再次进入此函数必然是 reload 行为
+    importer = HttpImporter(url, save_to) # 实例化定制加载器对象
+    sys.meta_path = [m for m in sys.meta_path if type(m).__name__ != 'HttpImporter'] # 清除历史自定义加载器防止重复堆叠引发异常
+    sys.meta_path.insert(0, importer) # 将新加载器置于最高优先级以接管目标模块
+    importlib.invalidate_caches() # 强制刷新Python导入缓存
+    for name in list(sys.modules): # 遍历系统已加载模块
+        if name == importer.mod_name or name.startswith(importer.mod_name + '.'): del sys.modules[name] # 剔除旧模块及子模块以确保首次能全新加载
+    return importlib.import_module(importer.mod_name) # 返回最终动态导入的顶级模块实例
