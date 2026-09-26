@@ -23,7 +23,7 @@ class ClientMqttTests(unittest.TestCase):
             builtins.input = original_input
 
     def test_request_uses_configured_private_key_by_default(self):
-        node = client_mqtt.MQTTClientNode(client_private_key_bytes="2**128")
+        node = client_mqtt.MQTTClientNode(client_private_key_bytes="2333")
         self.assertIsNotNone(node.mqtt_net.client_private_key_bytes)
 
     def test_expression_private_key_is_supported(self):
@@ -32,7 +32,7 @@ class ClientMqttTests(unittest.TestCase):
 
     def test_signed_request_is_blocked_when_server_pubkey_is_missing(self):
         node = client_mqtt.MQTTClientNode(
-            client_private_key_bytes="2**128",
+            client_private_key_bytes="2333",
         )
         event = Mock()
         req_id = "req-123|deadbeef"
@@ -52,7 +52,7 @@ class ClientMqttTests(unittest.TestCase):
     def test_signed_request_is_accepted_when_server_pubkey_is_known(self):
         server_key = ecdsa.SigningKey.generate(curve=ecdsa.NIST256p).verifying_key.to_pem()
         node = client_mqtt.MQTTClientNode(
-            client_private_key_bytes="2**128",
+            client_private_key_bytes="2333",
             server_public_key_bytes=server_key,
         )
         event = Mock()
@@ -72,7 +72,7 @@ class ClientMqttTests(unittest.TestCase):
 
     def test_signed_request_is_accepted_when_response_req_id_is_clean(self):
         node = client_mqtt.MQTTClientNode(
-            client_private_key_bytes="2**128",
+            client_private_key_bytes="2333",
         )
         event = Mock()
         req_id = "req-123"
@@ -91,7 +91,7 @@ class ClientMqttTests(unittest.TestCase):
 
     def test_signed_request_with_allow_flag_accepts_no_pubkey_response(self):
         node = client_mqtt.MQTTClientNode(
-            client_private_key_bytes="2**128",
+            client_private_key_bytes="2333",
         )
         event = Mock()
         req_id = "req-123|deadbeef"
@@ -110,7 +110,7 @@ class ClientMqttTests(unittest.TestCase):
 
     def test_request_uses_client_allow_flag_by_default(self):
         node = client_mqtt.MQTTClientNode(
-            client_private_key_bytes="2**128",
+            client_private_key_bytes="2333",
             allow_no_server_pubkey_response=True,
         )
         node.mqtt_net.publish_broadcast = Mock()
@@ -133,7 +133,7 @@ class ClientMqttTests(unittest.TestCase):
         self.assertTrue(node.pending_requests[req_id]["response"]["req_id"] == "req-999")
 
     def test_request_interrupt_returns_none_cleanly(self):
-        node = client_mqtt.MQTTClientNode(client_private_key_bytes="2**128")
+        node = client_mqtt.MQTTClientNode(client_private_key_bytes="2333")
         node.mqtt_net.publish_broadcast = Mock(side_effect=RuntimeError("boom"))
 
         result = node.request("print(1)", timeout=0.1)

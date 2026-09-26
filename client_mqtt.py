@@ -110,7 +110,7 @@ class MQTTClientNode:
         except Exception as exc:
             with self.lock:
                 self.pending_requests.pop(req_id, None)
-            logger.error(f"❌ [请求发送失败] req_id={req_id} error={exc}")
+            logger.error(f"❌ [请求发送失败] {request_topic} req_id={req_id} error={exc}")
             print(f"[ERROR] 请求发送失败: {exc}")
             return None
         is_success = False
@@ -121,7 +121,7 @@ class MQTTClientNode:
                     is_success = True
                     break
         except KeyboardInterrupt:
-            logger.warning(f"⚠️ [请求中断] req_id={req_id}")
+            logger.warning(f"⚠️ [请求中断] {request_topic} req_id={req_id}")
             print("[INFO] 用户中断等待，已停止本次请求。")
             raise
         finally:
@@ -129,7 +129,7 @@ class MQTTClientNode:
                 self.pending_requests.pop(req_id, None)
         if is_success:
             return req_ctx['response']
-        logger.error(f"❌ [请求超时] req_id={req_id}")
+        logger.error(f"❌ [请求超时] {request_topic} req_id={req_id}")
         return None
 
     def stop(self):
