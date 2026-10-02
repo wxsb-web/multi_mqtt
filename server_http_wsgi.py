@@ -26,6 +26,9 @@ import io
 import os
 import sys
 import time
+import queue
+import logging
+import threading
 import traceback
 import socketserver
 import http.client as _http_client
@@ -40,23 +43,32 @@ from server_http import RPCRequestHandler
 # ---------------------------------------------------------------------------
 
 class _WSGIWFile:
-    """冒充 handler.wfile，只把写入的字节收集到内存。"""
+    """冒充 handler.wfile。
 
-    __slots__ = ('_buf',)
+    提交（end_headers）之前的写入先缓冲；提交之后的写入直接推进分块
+    队列，WSGI 可迭代对象立刻产出，ASGI 网关随即把字节发给客户端，
+    实现真正的流式传输（大文本 TTS 边生成边播放）。
+    """
 
-    def __init__(self):
-        self._buf = io.BytesIO()
+    __slots__ = ('_state',)
+
+    def __init__(self, state):
+        self._state = state
 
     def write(self, data):
         if isinstance(data, str):
             data = data.encode('utf-8')
-        self._buf.write(data)
+        if self._state['committed']:
+            if data:
+                self._state['chunks'].put(data)
+        else:
+            self._state['pre'].write(data)
 
     def flush(self):
         pass
 
     def getvalue(self):
-        return self._buf.getvalue()
+        return self._state['pre'].getvalue()
 
 
 class _WSGIHandlerShim:
@@ -66,7 +78,8 @@ class _WSGIHandlerShim:
     RPC 逻辑一行不改。
     """
 
-    def __init__(self, environ):
+    def __init__(self, environ, state):
+        self._state = state
         self.environ = environ
         self.command = environ.get('REQUEST_METHOD', 'GET')
 
@@ -95,10 +108,10 @@ class _WSGIHandlerShim:
         self.key = RPCRequestHandler.key
         self.executor = RPCRequestHandler.executor
 
-        # 响应累积
+        # 响应状态
         self._status = 200
         self._headers = []          # list[(name, value)]
-        self.wfile = _WSGIWFile()
+        self.wfile = _WSGIWFile(state)
 
     # ---- BaseHTTPRequestHandler 兼容方法 ---------------------------------
 
@@ -109,7 +122,23 @@ class _WSGIHandlerShim:
         self._headers.append((keyword, str(value)))
 
     def end_headers(self):
-        pass
+        """提交响应：调用 start_response，并冲刷提交前缓冲的字节。"""
+        state = self._state
+        if state['committed']:
+            return
+        headers = list(self._headers)
+        names = {k.lower() for k, _ in headers}
+        if 'content-type' not in names:
+            headers.append(('Content-Type', 'text/plain; charset=utf-8'))
+        # 流式响应长度未知，不设置 Content-Length，由网关使用分块传输。
+
+        reason = _http_client.responses.get(self._status, 'Unknown')
+        state['start_response'](f"{self._status} {reason}", headers)
+        state['committed'] = True
+
+        buffered = state['pre'].getvalue()
+        if buffered:
+            state['chunks'].put(buffered)
 
     def send_error(self, code, message=None, explain=None):
         # handle_rpc 在 403 / 400 / 500 兜底时会调用它
@@ -126,7 +155,12 @@ class _WSGIHandlerShim:
 # ---------------------------------------------------------------------------
 
 def _build_wsgi_application():
-    """基于已初始化的 RPCRequestHandler 构造 WSGI application。"""
+    """基于已初始化的 RPCRequestHandler 构造流式 WSGI application。
+
+    每个 RPC 请求在独立守护线程里跑原装的 handle_rpc；application
+    立即返回一个队列驱动的可迭代对象——执行线程写出的每个分块都会
+    立刻被 ASGI 网关转发给客户端，不等执行结束。
+    """
 
     def application(environ, start_response):
         method = environ.get('REQUEST_METHOD', 'GET').upper()
@@ -160,24 +194,49 @@ def _build_wsgi_application():
             ])
             return [b'']
 
-        # 其余路径全部交给原装的 handle_rpc
-        shim = _WSGIHandlerShim(environ)
-        try:
-            RPCRequestHandler.handle_rpc(shim)
-        except Exception:
-            traceback.print_exc()
+        # 其余路径全部交给原装的 handle_rpc（在线程中执行）
+        state = {
+            'committed': False,
+            'start_response': start_response,
+            'chunks': queue.Queue(),
+            'pre': io.BytesIO(),
+        }
 
-        body = shim.wfile.getvalue()
-        headers = list(shim._headers)
-        names = {k.lower() for k, _ in headers}
-        if 'content-type' not in names:
-            headers.append(('Content-Type', 'text/plain; charset=utf-8'))
-        if 'content-length' not in names:
-            headers.append(('Content-Length', str(len(body))))
+        def run():
+            shim = _WSGIHandlerShim(environ, state)
+            try:
+                RPCRequestHandler.handle_rpc(shim)
+            except Exception:
+                tb = traceback.format_exc()
+                if not state['committed']:
+                    state['start_response']('500 Internal Server Error', [
+                        ('Content-Type', 'text/plain; charset=utf-8'),
+                    ])
+                    state['committed'] = True
+                    state['chunks'].put(tb.encode('utf-8'))
+                else:
+                    logging.getLogger("error").exception(
+                        "WSGI RPC stream failed mid-flight")
+            finally:
+                # 兜底：正常情况下 handle_rpc 必然已经提交。
+                if not state['committed']:
+                    state['start_response']('200 OK', [
+                        ('Content-Type', 'text/plain; charset=utf-8'),
+                    ])
+                    state['committed'] = True
+                state['chunks'].put(None)  # 结束哨兵
 
-        reason = _http_client.responses.get(shim._status, 'Unknown')
-        start_response(f"{shim._status} {reason}", headers)
-        return [body]
+        threading.Thread(target=run, name='RPC-WSGI-Exec', daemon=True).start()
+
+        def body_iter():
+            chunks = state['chunks']
+            while True:
+                item = chunks.get()
+                if item is None:
+                    return
+                yield item
+
+        return body_iter()
 
     return application
 
