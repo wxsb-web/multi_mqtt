@@ -31,11 +31,23 @@ import logging
 import threading
 import traceback
 import socketserver
+import urllib.parse
 import http.client as _http_client
 from wsgiref.simple_server import WSGIServer, WSGIRequestHandler
 
 import server_http
 from server_http import RPCRequestHandler
+
+
+def _wsgi_unescape(value: str) -> str:
+    """把 WSGI 的 latin-1 承载文本还原为原始字节并按 UTF-8 解码。
+
+    PEP 3333 规定 PATH_INFO 等环境变量以 ISO-8859-1 编码承载原始
+    请求字节；直接当文本使用会让中文变成 'ä½ å¥½' 乱码（edge-tts
+    会把乱码逐字母朗读出来，即“说的不是输入文字”事故的根因）。
+    """
+    raw = value.encode("latin-1", "surrogateescape")
+    return raw.decode("utf-8", "surrogateescape")
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +100,15 @@ class _WSGIHandlerShim:
             int(environ.get('REMOTE_PORT') or 0),
         )
 
-        # 与 BaseHTTPRequestHandler.path 对齐：PATH + '?' + QUERY
-        qs = environ.get('QUERY_STRING', '')
-        path = environ.get('PATH_INFO', '') or ''
-        self.path = path + ('?' + qs if qs else '')
+        # 与 BaseHTTPRequestHandler.path 对齐：PATH + '?' + QUERY。
+        # WSGI 按 latin-1 承载字节（PEP 3333），先还原成正确的 UTF-8 文本；
+        # QUERY_STRING 是未解码的原始 query，按 UTF-8 unquote 后再拼上。
+        qs = environ.get('QUERY_STRING', '') or ''
+        path = _wsgi_unescape(environ.get('PATH_INFO', '') or '')
+        self.path = path + (
+            '?' + urllib.parse.unquote(qs, encoding='utf-8') if qs else '')
+        # 告知 handle_rpc：路径已是解码后的文本，不要再 unquote。
+        self.path_already_decoded = True
 
         # 把 environ 里的请求头还原成类似 handler.headers 的 dict
         headers = {}

@@ -236,7 +236,13 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             if not code_str:
                 self.send_error(400, "No code")
                 return
-            code = urllib.parse.unquote(code_str)
+            # 独立 HTTP 服务器下 self.path 仍是原始 percent-encoded 请求行，
+            # 需要 unquote；WSGI 下 PATH_INFO 已被网关解码（shim 会设置
+            # path_already_decoded），不能再解（否则中文变 Latin-1 乱码）。
+            if getattr(self, "path_already_decoded", False):
+                code = code_str
+            else:
+                code = urllib.parse.unquote(code_str)
 
             class ResponseWrapper:
                 """RPC 代码里的 response/p 对象。
