@@ -40,7 +40,7 @@ from remote_cmd import (                        # noqa: E402
 
 DEFAULT_REQUEST_TOPIC = "sys/device/request"
 DEFAULT_REPLY_TOPIC = "sys/device/response"
-DEFAULT_KEY = "2**128"
+DEFAULT_KEY = ""
 
 # 向后兼容：从本模块 import 这些名字仍然可用
 __all__ = [
