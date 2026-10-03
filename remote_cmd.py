@@ -29,9 +29,11 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import shlex
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 
 # ---- 传输尺寸约束（均按实测的公共 broker 行为设定） --------------------------
 MAX_TRANSFER = 1 << 20          # 1 MiB：单文件经本报文通道传输的默认硬上限
@@ -39,6 +41,11 @@ WIRE_BUDGET = 1 << 17          # 128 KiB：单条报文 JSON 转义后在线尺�
 INLINE_MAX = 8192              # 命令输出小于该字节数时直接随回包返回
 DEFAULT_TIMEOUT = 60           # 单次问答默认等待秒数
 DEFAULT_STREAM_TOPIC = "sys/device/stream"  # 远端周期汇报的默认 topic
+
+# ---- PTY 会话约束 ------------------------------------------------------------
+PTY_FRAME_MAX = 1 << 14        # 16 KiB：PTY 单帧原始字节上限（最坏 latin-1 转义后 < 96KiB）
+DEFAULT_PTY_TTL = 12 * 3600    # 孤儿 PTY 会话最长存活秒数（默认 12 小时）
+MAX_PTY_TTL = 24 * 3600        # TTL 允许设定的上限
 
 
 # ============================ 网络层抽象（更换协议时实现它） ============================
@@ -63,9 +70,13 @@ class Transport(ABC):
     # ---- 可选能力：服务端推送（周期汇报）。不实现则 RemoteShell.stream() 不可用 ----
     # 约定两个方法，签名：
     #   stream_subscribe(topic: str, handler: Callable[[dict], None]) -> None
-    #   stream_unsubscribe(topic: str, handler) -> None
+    #   stream_unsubscribe(topic: str, handler: Callable) -> None
     # handler 收到的是推送消息解出的 dict；RemoteShell 按帧里的 stream/seq 自行
     # 过滤 sid 与多 broker 重复帧，transport 只负责"订阅 + 原样分发"。
+    #
+    # ---- 可选能力：PTY（RemotePty 使用）。除上面两个方法外另需 ----
+    #   publish(topic: str, payload_dict: dict) -> None
+    # 即向任意 topic 发一帧（下行输入/控制），与 request 的一问一答无关。
 
     def __enter__(self):
         return self
@@ -650,6 +661,300 @@ def build_code(payload: dict) -> str:
     return _REMOTE_TEMPLATE.replace("__PAYLOAD__", lit)
 
 
+# ============================ PTY 启动模板（client 下发，禁止改名） ============================
+# 仿 ssh 的 PTY：服务端只 fork 一次常驻 shell（用户登录 shell），之后所有按键写入
+# 同一个 PTY master，绝不在每条命令上重启 bash。uplink 帧经服务端 mqtt_net 的回调
+# 路由表直达 PTY（不经过 gms.handle_message，避免 "missing code" 噪声）；downlink
+# 由读线程直接 publish 到协商好的 out topic。flush_interval=0 为实时回传。
+_PTY_START_TEMPLATE = r'''
+def _cmq_pty_start():
+    import json as _j
+    _a = _j.loads(__PAYLOAD__)
+    _mfd = _sfd = None
+    _res = {}
+    try:
+        import os as _o, time as _t, threading as _th, traceback as _tb
+        if _o.name != "posix":
+            raise RuntimeError("PTY 只能在 POSIX 服务端建立，当前系统: %s" % _o.name)
+        import pty as _pty, fcntl as _fc, termios as _te, struct as _st
+        import select as _sel, subprocess as _sp, signal as _sg, queue as _qe
+        from collections import deque as _dq
+
+        _sid = str(_a["sid"])
+        _in_topic = str(_a["in_topic"])
+        _out_topic = str(_a["out_topic"])
+
+        def _find_net():
+            # 复用服务端进程里现成的 MQTT 网络层（gms.mqtt_net），不新建连接。
+            for _v in list(globals().values()):
+                _mn = getattr(_v, "mqtt_net", None)
+                if _mn is not None and hasattr(_mn, "publish_broadcast"):
+                    return _mn
+            return None
+
+        _net = _find_net()
+        if _net is None:
+            raise RuntimeError("服务端没有可复用的 MQTT 管理器（期望 gms.mqtt_net）")
+
+        _rows = max(1, int(_a.get("rows", 24)))
+        _cols = max(1, int(_a.get("cols", 80)))
+        _frame_max = max(512, int(_a.get("frame_max", 16384)))
+        _interval = max(0.0, float(_a.get("flush_interval", 0.0)))
+        _ttl = min(max(60.0, float(_a.get("ttl", 43200.0))), 86400.0)
+        _login = bool(_a.get("login", True))
+
+        _shell = _a.get("shell")
+        if not _shell:
+            try:
+                import pwd as _pw
+                _shell = _o.environ.get("SHELL") or _pw.getpwuid(_o.getuid()).pw_shell
+            except Exception:
+                _shell = None
+            if not _shell or not _o.path.isfile(_shell):
+                _shell = "/bin/bash" if _o.path.isfile("/bin/bash") else "/bin/sh"
+        _term = str(_a.get("term") or _o.environ.get("TERM") or "xterm-256color")
+        _cwd = _a.get("cwd") or _o.path.expanduser("~")
+
+        _mfd, _sfd = _pty.openpty()
+        _fc.ioctl(_sfd, _te.TIOCSWINSZ, _st.pack("HHHH", _rows, _cols, 0, 0))
+        _envv = dict(_o.environ)
+        _envv["TERM"] = _term
+        _argv0 = ("-" + _o.path.basename(_shell)) if _login else _shell
+
+        def _become():
+            # 子进程：新会话 + 把 slave 设为控制终端（ssh 同款）。
+            _o.setsid()
+            _fc.ioctl(_sfd, _te.TIOCSCTTY, 0)
+
+        _proc = _sp.Popen(
+            [_argv0], executable=_shell,
+            stdin=_sfd, stdout=_sfd, stderr=_sfd,
+            cwd=_cwd, env=_envv, close_fds=True, preexec_fn=_become)
+        try:
+            _o.close(_sfd)
+        except OSError:
+            pass
+        _sfd = None
+
+        _st0 = {"reason": "exit"}
+        _end = _th.Event()
+
+        def _kill():
+            if _proc.poll() is not None:
+                _end.set()
+                return
+            try:
+                _o.killpg(_o.getpgid(_proc.pid), _sg.SIGHUP)
+            except Exception:
+                try:
+                    _proc.terminate()
+                except Exception:
+                    pass
+            _t.sleep(0.5)
+            if _proc.poll() is None:
+                try:
+                    _o.killpg(_o.getpgid(_proc.pid), _sg.SIGKILL)
+                except Exception:
+                    try:
+                        _proc.kill()
+                    except Exception:
+                        pass
+            _end.set()
+
+        def _flush(_seq, _data):
+            try:
+                _net.publish_broadcast(
+                    _out_topic,
+                    {"pty": _sid, "seq": _seq, "d": _data.decode("latin-1")})
+            except Exception:
+                pass
+
+        def _router(_topic, _data, _broker):
+            # PTY 专用 topic：入队后不再下传给原 RPC 回调；其余消息原样透传。
+            _q = _net._cmq_pty_router.get(_topic)
+            if _q is not None and isinstance(_data, dict):
+                _q.put(_data)
+                return
+            return _net._cmq_pty_orig(_topic, _data, _broker)
+
+        if not getattr(_net, "_cmq_pty_router", None):
+            _net._cmq_pty_orig = _net.message_callback
+            _net._cmq_pty_router = {}
+            _net.set_on_message(_router)
+
+        _inq = _qe.Queue()
+        _net._cmq_pty_router[_in_topic] = _inq
+        _net.subscribe(_in_topic)
+
+        def _in_loop():
+            # 上行首帧去重：同一帧会被每个 broker 各投递一次（实测 11 个连接
+            # 能到 ~15 份），普通 RPC 帧靠网络层 req_id 的 TTLCache 去重，PTY
+            # 帧没有 req_id，必须靠客户端打的 iseq 自己去重，否则一次回车会
+            # 被写进 PTY 十几遍（命令跑一遍 + 一串空命令提示符）。
+            _iseq_recent = _dq(maxlen=256)
+            while not _end.is_set():
+                try:
+                    _fr = _inq.get(timeout=0.5)
+                except _qe.Empty:
+                    continue
+                try:
+                    if not isinstance(_fr, dict) or _fr.get("pty") != _sid:
+                        continue
+                    _iq = _fr.get("iseq")
+                    if _iq is not None:
+                        if _iq in _iseq_recent:
+                            continue  # 同一帧被多个 broker 重复送达，只留首帧
+                        _iseq_recent.append(_iq)
+                    if _fr.get("stop") or _fr.get("end"):
+                        _st0["reason"] = "stopped"
+                        _kill()
+                        return
+                    _wz = _fr.get("winsz")
+                    if _wz:
+                        _r2, _c2 = int(_wz[0]), int(_wz[1])
+                        _fc.ioctl(_mfd, _te.TIOCSWINSZ,
+                                  _st.pack("HHHH", _r2, _c2, 0, 0))
+                    _kk = _fr.get("k")
+                    if _kk:
+                        _b = _kk.encode("latin-1")
+                        _off = 0
+                        while _off < len(_b):
+                            _off += _o.write(_mfd, _b[_off:])
+                except Exception:
+                    pass
+
+        def _out_loop():
+            _seq = 0
+            _buf = b""
+            _mark = _t.time()
+            _deadline = _t.time() + _ttl
+            _poll = _sel.poll()
+            _poll.register(_mfd, _sel.POLLIN | _sel.POLLHUP | _sel.POLLERR)
+            _reason = None
+            try:
+                while True:
+                    _now = _t.time()
+                    if _now >= _deadline:
+                        _st0["reason"] = "ttl"
+                        _reason = "ttl"
+                        break
+                    _left = max(0.05, _deadline - _now)
+                    if _interval <= 0:
+                        _wait_ms = min(1000.0, _left * 1000)
+                    elif _buf:
+                        _wait_ms = min(
+                            500.0,
+                            max(10.0, (_interval - (_now - _mark)) * 1000),
+                            _left * 1000)
+                    else:
+                        _wait_ms = min(500.0, _left * 1000)
+                    _evs = _poll.poll(_wait_ms)
+                    _hup = False
+                    if _evs:
+                        try:
+                            _chunk = _o.read(_mfd, _frame_max)
+                        except OSError:
+                            _chunk = b""
+                        if _chunk:
+                            if not _buf:
+                                _mark = _t.time()
+                            _buf += _chunk
+                        if _evs[0][1] & (_sel.POLLHUP | _sel.POLLERR):
+                            _hup = True
+                    if _hup:
+                        while True:
+                            try:
+                                _c2 = _o.read(_mfd, _frame_max)
+                            except OSError:
+                                break
+                            if not _c2:
+                                break
+                            _buf += _c2
+                        _reason = _reason or _st0["reason"]
+                        break
+                    if _buf and (_interval <= 0
+                                 or (_t.time() - _mark) >= _interval
+                                 or len(_buf) >= _frame_max):
+                        _flush(_seq, _buf)
+                        _seq += 1
+                        _buf = b""
+                        _mark = _t.time()
+
+                if _buf:
+                    _flush(_seq, _buf)
+                if _proc.poll() is None:
+                    try:
+                        _rc = _proc.wait(timeout=3)
+                    except _sp.TimeoutExpired:
+                        _kill()
+                        try:
+                            _rc = _proc.wait(timeout=3)
+                        except Exception:
+                            _rc = -1
+                else:
+                    _rc = _proc.returncode
+                _end.set()
+                try:
+                    _net._cmq_pty_router.pop(_in_topic, None)
+                except Exception:
+                    pass
+                try:
+                    _net.publish_broadcast(
+                        _out_topic,
+                        {"pty": _sid, "end": True,
+                         "reason": _reason, "rc": _rc})
+                except Exception:
+                    pass
+            finally:
+                try:
+                    _o.close(_mfd)
+                except OSError:
+                    pass
+
+        _th.Thread(target=_in_loop, name="pty-in", daemon=True).start()
+        _th.Thread(target=_out_loop, name="pty-out", daemon=True).start()
+
+        # 心跳：服务端进程活着就周期发一帧。客户端靠它区分"shell 没输出"
+        # 和"服务器已死"——否则 broker 仍在线、服务端进程被杀时，end 帧永远
+        # 发不出来，客户端会无限干等（按键全进黑洞）。
+        _hb = max(0.0, float(_a.get("heartbeat", 0.0)))
+
+        def _hb_loop():
+            while _hb > 0.0 and not _end.wait(_hb):
+                try:
+                    _net.publish_broadcast(
+                        _out_topic,
+                        {"pty": _sid, "hb": int(_t.time() * 1000)})
+                except Exception:
+                    pass
+
+        if _hb > 0.0:
+            _th.Thread(target=_hb_loop, name="pty-hb", daemon=True).start()
+
+        _res = {"ok": True, "sid": _sid, "heartbeat": _hb,
+                "in_topic": _in_topic, "out_topic": _out_topic,
+                "shell": _shell, "pid": _proc.pid, "term": _term,
+                "rows": _rows, "cols": _cols, "cwd": _cwd,
+                "flush_interval": _interval, "ttl": _ttl, "login": _login}
+    except Exception:
+        for _fd in (_mfd, _sfd):
+            try:
+                if _fd is not None:
+                    _o.close(_fd)
+            except Exception:
+                pass
+        _res = {"ok": False, "error": _tb.format_exc()}
+    return _j.dumps(_res, ensure_ascii=False)
+_cmq_pty_start()
+'''
+
+
+def build_pty_start_code(payload: dict) -> str:
+    """把 PTY 启动信封编译成远端可直接执行的自包含 Python 代码。"""
+    lit = json.dumps(json.dumps(payload, ensure_ascii=False))
+    return _PTY_START_TEMPLATE.replace("__PAYLOAD__", lit)
+
+
 def bytes_to_wire(b: bytes) -> str:
     """客户端字节 -> 报文字符串（latin-1 无损映射）。"""
     return b.decode("latin-1")
@@ -964,29 +1269,94 @@ class RemoteShell:
         return self._call("edit", path=str(path), old="", new=text,
                           backup=backup, encoding=encoding, append=True)
 
-    def apt_install(self, packages, update=True, timeout=600) -> CmdResult:
-        """远端 apt-get 非交互安装（需要 root；设备是 Docker root）。"""
+    def install_packages(self, packages, manager=None, update=None,
+                         timeout=900) -> CmdResult:
+        """在**服务端 shell 环境**里用本机包管理器安装（客户端不硬编码任何发行版）。
+
+        - ``manager=None``：在服务端按 apt-get → apk → dnf → yum → microdnf
+          → zypper → pacman → brew → pkg 的顺序探测可用者；显式指定则强制使用。
+        - ``update=None``：apt/dnf/yum/pkg 先刷新索引；传 ``False`` 跳过。
+        """
         if isinstance(packages, str):
             packages = [packages]
-        pkgs = " ".join(str(p) for p in packages)
-        script = "set -e; export DEBIAN_FRONTEND=noninteractive; "
-        if update:
-            script += "apt-get update -y; "
-        script += f"apt-get install -y --no-install-recommends {pkgs}"
+        pkgs = " ".join(shlex.quote(str(p)) for p in packages)
+        script = f"""set -e
+PKS={shlex.quote(pkgs)}
+FORCE_MGR={shlex.quote(str(manager or ""))}
+DO_UPDATE={shlex.quote("" if update else "0")}
+if [ -n "$FORCE_MGR" ]; then
+  M="$FORCE_MGR"
+  command -v "$M" >/dev/null 2>&1 || {{ echo "package manager not found: $M" >&2; exit 127; }}
+else
+  M=""
+  for c in apt-get apk dnf yum microdnf zypper pacman brew pkg; do
+    if command -v "$c" >/dev/null 2>&1; then M="$c"; break; fi
+  done
+fi
+[ -n "$M" ] || {{ echo "no supported package manager on remote" >&2; exit 127; }}
+case "$M" in
+  apt-get)
+    export DEBIAN_FRONTEND=noninteractive
+    [ "$DO_UPDATE" = "0" ] || apt-get update -y
+    exec apt-get install -y --no-install-recommends $PKS ;;
+  apk) exec apk add $PKS ;;
+  dnf|yum)
+    [ "$DO_UPDATE" = "0" ] || $M makecache fast >/dev/null 2>&1 || true
+    exec $M install -y $PKS ;;
+  microdnf) exec microdnf install -y $PKS ;;
+  zypper) exec zypper --non-interactive install $PKS ;;
+  pacman) exec pacman -S --noconfirm --needed $PKS ;;
+  brew) exec brew install $PKS ;;
+  pkg)
+    export ASSUME_ALWAYS_YES=yes
+    [ "$DO_UPDATE" = "0" ] || pkg update
+    exec pkg install -y $PKS ;;
+  *) echo "unsupported package manager: $M" >&2; exit 2 ;;
+esac
+"""
         return self.run(script, timeout=timeout, check=True)
 
-    def pip_install(self, packages, args=("--break-system-packages",), timeout=600) -> CmdResult:
-        """远端 pip 安装（默认带 --break-system-packages，Debian12 容器需要）。"""
+    def apt_install(self, packages, update=True, timeout=600) -> CmdResult:
+        """兼容旧接口：显式走服务端 apt-get。通用安装请直接用 install_packages。"""
+        return self.install_packages(packages, manager="apt-get",
+                                     update=update, timeout=timeout)
+
+    def pip_install(self, packages, args=(), timeout=600, python=None) -> CmdResult:
+        """在**服务端 shell 环境**里 pip 安装；不假设解释器名，也不盲目加
+        --break-system-packages。
+
+        - 服务端自行探测 python3/python（或用 ``python=`` 指定）；
+        - 检测 PEP 668 EXTERNALLY-MANAGED 标记，仅在存在时加
+          ``--break-system-packages``；若仍因 externally-managed 失败再自动重试一次；
+        - ``args`` 额外透传（旧调用里的 --break-system-packages 不会有害）。
+        """
         if isinstance(packages, str):
             packages = [packages]
-        opts = " ".join(args) if args else ""
-        return self.run(
-            "python3 -m pip install --no-cache-dir " + opts + " "
-            + " ".join(str(p) for p in packages),
-            timeout=timeout, check=True)
+        pkgs = " ".join(shlex.quote(str(p)) for p in packages)
+        extra = " ".join(shlex.quote(str(a)) for a in (args or ()))
+        script = f"""set -e
+PKS={shlex.quote(pkgs)}
+EXTRA={shlex.quote(extra)}
+PY={shlex.quote(str(python or ""))}
+if [ -z "$PY" ]; then
+  for c in python3 python; do
+    if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+  done
+fi
+[ -n "$PY" ] || {{ echo "no python interpreter on remote" >&2; exit 127; }}
+BRK=""
+if "$PY" -c 'import glob, os, sysconfig; p = sysconfig.get_path("stdlib"); sys.exit(0 if glob.glob(os.path.join(p, "EXTERNALLY-MANAGED")) else 1)' 2>/dev/null; then
+  BRK="--break-system-packages"
+fi
+if ! "$PY" -m pip install --no-cache-dir $BRK $EXTRA $PKS; then
+  if [ "$BRK" = "--break-system-packages" ]; then exit 1; fi
+  exec "$PY" -m pip install --no-cache-dir --break-system-packages $EXTRA $PKS
+fi
+"""
+        return self.run(script, timeout=timeout, check=True)
 
     def which(self, name) -> str | None:
-        r = self.run(f"command -v {name} || true")
+        r = self.run("command -v -- %s || true" % shlex.quote(str(name)))
         p = r.text.strip()
         return p or None
 
@@ -1232,3 +1602,199 @@ class RemoteShell:
 
     def hash(self, path, algo="sha256") -> dict:
         return self._call("hash", path=str(path), algo=algo)
+
+
+# ============================ 传输无关的远端 PTY 会话 ============================
+
+class RemotePty:
+    """远端交互式 PTY 客户端（ssh 模型），网络层由注入的 transport 决定。
+
+    生命周期：:meth:`open` → :meth:`send` / :meth:`resize` → 远端退出或
+    :meth:`detach` → :meth:`close`。
+
+    协商
+    ----
+    :meth:`open` 生成 sid 并提出 in/out 两个 topic（可覆盖）；本地先订阅 out
+    topic，再把 :data:`_PTY_START_TEMPLATE` 整段自包含代码经一问一答下发执行。
+    服务端只运行通用 server_mqtt.py，无需为 PTY 做任何改动；服务端常驻 shell
+    只启动一次，之后每个按键都写入同一个 PTY。
+
+    transport 需具备可选能力：``publish`` / ``stream_subscribe`` /
+    ``stream_unsubscribe``（MQTT 版见 cmd_client_mqtt.MqttTransport）。
+
+    帧约定
+    ------
+    - 上行（client→server，in topic）：每帧带单调递增的 ``iseq``，服务端
+      按它做多 broker 首帧去重（同一帧会被每个 broker 各投递一次）：
+      ``{"pty": sid, "iseq": n, "k": latin-1 按键}`` /
+      ``{"pty": sid, "iseq": n, "winsz": [rows, cols]}`` /
+      ``{"pty": sid, "iseq": n, "stop": true}``
+    - 下行（server→client，out topic）：
+      ``{"pty": sid, "seq": n, "d": latin-1 输出}`` /
+      ``{"pty": sid, "hb": ts_ms}``（周期心跳，证明服务端存活）/
+      ``{"pty": sid, "end": true, "reason": ..., "rc": ...}``
+    """
+
+    def __init__(self, transport: Transport, timeout: float = DEFAULT_TIMEOUT):
+        if not isinstance(transport, Transport):
+            raise TypeError("transport 必须是 remote_cmd.Transport 实例")
+        self.tr = transport
+        self.timeout = timeout
+        self.sid: str | None = None
+        self.in_topic: str | None = None
+        self.out_topic: str | None = None
+        self.server_info: dict | None = None
+        self.end_reason: str | None = None
+        self._end_event = threading.Event()
+        self._handler = None
+        self._frames = 0
+        self._lock = threading.RLock()
+        # 上行帧序号：所有按键/控制帧走 _publish_input 统一打号，
+        # 服务端 _in_loop 据此丢弃多 broker 重复帧
+        self._iseq = 0
+        self._ilock = threading.Lock()
+
+    def _check_caps(self):
+        missing = [n for n in ("publish", "stream_subscribe", "stream_unsubscribe")
+                   if not callable(getattr(self.tr, n, None))]
+        if missing:
+            raise RemoteError("当前 transport 不支持 PTY（缺少: %s）"
+                              % ", ".join(missing))
+
+    def open(self, rows, cols, *, shell=None, term=None, cwd=None,
+             login=True, flush_interval=0.0, ttl=DEFAULT_PTY_TTL,
+             frame_max=PTY_FRAME_MAX, sid=None, in_topic=None,
+             out_topic=None, on_data=None, heartbeat=0.0,
+             on_heartbeat=None, req_timeout=None) -> dict:
+        """协商并启动远端 PTY，返回服务端确认信息（含实际 topic/shell/pid）。
+
+        heartbeat>0 时要求服务端按该间隔（秒）周期发心跳帧，每收到一帧
+        （输出或心跳）回调一次 on_heartbeat，客户端据此做存活检测。
+        """
+        self._check_caps()
+        sid = sid or ("pty-%d-%s" % (int(time.time() * 1000),
+                                      os.urandom(2).hex()))
+        in_topic = in_topic or ("pty/%s/in" % sid)
+        out_topic = out_topic or ("pty/%s/out" % sid)
+        req_timeout = req_timeout or max(float(self.timeout), 30.0)
+        recent = deque(maxlen=256)
+
+        def handler(data):
+            if not isinstance(data, dict) or data.get("pty") != sid:
+                return
+            if data.get("end"):
+                self.end_reason = data.get("reason") or "end"
+                self._end_event.set()
+                return
+            if data.get("hb") is not None:
+                # 心跳帧：无输出也能证明服务端进程还活着
+                if on_heartbeat is not None:
+                    try:
+                        on_heartbeat(data.get("hb"))
+                    except Exception:
+                        pass
+                return
+            seq = data.get("seq")
+            if seq is not None:
+                if seq in recent:
+                    return  # 多 broker 重复送达
+                recent.append(seq)
+            chunk = wire_to_bytes(data.get("d"))
+            if chunk:
+                with self._lock:
+                    self._frames += 1
+                if on_data is not None:
+                    try:
+                        on_data(chunk)
+                    except Exception:
+                        pass
+
+        self._handler = handler
+        # 先订阅再启动，避免丢失最早的输出
+        self.tr.stream_subscribe(out_topic, handler)
+        payload = {"sid": sid, "in_topic": in_topic, "out_topic": out_topic,
+                   "rows": int(rows), "cols": int(cols),
+                   "shell": shell, "term": term, "cwd": cwd,
+                   "login": bool(login),
+                   "flush_interval": float(flush_interval),
+                   "ttl": min(max(60.0, float(ttl)), MAX_PTY_TTL),
+                   "frame_max": int(frame_max),
+                   "heartbeat": max(0.0, float(heartbeat))}
+        code = build_pty_start_code(payload)
+        try:
+            resp = self.tr.request(code, req_timeout)
+            if not resp:
+                raise RemoteTimeout("PTY 启动请求超时无回包")
+            try:
+                env = json.loads(resp.get("r") or "")
+            except (ValueError, TypeError) as e:
+                raise RemoteRpcError("无法解析 PTY 启动回包: %s" % e, resp)
+            if not env.get("ok"):
+                raise RemoteOpError(env.get("error", "pty start failed"),
+                                    env, resp)
+        except Exception:
+            try:
+                self.tr.stream_unsubscribe(out_topic, handler)
+            except Exception:
+                pass
+            raise
+        self.sid = sid
+        self.in_topic = in_topic
+        self.out_topic = out_topic
+        self.server_info = env
+        return env
+
+    def _publish_input(self, payload: dict) -> None:
+        """上行帧唯一出口：打单调 ``iseq`` 后发出。
+
+        PTY 帧没有 req_id，不经过网络层的首帧去重，而 publish 会广播到
+        所有 broker，同一帧必然被服务端收多份；序号让服务端只放行首帧。
+        """
+        with self._ilock:
+            payload["iseq"] = self._iseq
+            self._iseq += 1
+        self.tr.publish(self.in_topic, payload)
+
+    def send(self, data) -> None:
+        """把本地按键字节写入远端 PTY（latin-1 承载，可逐键也可合并）。"""
+        if self.sid is None:
+            raise RemoteError("PTY 尚未 open")
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self._publish_input(
+            {"pty": self.sid, "k": bytes(data).decode("latin-1")})
+
+    def resize(self, rows, cols) -> None:
+        """通知服务端调整 PTY 窗口（内核会向 shell 转发 SIGWINCH）。"""
+        if self.sid is None:
+            return
+        self._publish_input(
+            {"pty": self.sid, "winsz": [int(rows), int(cols)]})
+
+    def detach(self) -> None:
+        """请求服务端结束会话（kill 常驻 shell 及其进程组）。"""
+        if self.sid is None:
+            return
+        try:
+            self._publish_input({"pty": self.sid, "stop": True})
+        except Exception:
+            pass
+
+    def wait_end(self, timeout=None) -> bool:
+        """阻塞到远端会话结束（或超时）。返回是否已结束。"""
+        return self._end_event.wait(timeout)
+
+    def close(self) -> None:
+        """断开：通知服务端停止、取消本地订阅；不停底层 transport/node。"""
+        if self.sid is not None:
+            self.detach()
+            try:
+                self._end_event.wait(1.5)
+            except Exception:
+                pass
+        if self._handler is not None and self.out_topic is not None:
+            try:
+                self.tr.stream_unsubscribe(self.out_topic, self._handler)
+            except Exception:
+                pass
+        self.sid = None

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import posixpath
 import sys
@@ -29,6 +30,8 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+logger = logging.getLogger("cmd_client_mqtt")
 
 from multi_mqtt import get_standard_pem_bytes  # noqa: E402
 import client_mqtt as _cm                        # noqa: E402  复用 REPL 基建
@@ -100,6 +103,12 @@ class MqttTransport(Transport):
             allow_no_server_pubkey_response=self.allow_no_pub,
         )
 
+    # ---- 可选能力：向任意 topic 发一帧（RemotePty 的按键/控制帧用） ----
+
+    def publish(self, topic: str, payload_dict: dict):
+        """不走一问一答、不签名（帧内无 code），直接 publish 到指定 topic。"""
+        self.node.mqtt_net.publish_broadcast(topic, payload_dict)
+
     # ---- 可选能力：服务端推送（RemoteShell.stream 用） ----
 
     def stream_subscribe(self, topic, handler):
@@ -128,7 +137,9 @@ class MqttTransport(Transport):
             lst.remove(handler)
 
     def _dispatch_stream(self, topic, data, broker):
-        if not isinstance(data, dict) or "stream" not in data:
+        # "stream" 帧：周期汇报；"pty" 帧：PTY 下行输出。两类共用分发链。
+        if not isinstance(data, dict) or \
+                ("stream" not in data and "pty" not in data):
             return
         for h in list(self._stream_handlers.get(topic, [])):
             try:
