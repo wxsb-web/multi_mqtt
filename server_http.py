@@ -276,6 +276,8 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                         if 'Content-Type' not in self.headers:
                             self.handler.send_header(
                                 'Content-Type', 'application/octet-stream')
+                        # 告知浏览器本资源支持 Range：播放中可直接拖动跳转。
+                        self.handler.send_header('Accept-Ranges', 'bytes')
                         # 流式响应长度未知，不发送 Content-Length
                         self.handler.end_headers()
                         self._streamed = True

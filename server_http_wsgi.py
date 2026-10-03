@@ -24,6 +24,7 @@ server_http_wsgi.py — 把 server_http.py 的 RPC 处理器包装成 WSGI 应�
 
 import io
 import os
+import re
 import sys
 import time
 import queue
@@ -171,6 +172,9 @@ class _WSGIHandlerShim:
 # WSGI application 构造
 # ---------------------------------------------------------------------------
 
+_RANGE_SPEC_RE = re.compile(r'^bytes=(\d*)-(\d*)$')
+
+
 def _build_wsgi_application():
     """基于已初始化的 RPCRequestHandler 构造流式 WSGI application。
 
@@ -178,6 +182,92 @@ def _build_wsgi_application():
     立即返回一个队列驱动的可迭代对象——执行线程写出的每个分块都会
     立刻被 ASGI 网关转发给客户端，不等执行结束。
     """
+
+    def _capture_full(environ):
+        """完整执行一次 RPC 并收集全部响应字节（供 Range 请求切片）。
+
+        使用独立的 capture 状态和空转的 start_response；阻塞到执行结束，
+        返回 (status_line, headers, full_body)。
+        """
+        cap = {
+            'committed': False,
+            'chunks': queue.Queue(),
+            'pre': io.BytesIO(),
+            'status': '200 OK',
+            'headers': [],
+        }
+
+        def cap_start_response(status, headers):
+            cap['status'] = status
+            cap['headers'] = list(headers)
+
+        cap['start_response'] = cap_start_response
+
+        def run():
+            shim = _WSGIHandlerShim(environ, cap)
+            try:
+                RPCRequestHandler.handle_rpc(shim)
+            except Exception:
+                tb = traceback.format_exc()
+                if not cap['committed']:
+                    cap_start_response('500 Internal Server Error', [
+                        ('Content-Type', 'text/plain; charset=utf-8')])
+                    cap['committed'] = True
+                    cap['chunks'].put(tb.encode('utf-8'))
+            finally:
+                if not cap['committed']:
+                    cap_start_response('200 OK', [
+                        ('Content-Type', 'text/plain; charset=utf-8')])
+                    cap['committed'] = True
+                cap['chunks'].put(None)  # 结束哨兵
+
+        threading.Thread(target=run, name='RPC-WSGI-Range', daemon=True).start()
+
+        parts = []
+        while True:
+            item = cap['chunks'].get()
+            if item is None:
+                break
+            parts.append(item)
+        return cap['status'], cap['headers'], b''.join(parts)
+
+    def _serve_byte_range(environ, start_response, a, b):
+        status, headers, body = _capture_full(environ)
+        if not status.startswith('200'):
+            start_response(status, headers)
+            return [body]
+
+        total = len(body)
+        if a and b:
+            start, end = int(a), min(int(b), total - 1)
+        elif a:
+            start, end = int(a), total - 1
+        elif b:
+            start, end = max(0, total - int(b)), total - 1
+        else:
+            start, end = 0, total - 1
+
+        if total == 0 or start >= total or start > end:
+            msg = b"Requested Range Not Satisfiable"
+            start_response('416 Range Not Satisfiable', [
+                ('Content-Range', f'bytes */{total}'),
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', str(len(msg))),
+            ])
+            return [msg]
+
+        ctype = 'application/octet-stream'
+        for key, value in headers:
+            if key.lower() == 'content-type':
+                ctype = value
+        out = body[start:end + 1]
+        start_response('206 Partial Content', [
+            ('Content-Type', ctype),
+            ('Content-Range', f'bytes {start}-{end}/{total}'),
+            ('Content-Length', str(len(out))),
+            ('Accept-Ranges', 'bytes'),
+        ])
+        return [out]
 
     def application(environ, start_response):
         method = environ.get('REQUEST_METHOD', 'GET').upper()
@@ -210,6 +300,16 @@ def _build_wsgi_application():
                 ('Content-Length', '0'),
             ])
             return [b'']
+
+        # 播放中拖动进度条 → 浏览器发 Range 请求：完整捕获输出后返回 206。
+        # 例外：'bytes=0-' 是媒体加载器的初始（打开式）请求，仍走下面的
+        # 流式路径返回 200，保证点击后立刻边合成边播放。
+        range_header = environ.get('HTTP_RANGE')
+        if range_header:
+            match = _RANGE_SPEC_RE.match(range_header.strip())
+            if match and not (match.group(1) == '0' and match.group(2) == ''):
+                return _serve_byte_range(
+                    environ, start_response, match.group(1), match.group(2))
 
         # 其余路径全部交给原装的 handle_rpc（在线程中执行）
         state = {
