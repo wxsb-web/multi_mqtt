@@ -686,13 +686,16 @@ def _cmq_pty_start():
 
         def _find_net():
             # 复用服务端进程里现成的 MQTT 网络层（gms.mqtt_net），不新建连接。
+            # 同时返回服务端实例的 handle_message —— 它是消息回调链唯一可信的
+            # "链底"，用于把已被旧版本 _router 自裹成闭环的回调链一步接回真底。
             for _v in list(globals().values()):
                 _mn = getattr(_v, "mqtt_net", None)
                 if _mn is not None and hasattr(_mn, "publish_broadcast"):
-                    return _mn
-            return None
+                    _cb = getattr(_v, "handle_message", None)
+                    return _mn, (_cb if callable(_cb) else None)
+            return None, None
 
-        _net = _find_net()
+        _net, _srv_cb = _find_net()
         if _net is None:
             raise RuntimeError("服务端没有可复用的 MQTT 管理器（期望 gms.mqtt_net）")
 
@@ -713,7 +716,15 @@ def _cmq_pty_start():
             if not _shell or not _o.path.isfile(_shell):
                 _shell = "/bin/bash" if _o.path.isfile("/bin/bash") else "/bin/sh"
         _term = str(_a.get("term") or _o.environ.get("TERM") or "xterm-256color")
+        _cwd_warn = None
         _cwd = _a.get("cwd") or _o.path.expanduser("~")
+        # cwd 不存在只是客户端给错了参数，不该让整个 PTY 起不来（更不该把
+        # client 打退出）：逐级回退 HOME → /，并把实情通过回包告知客户端。
+        if not _o.path.isdir(_cwd):
+            _cwd_warn = "请求的 cwd 不存在或不是目录: %s" % _cwd
+            _cwd = _o.path.expanduser("~")
+            if not _o.path.isdir(_cwd):
+                _cwd = "/"
 
         _mfd, _sfd = _pty.openpty()
         _fc.ioctl(_sfd, _te.TIOCSWINSZ, _st.pack("HHHH", _rows, _cols, 0, 0))
@@ -769,17 +780,38 @@ def _cmq_pty_start():
             except Exception:
                 pass
 
+        # 递归防线：正常链路深度恒为 1（router → 链底）。阈值兜底是为了防止
+        # 历史坏版本留下的自裹回调链再次把分发线程炸穿——宁可丢一帧也不递归。
+        _rlocal = _th.local()
+
         def _router(_topic, _data, _broker):
             # PTY 专用 topic：入队后不再下传给原 RPC 回调；其余消息原样透传。
-            _q = _net._cmq_pty_router.get(_topic)
-            if _q is not None and isinstance(_data, dict):
-                _q.put(_data)
-                return
-            return _net._cmq_pty_orig(_topic, _data, _broker)
+            if getattr(_rlocal, "depth", 0) >= 8:
+                return None
+            _rlocal.depth = getattr(_rlocal, "depth", 0) + 1
+            try:
+                _q = _net._cmq_pty_router.get(_topic)
+                if _q is not None and isinstance(_data, dict):
+                    _q.put(_data)
+                    return None
+                return _net._cmq_pty_orig(_topic, _data, _broker)
+            finally:
+                _rlocal.depth -= 1
 
-        if not getattr(_net, "_cmq_pty_router", None):
-            _net._cmq_pty_orig = _net.message_callback
+        # 安装必须幂等。旧版用"router dict 是否为空"判断是否已安装，但会话
+        # 结束只 pop topic、空 dict 仍残留（falsy），每次重连都把旧 router
+        # 当成"原回调"再裹一层；旧 router 又动态回读 _net._cmq_pty_orig，
+        # 而该属性此刻指向它自己 → 自调用闭环，任何非 PTY topic（含
+        # sys/device/request）都会 RecursionError，整个服务端卡死。
+        # 用独立布尔标记保证全程只安装一次，dict 与链底永不被覆盖。
+        if not getattr(_net, "_cmq_pty_installed", False):
+            # 链底优先用服务端实例自己的 handle_message：即使本进程已被旧版
+            # 代码裹坏（_cmq_pty_orig 指向旧 router 闭环），新安装也能一步
+            # 跳到真正的链底，顺手完成自愈。
+            _base = _srv_cb if _srv_cb is not None else _net.message_callback
+            _net._cmq_pty_orig = _base
             _net._cmq_pty_router = {}
+            _net._cmq_pty_installed = True
             _net.set_on_message(_router)
 
         _inq = _qe.Queue()
@@ -935,6 +967,7 @@ def _cmq_pty_start():
                 "in_topic": _in_topic, "out_topic": _out_topic,
                 "shell": _shell, "pid": _proc.pid, "term": _term,
                 "rows": _rows, "cols": _cols, "cwd": _cwd,
+                "cwd_warning": _cwd_warn,
                 "flush_interval": _interval, "ttl": _ttl, "login": _login}
     except Exception:
         for _fd in (_mfd, _sfd):

@@ -48,6 +48,8 @@ from remote_cmd import (                # noqa: E402
     RemotePty, RemoteError, DEFAULT_PTY_TTL,
 )
 
+from multi_mqtt import stime
+
 
 # ============================ 本地终端：输出 ANSI 支持 ============================
 
@@ -175,7 +177,7 @@ def _hard_exit(console, code: int, message: str, pty=None):
         pass
     if message:
         try:
-            sys.stderr.write(message)
+            sys.stderr.write(stime()+ message)
             sys.stderr.flush()
         except Exception:
             pass
@@ -218,10 +220,14 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                    on_data=on_data)
 
     banner = (
-        f"[pty] connected shell={env['shell']} pid={env['pid']} "
-        f"({env['rows']}x{env['cols']}, interval={env['flush_interval']})\n"
-        f"[pty] in : {env['in_topic']}\n[pty] out: {env['out_topic']}\n"
+        f"[{stime()}] connected shell={env['shell']} pid={env['pid']} "
+        f"({env['rows']}x{env['cols']}, interval={env['flush_interval']})\t"
+        f"{env['in_topic']}\t{env['out_topic']}\n"
         f"[pty] Ctrl-] 本地脱离；远端 exit/Ctrl-D 结束会话\n")
+    if env.get("cwd_warning"):
+        # 服务端对不存在的 cwd 已自行回退（HOME→/），会话照常用；只提示不退出
+        banner += (f"[pty] 注意: {env['cwd_warning']}，"
+                   f"已回退到 {env['cwd']}\n")
     if dead_timeout > 0:
         banner += (f"[pty] 心跳 {heartbeat:g}s：服务器关闭/断连后最多 "
                    f"{dead_timeout:g}s 自动退出\n")
