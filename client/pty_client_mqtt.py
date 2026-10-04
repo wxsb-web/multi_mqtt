@@ -18,6 +18,9 @@
     python client/pty_client_mqtt.py                    # 交互式 PTY（默认参数）
     python client/pty_client_mqtt.py -i 0.2             # 服务端最多 0.2s 攒批
     python client/pty_client_mqtt.py --shell /bin/bash --cwd /root
+    python client/pty_client_mqtt.py -t q -k 2**128 "tmux at"
+                                                        # SSH 式：连上自动执行
+                                                        # 前置命令，随后留在会话里
 
 AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
 ====================================================
@@ -457,6 +460,17 @@ def _hard_exit(console, code: int, message: str, pty=None):
     os._exit(code)
 
 
+def _join_pre_command(parts) -> str:
+    """把 REMAINDER 位置参数拼成一行前置命令：多段按空格连接（与 ssh 一致），
+    去掉 argparse REMAINDER 可能保留的 ``--`` 分隔符；无命令返回空串。"""
+    if not parts:
+        return ""
+    items = [str(x) for x in parts]
+    if items and items[0] == "--":
+        items = items[1:]
+    return " ".join(items).strip()
+
+
 def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     pty = RemotePty(transport, timeout=args.timeout)
     # 挂到 AI 桥：外部经本地 HTTP RPC 调用 ai_bridge 即复用本 PTY，
@@ -578,6 +592,20 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     t_in.start()
     t_resize.start()
 
+    pre_cmd = _join_pre_command(getattr(args, "command", None))
+    if pre_cmd:
+        # SSH 式前置命令（ssh host "tmux at"）：握手一完成就把整行敲进常驻
+        # shell。tty 行规程会先把字节缓存在内核输入队列里等 shell 读取，
+        # 无需 sleep 等提示符。加 \r 提交；命令结束后会话不关闭，人继续
+        # 留在 shell / tmux 里。
+        try:
+            pty.send(pre_cmd + "\r")
+            sys.stderr.write("[pty] 已自动执行前置命令: %s\n" % pre_cmd)
+            sys.stderr.flush()
+        except Exception as exc:
+            sys.stderr.write("[pty][WARN] 前置命令发送失败: %s\n" % exc)
+            sys.stderr.flush()
+
     # 主线程：远端输出原样渲染；任何退出路径都走 _hard_exit 立即收场
     try:
         while not stop_ev.is_set():
@@ -641,7 +669,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "外部进程经它调用 ai_bridge 复用本 PTY，不再重连 broker；0=关闭")
     p.add_argument("--host", "-host", default="0.0.0.0",
                    help="本地 AI 控制口绑定地址（默认 0.0.0.0）；仅本机调用建议 --host 127.0.0.1")
-                   
+    # SSH 式可选位置参数：连接成功后自动敲进常驻 shell 的前置命令，如
+    # ``pty_client_mqtt.py -t q -k *** "tmux at"``；REMAINDER 保证命令自身
+    # 的 -x 选项（tmux attach -d）不会被本客户端解析。命令结束后会话继续，
+    # 人仍留在远端 shell / 全屏程序里。
+    p.add_argument("command", nargs=argparse.REMAINDER,
+                   help="可选：连接后自动执行的前置命令（SSH 式），如 \"tmux at\"")
+
     return p
 
 

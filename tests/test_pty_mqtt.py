@@ -372,6 +372,34 @@ class RemotePtyClientTests(unittest.TestCase):
         self.assertEqual(hosts, ["up-a"])
 
 
+class PtyCliPreCommandTests(unittest.TestCase):
+    """SSH 式前置命令：位置参数解析与拼接。"""
+
+    def test_no_command_defaults_empty(self):
+        args = pcm.build_parser().parse_args([])
+        self.assertEqual(args.command, [])
+        self.assertEqual(pcm._join_pre_command(args.command), "")
+
+    def test_quoted_command_after_options(self):
+        args = pcm.build_parser().parse_args(
+            ["-t", "q", "-k", "2**128", "tmux at"])
+        self.assertEqual(pcm._join_pre_command(args.command), "tmux at")
+
+    def test_unquoted_words_joined_like_ssh(self):
+        args = pcm.build_parser().parse_args(["tmux", "at"])
+        self.assertEqual(pcm._join_pre_command(args.command), "tmux at")
+
+    def test_command_own_dash_options_are_not_consumed_by_client(self):
+        # REMAINDER：tmux attach -d 里的 -d 是给远端命令的，不能报无法识别
+        args = pcm.build_parser().parse_args(["tmux", "attach", "-d", "-t", "x"])
+        self.assertEqual(pcm._join_pre_command(args.command),
+                         "tmux attach -d -t x")
+
+    def test_double_dash_separator_stripped(self):
+        self.assertEqual(pcm._join_pre_command(["--", "tmux at"]), "tmux at")
+        self.assertEqual(pcm._join_pre_command(None), "")
+
+
 # ============================ 2. 模板静态检查（全平台） ============================
 
 class PtyTemplateStaticTests(unittest.TestCase):
