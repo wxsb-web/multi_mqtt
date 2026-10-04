@@ -414,6 +414,29 @@ class PtyCliPreCommandTests(unittest.TestCase):
         self.assertEqual(pcm._join_pre_command(["--", "tmux at"]), "tmux at")
         self.assertEqual(pcm._join_pre_command(None), "")
 
+    def test_legacy_option_names_still_parse(self):
+        # 改名前的硬编码选项一个都不能丢
+        a = pcm.build_parser().parse_args(
+            ["--shell", "/bin/sh", "--term", "xterm", "--cwd", "/root",
+             "--interval", "1", "--no-login", "--ttl", "3600",
+             "--heartbeat", "3", "--dead-timeout", "9", "--size", "24x100",
+             "--detach-key", "f9", "--menu-key", "f10",
+             "--port", "0", "--host", "127.0.0.1"])
+        self.assertEqual((a.shell, a.term, a.cwd, a.interval, a.no_login,
+                          a.ttl, a.heartbeat, a.dead_timeout, a.size,
+                          a.detach_key, a.menu_key, a.port, a.host),
+                         ("/bin/sh", "xterm", "/root", 1.0, True, 3600.0,
+                          3.0, 9.0, "24x100", "f9", "f10", 0, "127.0.0.1"))
+
+    def test_alias_option_names_share_one_table(self):
+        # 下划线/短横/短别名全部由 alias 表生成
+        a = pcm.build_parser().parse_args(
+            ["--sh", "/bin/bash", "--hb", "2", "--dead_timeout", "7",
+             "--nologin", "--geometry", "20x80", "-i", "0.5", "-p", "0"])
+        self.assertEqual((a.shell, a.heartbeat, a.dead_timeout, a.no_login,
+                          a.size, a.interval, a.port),
+                         ("/bin/bash", 2.0, 7.0, True, "20x80", 0.5, 0))
+
 
 class PtyHotkeyParseTests(unittest.TestCase):
     """按键名 -> 终端字节序列，及反查显示名。"""
@@ -467,7 +490,8 @@ class PtyMagicBarTests(unittest.TestCase):
         return tr, pty, {"pty": pty, "transport": tr, "live": live}
 
     def test_detach_aliases(self):
-        for word in ("detach", "exit", "quit", "q", "d"):
+        # exit/quit 必须与 client_mqtt 是同一张表；x 是 PTY 侧自定义别名
+        for word in ("detach", "exit", "quit", "q", "d", "x"):
             _, pty, ctx = self._ctx()
             do_detach, lines = pcm._run_magic(word, ctx)
             self.assertTrue(do_detach, word)
@@ -482,6 +506,25 @@ class PtyMagicBarTests(unittest.TestCase):
         self.assertIn("heartbeat", joined)
         self.assertNotIn("topic", joined)  # 刻意不提供 topic/key 设置
         self.assertEqual(pcm._run_magic("   ", ctx), (False, []))
+
+    def test_shared_alias_tables_reuse_client_mqtt(self):
+        # 能复用 client_mqtt 的别名不许在 PTY 侧搞第二份：
+        # exit/quit、status/state/s、help/h/? 必须就是同一张表
+        from client import client_mqtt as cm
+        for word in cm.alias_exit:
+            self.assertIn(word, pcm.alias_detach)
+        self.assertIn("status", cm.alias_status)
+        _, _, ctx = self._ctx()
+        self.assertTrue(pcm._run_magic("state", ctx)[0] is False)
+        self.assertIn("broker", "\n".join(pcm._run_magic("state", ctx)[1]))
+        self.assertTrue(pcm._run_magic("?", ctx)[1])
+
+    def test_dash_underscore_command_equivalence(self):
+        _, _, ctx = self._ctx()
+        pcm._run_magic("dead-timeout 7", ctx)
+        self.assertEqual(ctx["live"]["dead_timeout"], 7.0)
+        pcm._run_magic("dead_timeout 0", ctx)
+        self.assertEqual(ctx["live"]["dead_timeout"], 0.0)
 
     def test_remote_params_publish_set_and_clamp(self):
         tr, pty, ctx = self._ctx()

@@ -79,6 +79,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
 if not __package__:
     __package__ = "client"
 
+from . import client_mqtt as _cm            # noqa: E402  复用统一别名表/_cli_opts
 from .cmd_client_mqtt import (              # noqa: E402
     MqttTransport, add_connection_args,
 )
@@ -87,6 +88,36 @@ from .remote_cmd import (                   # noqa: E402
 )
 
 from multi_mqtt import stime, BROKER_LIST
+
+# ================= 统一别名表（小写变量名） =================
+# 与 client_mqtt.py 同一套规矩：语义别名不带 "--"/"%" 前缀，三处共用一份：
+#   1) CLI 参数   -> _cm._cli_opts(*alias_xxx) 自动生成 --x/-x/x_x/x-x
+#   2) 本地魔术栏 -> cmd in alias_xxx（输入里的 - 先归一化成 _）
+#   3) 其他引用   -> 直接 import 本模块的 alias_xxx
+# 连接类（request_topic/reply_topic/private_key/allow/timeout）直接复用
+# client_mqtt 的表，由 cmd_client_mqtt.add_connection_args 注册，这里不重复；
+# status/help/exit 也直接引用 client_mqtt 的别名，禁止在 PTY 侧另立名字。
+
+# ---- PTY 会话参数（CLI 选项 + 可被魔术栏热调/引用） ----
+alias_shell        = ('shell', 'sh')
+alias_term         = ('term', 'terminal')
+alias_cwd          = ('cwd', 'dir', 'workdir')
+alias_interval     = ('interval', 'i', 'flush_interval', 'flush')
+alias_heartbeat    = ('heartbeat', 'hb')
+alias_ttl          = ('max_shell_live_time','ttl',)
+alias_dead_timeout = ('dead_timeout', 'deadtime', 'dead')
+alias_size         = ('size', 'geometry')
+alias_no_login     = ('no_login', 'nologin')
+alias_detach_key   = ('detach_key', 'detachkey')
+alias_menu_key     = ('menu_key', 'menukey', 'magic_key')
+alias_rpc_port     = ('port', 'rpc_port', 'p')
+alias_rpc_host     = ('host', 'rpc_host')
+alias_command      = ('command', 'cmd')
+
+# 魔术栏的"脱离"：语义等同退出，exit/quit 直接复用 client_mqtt 的别名表，
+# PTY 语境再补 detach 系列（顺序无所谓，匹配一律用 in）。
+alias_detach = tuple(dict.fromkeys(
+    ('detach', 'd', 'bye', 'q', 'x') + tuple(_cm.alias_exit)))
 
 
 # ============================ 本地终端：输出 ANSI 支持 ============================
@@ -622,27 +653,38 @@ def ai_pty_status(base=DEFAULT_AI_BASE, timeout=15):
 
 # ============================ PTY 会话 ============================
 
-# 本地魔术命令栏（热键唤起）：只处理本地动作和"时间类"参数，刻意不提供
-# topic/key 等连接参数（那些必须重连，参考 client_mqtt.py 的 %magic 边界）。
-_PTY_MAGIC_HELP = (
-    "本地命令（不会发到远端）：\r\n"
-    "  detach | exit | quit   脱离（远端 tmux/shell 继续运行）\r\n"
-    "  status                 会话与 broker 状态\r\n"
-    "  interval <秒>          服务端输出攒批间隔，0=实时，上限 60\r\n"
-    "  heartbeat <秒>         心跳间隔，0=关闭，上限 3600\r\n"
-    "  ttl <秒>               孤儿会话存活，60~86400\r\n"
-    "  dead <秒>              本地判死超时，0=不检测（立即生效）\r\n"
-    "  help                   本帮助；空行/Esc/Ctrl-C 取消\r\n"
+# 可设置参数规格表（唯一真相源；别名表在文件前面统一声明）：
+#   (规范名/live 键, 别名组, RemotePty.configure 关键字[None=纯本地],
+#    (下限, 上限), 说明)
+_PTY_MAGIC_SPECS = (
+    ("interval", alias_interval, "interval", (0.0, 60.0),
+     "服务端输出攒批间隔秒，0=实时，上限 60"),
+    ("heartbeat", alias_heartbeat, "heartbeat", (0.0, 3600.0),
+     "心跳间隔秒，0=关闭，上限 3600"),
+    ("ttl", alias_ttl, "ttl", (60.0, 86400.0),
+     "孤儿会话存活秒，60~86400"),
+    ("dead_timeout", alias_dead_timeout, None, (0.0, 3600.0),
+     "本地判死超时秒，0=不检测（立即生效）"),
 )
 
-# 参数名 -> (下限, 上限, 服务端 configure 关键字 or None 表示纯本地)
-_MAGIC_NUM_PARAMS = {
-    "interval": (0.0, 60.0, "interval"),
-    "heartbeat": (0.0, 3600.0, "heartbeat"),
-    "ttl": (60.0, 86400.0, "ttl"),
-    "dead": (0.0, 3600.0, None),
-    "dead-timeout": (0.0, 3600.0, None),
-}
+
+def _alias_usage(aliases) -> str:
+    return "|".join(aliases)
+
+
+def _magic_help_lines():
+    """帮助文本由别名表/规格表生成，命令增删改时不可能和实现脱节。"""
+    lines = ["本地命令（不会发到远端）："]
+    lines.append("  %s   脱离（远端 tmux/shell 继续运行）"
+                 % _alias_usage(alias_detach))
+    lines.append("  %s   会话与 broker 状态"
+                 % _alias_usage(_cm.alias_status))
+    for canon, aliases, _remote, _bounds, desc in _PTY_MAGIC_SPECS:
+        lines.append("  %s <秒>   %s"
+                     % (_alias_usage((canon,) + aliases[1:]), desc))
+    lines.append("  %s   本帮助；空行/Esc/Ctrl-C 取消"
+                 % _alias_usage(_cm.alias_help))
+    return lines
 
 
 def _run_magic(line, ctx):
@@ -651,16 +693,17 @@ def _run_magic(line, ctx):
     if not body:
         return False, []
     parts = body.split(None, 1)
-    cmd = parts[0].lower()
+    # - 与 _ 等价（dead-timeout / dead_timeout 同一命令）
+    cmd = parts[0].lower().replace("-", "_")
     arg = parts[1].strip() if len(parts) > 1 else ""
     pty = ctx["pty"]
     live = ctx["live"]
 
-    if cmd in ("help", "?", "h"):
-        return False, _PTY_MAGIC_HELP.split("\r\n")[:-1] or [""]
-    if cmd in ("detach", "exit", "quit", "q", "d", "bye",'x'):
+    if cmd in _cm.alias_help:
+        return False, _magic_help_lines()
+    if cmd in alias_detach:
         return True, ["正在脱离（远端会话保持运行）…"]
-    if cmd in ("status", "s", "st"):
+    if cmd in _cm.alias_status:
         info = getattr(pty, "server_info", None) or {}
         online, total, _hosts = _broker_status(ctx.get("transport"))
         lines = [
@@ -676,26 +719,26 @@ def _run_magic(line, ctx):
             "结束原因   = %s" % getattr(pty, "end_reason", None),
         ]
         return False, lines
-    spec = _MAGIC_NUM_PARAMS.get(cmd)
-    if spec is not None:
+    for canon, aliases, remote_key, (lo, hi), _desc in _PTY_MAGIC_SPECS:
+        if cmd not in aliases:
+            continue
         if not arg:
-            return False, ["%s = %s" % (cmd, live.get(cmd, live.get("dead_timeout")))]
+            return False, ["%s = %s" % (canon, live.get(canon))]
         try:
             val = float(arg)
         except ValueError:
-            return False, ["%s 需要一个数字（秒），收到: %r" % (cmd, arg)]
-        lo, hi, remote_key = spec
+            return False, ["%s 需要一个数字（秒），收到: %r" % (canon, arg)]
         val = min(max(lo, val), hi)
         if remote_key is None:
-            live["dead_timeout"] = val
-            return False, ["dead_timeout <- %s 秒（立即生效）" % val]
+            live[canon] = val
+            return False, ["%s <- %s 秒（立即生效）" % (canon, val)]
         try:
             applied = pty.configure(**{remote_key: val})
         except RemoteError as exc:
             return False, ["设置失败: %s" % exc]
-        live[remote_key] = applied[remote_key]
+        live[canon] = applied[remote_key]
         return False, ["%s <- %s 秒（已通知服务端热调）"
-                       % (remote_key, applied[remote_key])]
+                       % (canon, applied[remote_key])]
     return False, ["未知本地命令: %s（输入 help 查看）" % cmd]
 
 
@@ -1047,50 +1090,62 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
 # ============================ CLI ============================
 
 def build_parser() -> argparse.ArgumentParser:
+    # 选项名一律由文件前面的 alias_xxx 别名表 + client_mqtt._cli_opts 生成，
+    # 与本地魔术栏命令、rpc(**ka) 别名三处永远一致；禁止再硬编码 "--xxx"。
+    # dest 保持历史字段名（args.interval/args.port 等），调用方无需改动。
     p = argparse.ArgumentParser(
         prog="pty_client_mqtt",
         description="PTY over MQTT：SSH 式远程交互终端（常驻 shell，逐键过 broker）")
-    # 连接参数：选项名全部引用 client_mqtt 别名表，与 cmd_client_mqtt 共用同一份
+    # 连接参数（topic/key/allow/timeout）：直接复用 client_mqtt 别名表
     add_connection_args(p, default_timeout=30.0)
-    # PTY 参数
-    p.add_argument("--shell", default="",
+    # PTY 会话参数
+    p.add_argument(*_cm._cli_opts(*alias_shell), dest="shell", default="",
                    help="远端 shell，默认服务端用户登录 shell（$SHELL/passwd）")
-    p.add_argument("--term", default="",
+    p.add_argument(*_cm._cli_opts(*alias_term), dest="term", default="",
                    help="TERM，默认本地 $TERM 或 xterm-256color")
-    p.add_argument("--cwd", default=None, help="启动目录，默认远端 HOME")
-    p.add_argument("--interval", "-i", type=float, default=0.0,
+    p.add_argument(*_cm._cli_opts(*alias_cwd), dest="cwd", default=None,
+                   help="启动目录，默认远端 HOME")
+    p.add_argument(*_cm._cli_opts(*alias_interval), dest="interval",
+                   type=float, default=0.0,
                    help="服务端主动推送最小间隔秒：0=实时（默认），>0 攒批")
-    p.add_argument("--no-login", action="store_true",
+    p.add_argument(*_cm._cli_opts(*alias_no_login), dest="no_login",
+                   action="store_true",
                    help="不使用 login shell（默认 argv0 带 - 前缀）")
-    p.add_argument("--ttl", type=float, default=DEFAULT_PTY_TTL,
+    p.add_argument(*_cm._cli_opts(*alias_ttl), dest="ttl",
+                   type=float, default=DEFAULT_PTY_TTL,
                    help="孤儿会话最长存活秒（默认 12h，上限 24h）")
-    p.add_argument("--heartbeat", type=float, default=5.0,
+    p.add_argument(*_cm._cli_opts(*alias_heartbeat), dest="heartbeat",
+                   type=float, default=5.0,
                    help="服务端心跳间隔秒：0=关闭（默认 5s）")
-    p.add_argument("--dead-timeout", type=float, default=15.0,
+    p.add_argument(*_cm._cli_opts(*alias_dead_timeout), dest="dead_timeout",
+                   type=float, default=15.0,
                    help="多久收不到任何远端帧（输出/心跳）即判定服务器已死"
                         "并直接退出（默认 15s，实际不小于 3 倍心跳；"
                         "0=不检测，心跳关闭时自动失效）")
-    p.add_argument("--size", default=None,
+    p.add_argument(*_cm._cli_opts(*alias_size), dest="size", default=None,
                    help="强制窗口 ROWSxCOLS，如 24x100；默认取本地终端大小")
-    p.add_argument("--detach-key", default="ctrl-]",
+    p.add_argument(*_cm._cli_opts(*alias_detach_key), dest="detach_key",
+                   default="ctrl-]",
                    help="本地脱离键：只断开 client，远端 tmux/shell 继续运行"
                         "（默认 ctrl-]，沿用 telnet 惯例，不与 tmux 前缀冲突；"
                         "可写 ctrl-a/f9/insert 等名字，none 禁用）")
-    p.add_argument("--menu-key", default="ctrl-alt-insert",
+    p.add_argument(*_cm._cli_opts(*alias_menu_key), dest="menu_key",
+                   default="ctrl-alt-insert",
                    help="本地命令栏热键：detach、status、热调 interval/"
                         "heartbeat/ttl/dead，不会把按键发到远端（默认 "
-                        "ctrl-alt-insert；名字写法同 --detach-key，none 禁用）")
-                   
-    p.add_argument("--port", "-port", "-p", type=int, default=1188,
+                        "ctrl-alt-insert；名字写法同脱离键，none 禁用）")
+    p.add_argument(*_cm._cli_opts(*alias_rpc_port), dest="port",
+                   type=int, default=1188,
                    help="本地 AI 控制口 HTTP RPC 端口（默认 1188）；"
                         "外部进程经它调用 ai_bridge 复用本 PTY，不再重连 broker；0=关闭")
-    p.add_argument("--host", "-host", default="0.0.0.0",
-                   help="本地 AI 控制口绑定地址（默认 0.0.0.0）；仅本机调用建议 --host 127.0.0.1")
+    p.add_argument(*_cm._cli_opts(*alias_rpc_host), dest="host",
+                   default="0.0.0.0",
+                   help="本地 AI 控制口绑定地址（默认 0.0.0.0）；仅本机调用建议 127.0.0.1")
     # SSH 式可选位置参数：连接成功后自动敲进常驻 shell 的前置命令，如
     # ``pty_client_mqtt.py -t q -k *** "tmux at"``；REMAINDER 保证命令自身
     # 的 -x 选项（tmux attach -d）不会被本客户端解析。命令结束后会话继续，
     # 人仍留在远端 shell / 全屏程序里。
-    p.add_argument("command", nargs=argparse.REMAINDER,
+    p.add_argument(alias_command[0], nargs=argparse.REMAINDER,
                    help="可选：连接后自动执行的前置命令（SSH 式），如 \"tmux at\"")
 
     return p
