@@ -33,7 +33,6 @@ import shlex
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections import deque
 
 # ---- 传输尺寸约束（均按实测的公共 broker 行为设定） --------------------------
 MAX_TRANSFER = 1 << 20          # 1 MiB：单文件经本报文通道传输的默认硬上限
@@ -678,11 +677,38 @@ def _cmq_pty_start():
             raise RuntimeError("PTY 只能在 POSIX 服务端建立，当前系统: %s" % _o.name)
         import pty as _pty, fcntl as _fc, termios as _te, struct as _st
         import select as _sel, subprocess as _sp, signal as _sg, queue as _qe
-        from collections import deque as _dq
+
+        # 本服务端进程的稳定身份（executor 全局命名空间跨握手持久，同一进程
+        # 每次握手拿到同一个 uid）。多个持相同 key 的 server_mqtt 进程（旧
+        # 机器/旧容器没关、同机起了两个）会同时应答同一个握手、各自开一个
+        # PTY 订阅同一 in topic、往同一 out topic 各自从 seq=0 推流；客户端
+        # 只认首个应答者，并通过上行帧里的 owner 让其他"影子 PTY"自行了断。
+        _g = globals()
+        _uid = _g.get("_cmq_server_uid")
+        if not _uid:
+            _uid = _o.urandom(6).hex()
+            _g["_cmq_server_uid"] = _uid
+        try:
+            _host = _o.uname().nodename
+        except Exception:
+            _host = "?"
 
         _sid = str(_a["sid"])
         _in_topic = str(_a["in_topic"])
         _out_topic = str(_a["out_topic"])
+
+        # 同进程内同 sid 幂等：网络层 req_id 已保证同一条握手代码只执行一次，
+        # 这里是兜底，防止任何重复执行再开出一个往同一 out topic 推流的 PTY
+        # （两条近同流会在客户端按 seq 拼出 1 列偏移的错位重影）。
+        _sess_lock = _g.get("_cmq_pty_sess_lock")
+        if _sess_lock is None:
+            _sess_lock = _th.Lock()
+            _g["_cmq_pty_sess_lock"] = _sess_lock
+        _sessions = _g.setdefault("_cmq_pty_sessions", {})
+        with _sess_lock:
+            _cached_env = _sessions.get(_sid)
+        if _cached_env is not None:
+            return _cached_env
 
         def _find_net():
             # 复用服务端进程里现成的 MQTT 网络层（gms.mqtt_net），不新建连接。
@@ -776,7 +802,8 @@ def _cmq_pty_start():
             try:
                 _net.publish_broadcast(
                     _out_topic,
-                    {"pty": _sid, "seq": _seq, "d": _data.decode("latin-1")})
+                    {"pty": _sid, "seq": _seq, "d": _data.decode("latin-1"),
+                     "owner": _uid})
             except Exception:
                 pass
 
@@ -819,11 +846,16 @@ def _cmq_pty_start():
         _net.subscribe(_in_topic)
 
         def _in_loop():
-            # 上行首帧去重：同一帧会被每个 broker 各投递一次（实测 11 个连接
-            # 能到 ~15 份），普通 RPC 帧靠网络层 req_id 的 TTLCache 去重，PTY
-            # 帧没有 req_id，必须靠客户端打的 iseq 自己去重，否则一次回车会
-            # 被写进 PTY 十几遍（命令跑一遍 + 一串空命令提示符）。
-            _iseq_recent = _dq(maxlen=256)
+            # 上行帧单调闸门：同一帧会被每个 broker 各投递一次（实测 11 个
+            # 连接能到 ~15 份），而不同 broker 的路径延迟抖动还会让帧乱序
+            # 到达。普通 RPC 帧靠网络层 req_id 的 TTLCache 去重，PTY 帧没有
+            # req_id，必须靠客户端打的 iseq 做单调检查：iseq 已放行就丢
+            # ——既去掉多 broker 重复副本，也挡下乱序迟到的旧帧。后者对
+            # winsz 尤其致命：拖动窗口时一串尺寸帧广播出去，慢 broker 把
+            # 早先更大的尺寸晚送到，若覆盖当前尺寸，远端 PTY 会一直比本地
+            # 窗口宽，pip/gradle 的 \r 进度条从此全线错位。无 iseq 的旧版
+            # 客户端帧照旧放行（向后兼容）。
+            _iseq_last = None
             while not _end.is_set():
                 try:
                     _fr = _inq.get(timeout=0.5)
@@ -832,18 +864,30 @@ def _cmq_pty_start():
                 try:
                     if not isinstance(_fr, dict) or _fr.get("pty") != _sid:
                         continue
+                    _ow = _fr.get("owner")
+                    if _ow is not None and _ow != _uid:
+                        # 归属仲裁：客户端只认首个握手应答者，上行帧的 owner
+                        # 是赢家 uid。本进程收到不匹配的帧说明自己是同时应答
+                        # 的影子 PTY，立即结束会话并停止推流——否则它的输出流
+                        # 与赢家那条在客户端按 seq 交错，渲染出整屏错位重影。
+                        # 必须在 iseq 闸门之前判断：重复/乱序的他方帧也要杀。
+                        _st0["reason"] = "claim_lost"
+                        _kill()
+                        return
                     _iq = _fr.get("iseq")
                     if _iq is not None:
-                        if _iq in _iseq_recent:
-                            continue  # 同一帧被多个 broker 重复送达，只留首帧
-                        _iseq_recent.append(_iq)
+                        _iq = int(_iq)
+                        if _iseq_last is not None and _iq <= _iseq_last:
+                            continue  # 重复副本或乱序迟到的旧帧（按键/旧尺寸）
+                        _iseq_last = _iq
                     if _fr.get("stop") or _fr.get("end"):
                         _st0["reason"] = "stopped"
                         _kill()
                         return
                     _wz = _fr.get("winsz")
                     if _wz:
-                        _r2, _c2 = int(_wz[0]), int(_wz[1])
+                        _r2 = max(1, int(_wz[0]))
+                        _c2 = max(1, int(_wz[1]))
                         _fc.ioctl(_mfd, _te.TIOCSWINSZ,
                                   _st.pack("HHHH", _r2, _c2, 0, 0))
                     _kk = _fr.get("k")
@@ -931,10 +975,15 @@ def _cmq_pty_start():
                 except Exception:
                     pass
                 try:
+                    with _sess_lock:
+                        _sessions.pop(_sid, None)
+                except Exception:
+                    pass
+                try:
                     _net.publish_broadcast(
                         _out_topic,
                         {"pty": _sid, "end": True,
-                         "reason": _reason, "rc": _rc})
+                         "reason": _reason, "rc": _rc, "owner": _uid})
                 except Exception:
                     pass
             finally:
@@ -956,19 +1005,24 @@ def _cmq_pty_start():
                 try:
                     _net.publish_broadcast(
                         _out_topic,
-                        {"pty": _sid, "hb": int(_t.time() * 1000)})
+                        {"pty": _sid, "hb": int(_t.time() * 1000),
+                         "owner": _uid})
                 except Exception:
                     pass
 
         if _hb > 0.0:
             _th.Thread(target=_hb_loop, name="pty-hb", daemon=True).start()
 
-        _res = {"ok": True, "sid": _sid, "heartbeat": _hb,
+        _res = {"ok": True, "sid": _sid, "owner": _uid, "host": _host,
+                "heartbeat": _hb,
                 "in_topic": _in_topic, "out_topic": _out_topic,
                 "shell": _shell, "pid": _proc.pid, "term": _term,
                 "rows": _rows, "cols": _cols, "cwd": _cwd,
                 "cwd_warning": _cwd_warn,
                 "flush_interval": _interval, "ttl": _ttl, "login": _login}
+        _env_json = _j.dumps(_res, ensure_ascii=False)
+        with _sess_lock:
+            _sessions[_sid] = _env_json
     except Exception:
         for _fd in (_mfd, _sfd):
             try:
@@ -977,7 +1031,8 @@ def _cmq_pty_start():
             except Exception:
                 pass
         _res = {"ok": False, "error": _tb.format_exc()}
-    return _j.dumps(_res, ensure_ascii=False)
+        _env_json = _j.dumps(_res, ensure_ascii=False)
+    return _env_json
 _cmq_pty_start()
 '''
 
@@ -1639,6 +1694,109 @@ fi
 
 # ============================ 传输无关的远端 PTY 会话 ============================
 
+class _PtyReorderBuffer:
+    """下行帧按 ``seq`` 重排，吸收多 broker 路径的乱序与重复副本。
+
+    同一帧会经每个 broker 各投递一次，不同 broker 的路径延迟抖动还会让
+    后发的帧先到（输出洪峰时几乎必然发生）。终端 CSI 转义序列经常被拆在
+    两个 chunk 里，一旦乱序渲染，本地终端的状态机就会被打坏（进度条碎片
+    堆叠、光标错位）。这里像 TCP 一样按 seq 连续放行；中间缺帧只短暂
+    等待 :data:`GAP_TIMEOUT`，超时即认定真丢帧并跳号，把已在途的 chunk
+    按序全部放行，避免某一帧被 broker 丢掉后输出永久卡死。
+    """
+
+    GAP_TIMEOUT = 0.75
+
+    def __init__(self, on_chunks):
+        self._on_chunks = on_chunks   # callable(list[bytes])，在锁外回调
+        self._lock = threading.Lock()
+        self._next = None
+        self._pending = {}            # seq -> chunk
+        self._timer = None
+
+    def add(self, seq: int, chunk: bytes) -> None:
+        out = []
+        with self._lock:
+            seq = int(seq)
+            if self._next is not None and seq < self._next:
+                return  # 迟到的重复副本，内容已渲染过
+            self._pending[seq] = chunk
+            if self._next is None and 0 in self._pending:
+                # 服务端 seq 从 0 开始：收到 0 立即锚定，正常路径零等待。
+                # 首帧若是 seq>0（0 经慢 broker 晚点），先暂存等前序帧。
+                self._next = 0
+            if self._next is not None:
+                out = self._drain_locked()
+            if not self._pending and self._timer is not None:
+                t, self._timer = self._timer, None
+                t.cancel()
+            elif self._pending and self._timer is None:
+                self._timer = threading.Timer(
+                    self.GAP_TIMEOUT, self._gap_timeout)
+                self._timer.daemon = True
+                self._timer.start()
+        if out:
+            self._on_chunks(out)
+
+    def _drain_locked(self) -> list:
+        out = []
+        while self._next in self._pending:
+            out.append(self._pending.pop(self._next))
+            self._next += 1
+        return out
+
+    def _gap_timeout(self):
+        out = []
+        with self._lock:
+            self._timer = None
+            if not self._pending:
+                return
+            # 缺口等了 GAP_TIMEOUT 仍没补上（或首帧 seq>0 且 0 一直没到）：
+            # 按丢帧处理，锚到最小在途 seq，连续放行后若还有缺口再等一轮
+            self._next = min(self._pending)
+            out = self._drain_locked()
+            if self._pending:
+                self._timer = threading.Timer(
+                    self.GAP_TIMEOUT, self._gap_timeout)
+                self._timer.daemon = True
+                self._timer.start()
+        if out:
+            self._on_chunks(out)
+
+    def close(self):
+        with self._lock:
+            self._pending.clear()
+            t, self._timer = self._timer, None
+        if t is not None:
+            t.cancel()
+
+
+def _parse_pty_responders(resp, extras):
+    """从握手首包 + 迟到回包里解析全部应答服务端，首包标记 winner。
+
+    返回 ``[{"owner","host","pid","winner"}]``，按 owner/host 去重；
+    回包不是 PTY 启动响应（无法解析 r）时跳过。
+    """
+    out = []
+    seen = set()
+    for i, r in enumerate([resp] + list(extras or [])):
+        if not isinstance(r, dict):
+            continue
+        try:
+            env = json.loads(r.get("r") or "")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(env, dict) or not env.get("ok"):
+            continue
+        key = env.get("owner") or ("%s:%s" % (env.get("host"), env.get("pid")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"owner": env.get("owner"), "host": env.get("host"),
+                    "pid": env.get("pid"), "winner": i == 0})
+    return out
+
+
 class RemotePty:
     """远端交互式 PTY 客户端（ssh 模型），网络层由注入的 transport 决定。
 
@@ -1658,14 +1816,19 @@ class RemotePty:
     帧约定
     ------
     - 上行（client→server，in topic）：每帧带单调递增的 ``iseq``，服务端
-      按它做多 broker 首帧去重（同一帧会被每个 broker 各投递一次）：
-      ``{"pty": sid, "iseq": n, "k": latin-1 按键}`` /
-      ``{"pty": sid, "iseq": n, "winsz": [rows, cols]}`` /
-      ``{"pty": sid, "iseq": n, "stop": true}``
-    - 下行（server→client，out topic）：
-      ``{"pty": sid, "seq": n, "d": latin-1 输出}`` /
-      ``{"pty": sid, "hb": ts_ms}``（周期心跳，证明服务端存活）/
-      ``{"pty": sid, "end": true, "reason": ..., "rc": ...}``
+      按它做单调闸门（同一帧会被每个 broker 各投递一次，旧 iseq 帧乱序
+      迟到也一律丢弃，避免旧 winsz 覆盖新尺寸）；帧还带 ``owner``（首个
+      握手应答者的进程 uid），其他同时应答的影子 PTY 收到不匹配帧立即
+      自杀：
+      ``{"pty": sid, "iseq": n, "owner": uid, "k": latin-1 按键}`` /
+      ``{"pty": sid, "iseq": n, "owner": uid, "winsz": [rows, cols]}`` /
+      ``{"pty": sid, "iseq": n, "owner": uid, "stop": true}`` /
+      ``{"pty": sid, "iseq": n, "owner": uid, "claim": true}``
+    - 下行（server→client，out topic）：帧带同一 ``owner``，非赢家帧一律
+      丢弃（含影子 PTY 的 end 帧，不能让它终止本视图）：
+      ``{"pty": sid, "seq": n, "owner": uid, "d": latin-1 输出}`` /
+      ``{"pty": sid, "owner": uid, "hb": ts_ms}``（周期心跳）/
+      ``{"pty": sid, "owner": uid, "end": true, "reason": ..., "rc": ...}``
     """
 
     def __init__(self, transport: Transport, timeout: float = DEFAULT_TIMEOUT):
@@ -1678,8 +1841,16 @@ class RemotePty:
         self.out_topic: str | None = None
         self.server_info: dict | None = None
         self.end_reason: str | None = None
+        # 会话归属：首个握手应答服务端的进程 uid；同时应答的其他进程是影子
+        self.owner: str | None = None
+        # 握手收集到的全部应答者：[{"owner","host","pid","winner"}]
+        self.responders: list = []
+        self.foreign_frames = 0   # 被丢弃的影子 PTY 帧数（诊断用）
+        self._owner_ready = False
+        self._pending_frames: list = []
         self._end_event = threading.Event()
         self._handler = None
+        self._reorder = None
         self._frames = 0
         self._lock = threading.RLock()
         # 上行帧序号：所有按键/控制帧走 _publish_input 统一打号，
@@ -1698,11 +1869,16 @@ class RemotePty:
              login=True, flush_interval=0.0, ttl=DEFAULT_PTY_TTL,
              frame_max=PTY_FRAME_MAX, sid=None, in_topic=None,
              out_topic=None, on_data=None, heartbeat=0.0,
-             on_heartbeat=None, req_timeout=None) -> dict:
+             on_heartbeat=None, req_timeout=None,
+             owner_gather=0.8) -> dict:
         """协商并启动远端 PTY，返回服务端确认信息（含实际 topic/shell/pid）。
 
         heartbeat>0 时要求服务端按该间隔（秒）周期发心跳帧，每收到一帧
         （输出或心跳）回调一次 on_heartbeat，客户端据此做存活检测。
+
+        owner_gather：首包回收后再多等几秒收集其他持相同 key 的服务端的
+        迟到握手回包（多应答者检测/告警）；transport 不支持 request_many
+        时自动退化为只收首包。
         """
         self._check_caps()
         sid = sid or ("pty-%d-%s" % (int(time.time() * 1000),
@@ -1710,10 +1886,28 @@ class RemotePty:
         in_topic = in_topic or ("pty/%s/in" % sid)
         out_topic = out_topic or ("pty/%s/out" % sid)
         req_timeout = req_timeout or max(float(self.timeout), 30.0)
-        recent = deque(maxlen=256)
 
-        def handler(data):
-            if not isinstance(data, dict) or data.get("pty") != sid:
+        def _emit(chunks):
+            # 重排缓冲（或无 seq 兜底）放行一批按序 chunk
+            for chunk in chunks:
+                if on_data is not None:
+                    try:
+                        on_data(chunk)
+                    except Exception:
+                        pass
+            if chunks:
+                with self._lock:
+                    self._frames += len(chunks)
+
+        reorder = _PtyReorderBuffer(_emit)
+        self._reorder = reorder
+
+        def handle_one(data):
+            # 非赢家服务端的帧（含 end）一律丢弃：影子 PTY 退出不能终止
+            # 本视图，它的输出流更不能进重排缓冲制造缺口/错位。
+            _ow = data.get("owner")
+            if _ow is not None and self.owner and _ow != self.owner:
+                self.foreign_frames += 1
                 return
             if data.get("end"):
                 self.end_reason = data.get("reason") or "end"
@@ -1728,19 +1922,26 @@ class RemotePty:
                         pass
                 return
             seq = data.get("seq")
-            if seq is not None:
-                if seq in recent:
-                    return  # 多 broker 重复送达
-                recent.append(seq)
             chunk = wire_to_bytes(data.get("d"))
-            if chunk:
-                with self._lock:
-                    self._frames += 1
-                if on_data is not None:
-                    try:
-                        on_data(chunk)
-                    except Exception:
-                        pass
+            if not chunk:
+                return
+            if seq is not None:
+                # 按 seq 重排后再渲染：跨 broker 乱序的 CSI 分片不能直接写终端
+                reorder.add(seq, chunk)
+            else:
+                _emit([chunk])
+
+        def handler(data):
+            if not isinstance(data, dict) or data.get("pty") != sid:
+                return
+            if not self._owner_ready:
+                # 握手首包未到、属主未定：多个应答者的 shell 启动输出可能
+                # 已在飞，先缓存，定主后按 owner 过滤再重放，保证首屏干净。
+                self._pending_frames.append(data)
+                if len(self._pending_frames) > 4096:
+                    del self._pending_frames[:-2048]
+                return
+            handle_one(data)
 
         self._handler = handler
         # 先订阅再启动，避免丢失最早的输出
@@ -1755,7 +1956,11 @@ class RemotePty:
                    "heartbeat": max(0.0, float(heartbeat))}
         code = build_pty_start_code(payload)
         try:
-            resp = self.tr.request(code, req_timeout)
+            request_many = getattr(self.tr, "request_many", None)
+            if callable(request_many) and owner_gather > 0:
+                resp, extras = request_many(code, req_timeout, owner_gather)
+            else:
+                resp, extras = self.tr.request(code, req_timeout), []
             if not resp:
                 raise RemoteTimeout("PTY 启动请求超时无回包")
             try:
@@ -1775,15 +1980,33 @@ class RemotePty:
         self.in_topic = in_topic
         self.out_topic = out_topic
         self.server_info = env
+        self.owner = env.get("owner")
+        self.responders = _parse_pty_responders(resp, extras)
+        # 定主：放行为后续帧，并重放定主前缓存（影子 PTY 的早期帧在此被滤掉）
+        self._owner_ready = True
+        pending = self._pending_frames
+        self._pending_frames = []
+        for fr in pending:
+            handle_one(fr)
+        if self.owner:
+            # 立即发一帧 claim：影子服务端在下一次按键/resize 之前就自杀，
+            # 不用等 0.25s 的 resize_watch 兜底
+            try:
+                self._publish_input({"pty": sid, "claim": True})
+            except Exception:
+                pass
         return env
 
     def _publish_input(self, payload: dict) -> None:
-        """上行帧唯一出口：打单调 ``iseq`` 后发出。
+        """上行帧唯一出口：打单调 ``iseq``、盖 ``owner`` 后发出。
 
         PTY 帧没有 req_id，不经过网络层的首帧去重，而 publish 会广播到
         所有 broker，同一帧必然被服务端收多份；序号让服务端只放行首帧。
+        owner 让同时应答的影子 PTY 收到第一帧即自杀。
         """
         with self._ilock:
+            if self.owner:
+                payload["owner"] = self.owner
             payload["iseq"] = self._iseq
             self._iseq += 1
         self.tr.publish(self.in_topic, payload)
@@ -1830,4 +2053,11 @@ class RemotePty:
                 self.tr.stream_unsubscribe(self.out_topic, self._handler)
             except Exception:
                 pass
+        if self._reorder is not None:
+            self._reorder.close()
+            self._reorder = None
         self.sid = None
+        self.owner = None
+        self._owner_ready = False
+        self._pending_frames = []
+        self.foreign_frames = 0

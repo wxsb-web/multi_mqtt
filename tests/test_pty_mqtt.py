@@ -4,13 +4,14 @@
 
 分三部分：
 1. RemotePtyClientTests —— 全平台可跑：用 FakeTransport 测客户端协商逻辑
-   （iseq 打号、下行 seq 去重、心跳/end 帧、握手失败清理、close 行为）。
-   不连任何 broker，不需要 POSIX。
+   （iseq 打号、下行 seq 去重/乱序重排/丢帧跳号、心跳/end 帧、握手失败
+   清理、close 行为）。不连任何 broker，不需要 POSIX。
 2. PtyTemplateStaticTests —— 全平台可跑：模板编译与关键防护标记的静态检查。
 3. PtyTemplateLiveTests —— 仅 POSIX：在 PythonExecutor 的持久命名空间里
    真实执行 _PTY_START_TEMPLATE（真 openpty + fork /bin/sh + 三个线程），
    用 FakeNet 模拟服务端 mqtt_net，覆盖：
-     - 按键回显 / iseq 多副本首帧去重 / winsz / stop→end
+     - 按键回显 / iseq 单调闸门（多副本去重 + 旧 winsz 乱序迟到不得生效）
+       / winsz / stop→end
      - 心跳帧
      - cwd 不存在回退 HOME（不报错、不退出）
      - 重复握手路由幂等（RecursionError 回归测试）
@@ -29,13 +30,13 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from remote_cmd import (  # noqa: E402
+from client.remote_cmd import (  # noqa: E402
     RemotePty, Transport, RemoteError, RemoteTimeout, RemoteOpError,
     build_pty_start_code, PTY_FRAME_MAX,
 )
 from rpc_executor import PythonExecutor  # noqa: E402
 from multi_mqtt import BROKER_LIST  # noqa: E402
-import pty_client_mqtt as pcm  # noqa: E402
+from client import pty_client_mqtt as pcm  # noqa: E402
 
 IS_POSIX = os.name == "posix"
 
@@ -59,14 +60,23 @@ class FakeTransport(Transport):
 
     def __init__(self, response=None):
         self.response = response
-        self.requests = []        # [(code, timeout)]，记录调用顺序
-        self.published = []       # [(topic, payload)]
-        self.events = []          # 订阅/退订事件，保序
+        self.extra_responses = []  # 其他服务端的迟到握手回包
+        self.prefetch = []         # request_many 期间同步下发的帧（模拟首屏）
+        self.requests = []         # [(code, timeout)]，记录调用顺序
+        self.published = []        # [(topic, payload)]
+        self.events = []           # 订阅/退订事件，保序
         self._handlers = {}
 
     def request(self, code, timeout=60):
         self.requests.append((code, timeout))
         return self.response
+
+    def request_many(self, code, timeout=60, gather=0.8):
+        self.requests.append((code, timeout, gather))
+        for topic, data in list(self.prefetch):
+            self.emit(topic, data)
+        self.prefetch = []
+        return self.response, list(self.extra_responses)
 
     def publish(self, topic, payload):
         self.published.append((topic, dict(payload)))
@@ -85,9 +95,20 @@ class FakeTransport(Transport):
             h(data)
 
 
-def _open_pty(transport, sid="pty-test-1", **open_kw):
+def _wait_until(pred, timeout=2.0, step=0.02):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(step)
+    return False
+
+
+def _open_pty(transport, sid="pty-test-1", env_extra=None, **open_kw):
     """用罐头回包完成一次 RemotePty.open，返回 (pty, env, 收到的数据列表)。"""
     env = _canned_env(sid)
+    if env_extra:
+        env.update(env_extra)
     transport.response = {"r": json.dumps(env), "ok": True}
     received = []
     heartbeats = []
@@ -121,12 +142,47 @@ class RemotePtyClientTests(unittest.TestCase):
         pty, _, got, _ = _open_pty(tr, "pty-seq-1")
         self.addCleanup(lambda: pty.close())
         out = "pty/pty-seq-1/out"
-        # seq=7 来 3 份（多 broker 重复），seq=8 一份，乱序迟到的 seq=7 再一份
-        tr.emit(out, {"pty": "pty-seq-1", "seq": 7, "d": "A"})
-        tr.emit(out, {"pty": "pty-seq-1", "seq": 7, "d": "A"})
-        tr.emit(out, {"pty": "pty-seq-1", "seq": 8, "d": "B"})
-        tr.emit(out, {"pty": "pty-seq-1", "seq": 7, "d": "A"})
+        # seq=0 来 3 份（多 broker 重复），seq=1 一份，乱序迟到的 seq=0 再一份
+        tr.emit(out, {"pty": "pty-seq-1", "seq": 0, "d": "A"})
+        tr.emit(out, {"pty": "pty-seq-1", "seq": 0, "d": "A"})
+        tr.emit(out, {"pty": "pty-seq-1", "seq": 1, "d": "B"})
+        tr.emit(out, {"pty": "pty-seq-1", "seq": 0, "d": "A"})
         self.assertEqual(b"".join(got), b"AB")
+
+    def test_downlink_reorders_out_of_order_frames(self):
+        # 不同 broker 路径延迟抖动让后发帧先到：必须按 seq 重排后再渲染，
+        # 否则跨 chunk 的 CSI 转义序列会把终端状态机打坏（进度条错位）。
+        tr = FakeTransport()
+        pty, _, got, _ = _open_pty(tr, "pty-reorder-1")
+        self.addCleanup(lambda: pty.close())
+        out = "pty/pty-reorder-1/out"
+        tr.emit(out, {"pty": "pty-reorder-1", "seq": 1, "d": "B"})
+        tr.emit(out, {"pty": "pty-reorder-1", "seq": 0, "d": "A"})
+        tr.emit(out, {"pty": "pty-reorder-1", "seq": 3, "d": "D"})
+        tr.emit(out, {"pty": "pty-reorder-1", "seq": 2, "d": "C"})
+        self.assertEqual(b"".join(got), b"ABCD")
+        # 全部连续补齐后不应留下等待跳号的定时器
+        self.assertIsNone(pty._reorder._timer)
+        self.assertEqual(pty._reorder._pending, {})
+
+    def test_downlink_gap_skips_after_timeout_instead_of_stalling(self):
+        # 中间帧真被 broker 丢掉：短暂等待后跳号放行，输出不能永久卡死
+        from client.remote_cmd import _PtyReorderBuffer
+        _PtyReorderBuffer.GAP_TIMEOUT = 0.2
+        self.addCleanup(
+            setattr, _PtyReorderBuffer, "GAP_TIMEOUT", 0.75)
+        tr = FakeTransport()
+        pty, _, got, _ = _open_pty(tr, "pty-gap-1")
+        self.addCleanup(lambda: pty.close())
+        out = "pty/pty-gap-1/out"
+        tr.emit(out, {"pty": "pty-gap-1", "seq": 10, "d": "X"})
+        self.assertEqual(got, [])  # 缺口未补齐前先缓存
+        self.assertTrue(_wait_until(lambda: bool(got), timeout=2.0))
+        self.assertEqual(b"".join(got), b"X")
+        # 跳号后迟到的 seq=10 副本必须丢弃
+        tr.emit(out, {"pty": "pty-gap-1", "seq": 10, "d": "X"})
+        tr.emit(out, {"pty": "pty-gap-1", "seq": 11, "d": "Y"})
+        self.assertEqual(b"".join(got), b"XY")
 
     def test_heartbeat_frames_update_liveness_without_data(self):
         tr = FakeTransport()
@@ -167,6 +223,88 @@ class RemotePtyClientTests(unittest.TestCase):
         for _, frame in tr.published:
             self.assertNotIn("req_id", frame)
             self.assertNotIn("code", frame)
+
+    # ---- 多应答者归属仲裁（owner/claim） ----
+
+    def test_open_sends_claim_and_all_uplink_frames_carry_owner(self):
+        tr = FakeTransport()
+        pty, _, _, _ = _open_pty(tr, "pty-owner-1",
+                                 env_extra={"owner": "aaaaaa", "host": "h1",
+                                            "pid": 111})
+        self.addCleanup(lambda: pty.close())
+        self.assertEqual(pty.owner, "aaaaaa")
+        # open 一结束立即发 claim（iseq=0），影子服务端在首个按键前就自杀
+        first = tr.published[0][1]
+        self.assertEqual(first, {"pty": "pty-owner-1", "owner": "aaaaaa",
+                                 "iseq": 0, "claim": True})
+        pty.send(b"x")
+        pty.resize(30, 100)
+        self.assertEqual([f["owner"] for _, f in tr.published[1:]],
+                         ["aaaaaa", "aaaaaa"])
+        self.assertEqual([f["iseq"] for _, f in tr.published], [0, 1, 2])
+
+    def test_foreign_owner_downlink_frames_dropped_including_end(self):
+        # 影子 PTY 的输出帧和它的 end 帧都不能影响本视图
+        tr = FakeTransport()
+        pty, _, got, _ = _open_pty(tr, "pty-owner-2",
+                                   env_extra={"owner": "win1"})
+        self.addCleanup(lambda: pty.close())
+        out = "pty/pty-owner-2/out"
+        tr.emit(out, {"pty": "pty-owner-2", "owner": "shadow-x",
+                      "seq": 0, "d": "GHOST"})
+        tr.emit(out, {"pty": "pty-owner-2", "owner": "shadow-x",
+                      "end": True, "reason": "claim_lost"})
+        self.assertEqual(got, [])
+        self.assertIsNone(pty.end_reason)
+        self.assertEqual(pty.foreign_frames, 2)
+        # 赢家的流照常渲染
+        tr.emit(out, {"pty": "pty-owner-2", "owner": "win1",
+                      "seq": 0, "d": "ok"})
+        self.assertEqual(b"".join(got), b"ok")
+
+    def test_ownerless_old_server_backward_compatible(self):
+        # 旧服务端回包/帧不带 owner：不发 claim，下行照旧放行
+        tr = FakeTransport()
+        pty, _, got, _ = _open_pty(tr, "pty-ownerless-1")
+        self.addCleanup(lambda: pty.close())
+        self.assertIsNone(pty.owner)
+        self.assertFalse(any(f.get("claim") for _, f in tr.published))
+        tr.emit("pty/pty-ownerless-1/out",
+                {"pty": "pty-ownerless-1", "seq": 0, "d": "legacy"})
+        self.assertEqual(b"".join(got), b"legacy")
+
+    def test_multiple_handshake_responders_parsed_winner_first(self):
+        tr = FakeTransport()
+        tr.extra_responses = [{
+            "r": json.dumps(_canned_env(
+                "pty-multi-1", owner="bbbbbb", host="host-b", pid=222)),
+            "ok": True}]
+        pty, _, _, _ = _open_pty(
+            tr, "pty-multi-1",
+            env_extra={"owner": "aaaaaa", "host": "host-a", "pid": 111})
+        self.addCleanup(lambda: pty.close())
+        self.assertEqual(
+            [(r["owner"], r["host"], r["pid"], r["winner"])
+             for r in pty.responders],
+            [("aaaaaa", "host-a", 111, True),
+             ("bbbbbb", "host-b", 222, False)])
+
+    def test_prefetch_frames_buffered_until_owner_then_ghosts_filtered(self):
+        # 握手回包到达前（属主未定）就已经在飞的首屏帧：先缓存，定主后重放，
+        # 其中影子 PTY 的早期帧必须被滤掉，不进屏幕/不制造 seq 缺口。
+        tr = FakeTransport()
+        sid = "pty-prefetch-1"
+        out = "pty/%s/out" % sid
+        tr.prefetch = [
+            (out, {"pty": sid, "owner": "shadow", "seq": 0, "d": "G"}),
+            (out, {"pty": sid, "owner": "win", "seq": 0, "d": "W"}),
+        ]
+        pty, _, got, _ = _open_pty(
+            tr, sid, env_extra={"owner": "win"})
+        self.addCleanup(lambda: pty.close())
+        self.assertEqual(b"".join(got), b"W")
+        self.assertEqual(pty.foreign_frames, 1)
+        self.assertEqual(pty._pending_frames, [])
 
     def test_send_before_open_raises(self):
         pty = RemotePty(FakeTransport(), timeout=2)
@@ -268,9 +406,23 @@ class PtyTemplateStaticTests(unittest.TestCase):
         self.assertIn("_cwd_warn", self.code)
         self.assertIn("cwd_warning", self.code)
 
-    def test_uplink_iseq_dedup_present(self):
-        self.assertIn("_iseq_recent", self.code)
+    def test_uplink_iseq_monotonic_gate_present(self):
+        # iseq 单调闸门：既去多 broker 重复，也拦乱序迟到的旧帧（旧 winsz
+        # 晚到覆盖新尺寸会让远端 PTY 比本地窗口宽，进度条全线错位）
+        self.assertIn("_iseq_last", self.code)
+        self.assertIn("_iq <= _iseq_last", self.code)
+        self.assertNotIn("_iseq_recent", self.code)
         self.assertIn('"iseq"', self.code.replace("'", '"'))
+
+    def test_owner_arbitration_present(self):
+        # 多应答者归属仲裁：进程稳定 uid、下行帧盖 owner、外来 owner 帧
+        # 让影子 PTY 自杀、同进程同 sid 幂等注册表
+        self.assertIn("_cmq_server_uid", self.code)
+        self.assertIn("_cmq_pty_sessions", self.code)
+        self.assertIn("claim_lost", self.code)
+        self.assertIn("_ow != _uid", self.code)
+        self.assertIn('"owner": _uid', self.code)
+        self.assertIn('"owner": _uid, "host": _host', self.code)
 
 
 # ============================ 3. 服务端模板真机测试（仅 POSIX） ============================
@@ -374,18 +526,24 @@ if IS_POSIX:
             frame.update(partial)
             self.net.deliver("pty/%s/in" % sid, frame)
 
-        def _type(self, sid, iseq, text):
-            self._send(sid, {"iseq": iseq, "k": text})
+        def _type(self, sid, iseq, text, owner=None):
+            fr = {"iseq": iseq, "k": text}
+            if owner is not None:
+                fr["owner"] = owner
+            self._send(sid, fr)
 
-        def _assert_echo(self, sid, marker, iseq, timeout=5.0):
-            self._type(sid, iseq, "echo %s\r" % marker)
+        def _assert_echo(self, sid, marker, iseq, timeout=5.0, owner=None):
+            self._type(sid, iseq, "echo %s\r" % marker, owner=owner)
             self.assertTrue(
                 _wait_for(lambda: marker in _out_text(self.net, sid), timeout),
                 "PTY 未在 %.0fs 内回显 %s，实际输出: %r"
                 % (timeout, marker, _out_text(self.net, sid)))
 
-        def _stop(self, sid, iseq=9999):
-            self._send(sid, {"iseq": iseq, "stop": True})
+        def _stop(self, sid, iseq=9999, owner=None):
+            fr = {"iseq": iseq, "stop": True}
+            if owner is not None:
+                fr["owner"] = owner
+            self._send(sid, fr)
             self.assertTrue(
                 _wait_for(lambda: _end_frame(self.net, sid) is not None, 5.0),
                 "stop 后未收到 end 帧")
@@ -427,6 +585,84 @@ if IS_POSIX:
             # 改尺寸后会话必须仍然活着、能正常读写
             self._assert_echo(sid, "ZZSIZE42", iseq=2)
             self._stop(sid, iseq=3)
+
+        def test_winsz_out_of_order_older_size_must_not_win(self):
+            # 界面错乱回归：拖窗口时慢 broker 把旧的（更大）winsz 晚投递到，
+            # 服务端 iseq 单调闸门必须丢掉它，PTY 最终尺寸以新帧为准。
+            sid = "pty-live-winsz-reorder"
+            self._start(sid)
+            self._send(sid, {"iseq": 1, "winsz": [40, 200]})
+            self._send(sid, {"iseq": 2, "winsz": [20, 100]})
+            # iseq=1 的旧尺寸再经慢 broker 送达（重复/乱序迟到同一处理路径）
+            self._send(sid, {"iseq": 1, "winsz": [40, 200]})
+            time.sleep(0.3)
+            self._type(sid, 3, "stty size\r")
+            self.assertTrue(
+                _wait_for(lambda: "20 100" in _out_text(self.net, sid)),
+                "PTY 实际尺寸不是新帧的 20x100: %r"
+                % _out_text(self.net, sid))
+            self.assertNotIn("40 200", _out_text(self.net, sid),
+                             "旧 winsz 帧乱序迟到后覆盖了新尺寸")
+            self._stop(sid, iseq=4)
+
+        # ---- 多应答者归属仲裁（owner/claim） ----
+
+        def test_start_env_and_downlink_frames_carry_owner(self):
+            sid = "pty-live-owner"
+            env = self._start(sid)
+            self.assertTrue(env.get("owner"))
+            self.assertEqual(len(env["owner"]), 12)  # 6 字节 urandom.hex
+            self.assertTrue(env.get("host"))
+            self._assert_echo(sid, "ZZOWNER42", iseq=0)
+            # 输出/心跳/end 全部盖 owner，客户端才能按属主过滤影子流
+            frames = self.net.frames("pty/%s/out" % sid)
+            self.assertTrue(frames)
+            self.assertTrue(all(d.get("owner") == env["owner"]
+                                for _, d in frames))
+            self._stop(sid, iseq=1, owner=env["owner"])
+            self.assertEqual(_end_frame(self.net, sid).get("owner"),
+                             env["owner"])
+
+        def test_winner_claim_is_harmless_foreign_claim_kills_shadow(self):
+            sid = "pty-live-claim"
+            env = self._start(sid)
+            owner = env["owner"]
+            # 赢家自己的 claim 帧绝不能误杀会话
+            self._send(sid, {"iseq": 1, "owner": owner, "claim": True})
+            time.sleep(0.3)
+            self.assertIsNone(_end_frame(self.net, sid))
+            self._assert_echo(sid, "ZZCLAIMOK", iseq=2, owner=owner)
+            # 外来 owner（同时应答的另一进程）→ 本 PTY 判定自己是影子，
+            # 立即 claim_lost 结束并停止往同一 out topic 推流
+            self._send(sid, {"iseq": 3, "owner": "ffffffdeadbe",
+                             "claim": True})
+            self.assertTrue(
+                _wait_for(lambda: _end_frame(self.net, sid) is not None),
+                "影子 PTY 未在收到外来 owner 帧后自杀")
+            self.assertEqual(_end_frame(self.net, sid).get("reason"),
+                             "claim_lost")
+
+        def test_duplicate_handshake_same_sid_returns_existing_session(self):
+            # 同进程内同一 sid 重复握手（任何重复执行兜底）：返回既有会话，
+            # 不得再开第二个往同 topic 推流的 PTY
+            sid = "pty-live-dup"
+            in_t, out_t = "pty/%s/in" % sid, "pty/%s/out" % sid
+            payload = {
+                "sid": sid, "in_topic": in_t, "out_topic": out_t,
+                "rows": 24, "cols": 80, "shell": "/bin/sh", "term": "xterm",
+                "cwd": None, "login": False, "flush_interval": 0.0,
+                "ttl": 3600, "frame_max": PTY_FRAME_MAX, "heartbeat": 0.0,
+            }
+            env1 = self._start(sid)
+            resp2 = PythonExecutor(globals=self.ns).execute(
+                build_pty_start_code(payload))
+            self.assertTrue(resp2["ok"])
+            env2 = json.loads(resp2["r"])
+            self.assertTrue(env2["ok"])
+            self.assertEqual(env2, env1)  # 同一个会话（含同一 pid/owner）
+            # 会话照常工作
+            self._assert_echo(sid, "ZZDUPHAND", iseq=0, owner=env1["owner"])
+            self._stop(sid, iseq=1, owner=env1["owner"])
 
         def test_in_topic_is_subscribed_and_routed_off_rpc_path(self):
             sid = "pty-live-route"

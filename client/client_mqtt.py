@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-from multi_mqtt import MultiMQTTManager, get_req_id, utc_ms, get_standard_pem_bytes,get_duplicated_kargs
 import argparse,time,threading,os, sys, logging, codeop, importlib,builtins as _builtins
+
+# 本模块已迁移到 client/ 子目录：把项目根目录与本目录加入 sys.path，
+# 同时兼容「python client/client_mqtt.py」直接运行与「from client import ...」包导入。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.dirname(_HERE), _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from multi_mqtt import MultiMQTTManager, get_req_id, utc_ms, get_standard_pem_bytes,get_duplicated_kargs
 
 logger = logging.getLogger(__file__)
 from server_mqtt import REQUEST_TOPIC, DEFAULT_REPLY_TOPIC as REPLY_TOPIC
@@ -21,6 +29,21 @@ alias_status       =('status','state','s')
 alias_help         =('help','h','?')
 alias_exit         =('exit', 'quit')
 alias_timeout      =('timeout','time','wait','second','sec')
+
+def _cli_opts(*names):
+    """从别名生成 argparse 选项：自动加 --/- 前缀，_ 与 - 都支持；单字符只出 -x。
+
+    模块级唯一实现，client_mqtt 自己的 CLI 以及 cmd_client_mqtt /
+    pty_client_mqtt 的连接参数都通过它 + 上面的 alias_xxx 别名表生成，
+    保证三处（rpc(**ka) / CLI / %magic）参数名永远一致。
+    """
+    out, seen = [], set()
+    for n in names:
+        for f in (n, n.replace('_', '-')):
+            for c in (('-' + f,) if len(f) == 1 else ('--' + f, '-' + f)):
+                if c not in seen:
+                    seen.add(c); out.append(c)
+    return out
 
 _default_client = None
 _default_client_lock = threading.Lock()
@@ -84,12 +107,19 @@ class MQTTClientNode:
         cost_ms = (time.perf_counter() - req_ctx['start_time']) * 1000
         resp["latency_ms"] = round(cost_ms, 2)
         resp["client_from"] = rx_broker
+        if req_ctx.get("response") is not None:
+            # 首包已回收：同 req_id 的后续回包来自其他持相同 key 的服务端
+            # 进程（一个请求会被每台在线设备各执行一次）。调用方开了
+            # gather_window 时把这些迟到回包收集起来做归属仲裁，不覆盖首包。
+            with self.lock:
+                req_ctx.setdefault("extras", []).append(resp)
+            return
         req_ctx['response'] = resp
         req_ctx['event'].set()
 
     def request(self, payload: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_TIMEOUT,
                 client_private_key_bytes=None, allow_no_server_pubkey_response: bool = None,
-                reply_topic: str = REPLY_TOPIC):
+                reply_topic: str = REPLY_TOPIC, gather_window: float = 0.0):
         none={}
         if client_private_key_bytes is None:
             client_private_key_bytes = self.client_private_key_bytes or getattr(self.mqtt_net, "client_private_key_bytes", None)
@@ -101,6 +131,7 @@ class MQTTClientNode:
         req_data = {"req_id": req_id, "reply_topic": reply_topic, "code": payload, "timestamp": ms}
         event = threading.Event()
         req_ctx = {"event": event, "start_time": start_time, "response": None,
+                   "extras": [],
                    "client_private_key_bytes": client_private_key_bytes,
                    "allow_no_server_pubkey_response": allow_no_server_pubkey_response}
         with self.lock:
@@ -129,6 +160,10 @@ class MQTTClientNode:
                 if event.wait(timeout=0.2):
                     is_success = True
                     break
+            if is_success and gather_window > 0:
+                # 首包到手后再留一个小窗：其他持相同 key 的服务端进程对同
+                # 一请求的迟到回包在此到齐（PTY 多应答者归属仲裁用）。
+                time.sleep(min(gather_window, max(0.0, timeout - (time.perf_counter() - start_t))))
         except KeyboardInterrupt:
             logger.warning(f"⚠️ [请求中断] {request_topic} req_id={req_id}")
             print("[INFO] 用户中断等待，已停止本次请求。")
@@ -137,6 +172,10 @@ class MQTTClientNode:
             with self.lock:
                 self.pending_requests.pop(req_id, None)
         if is_success:
+            if gather_window > 0:
+                first = dict(req_ctx['response'])
+                first["_extra_responses"] = list(req_ctx.get("extras", []))
+                return first
             return req_ctx['response']
         logger.error(f"❌ [请求超时] {request_topic} req_id={req_id}")
         return none
@@ -550,16 +589,6 @@ def _fallback_code_input():
         prompt = "... "
 
 if __name__ == "__main__":
-    def _cli_opts(*names):
-        """从别名生成 argparse 选项：自动加 --/- 前缀，_ 与 - 都支持；单字符只出 -x。"""
-        out, seen = [], set()
-        for n in names:
-            for f in (n, n.replace('_', '-')):
-                for c in (('-' + f,) if len(f) == 1 else ('--' + f, '-' + f)):
-                    if c not in seen:
-                        seen.add(c); out.append(c)
-        return out
-
     parser = argparse.ArgumentParser(description="MQTT RPC client")
     parser.add_argument(
         *_cli_opts(*alias_private_key),
@@ -578,12 +607,12 @@ if __name__ == "__main__":
     parser.add_argument(
         *_cli_opts(*alias_request_topic),
         type=str, default=REQUEST_TOPIC, dest="request_topic",
-        help=f"REPL 起始 request_topic（默认 {REQUEST_TOPIC}）；运行中可用 %topic 切换。",
+        help=f"REPL 起始 request_topic（默认 {REQUEST_TOPIC}）；运行中可用 %%topic 切换。",
     )
     parser.add_argument(
         *_cli_opts(*alias_reply_topic),
         type=str, default=REPLY_TOPIC, dest="reply_topic",
-        help=f"REPL 起始 reply_topic（默认 {REPLY_TOPIC}）；运行中可用 %reply 切换。",
+        help=f"REPL 起始 reply_topic（默认 {REPLY_TOPIC}）；运行中可用 %%reply 切换。",
     )
     parser.add_argument(
         *_cli_opts(*alias_history),

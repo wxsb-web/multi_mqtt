@@ -15,9 +15,30 @@
 
 用法
 ====
-    python pty_client_mqtt.py                    # 交互式 PTY（默认参数）
-    python pty_client_mqtt.py -i 0.2             # 服务端最多 0.2s 攒批
-    python pty_client_mqtt.py --shell /bin/bash --cwd /root
+    python client/pty_client_mqtt.py                    # 交互式 PTY（默认参数）
+    python client/pty_client_mqtt.py -i 0.2             # 服务端最多 0.2s 攒批
+    python client/pty_client_mqtt.py --shell /bin/bash --cwd /root
+
+AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
+====================================================
+本进程启动时内置一个本地 HTTP RPC 口（默认 1188）。人类先在一个终端里
+开着本窗口，AI / 其他进程不新建 MQTT 连接，直接 HTTP 复用同一个 PTY，
+命令回显与输出照样在本窗口实时可见：
+
+    from client.pty_client_mqtt import ai_pty_run, ai_pty_status, ai_pty_send
+    ai_pty_status()                 # {'attached': True, 'brokers_online': 13, ...}
+    ai_pty_run("uname -a")          # -> {'ok': True, 'rc': 0, 'out': '...'}
+    ai_pty_run("apt install -y htop", timeout=300)
+    ai_pty_send("y\\n")             # 回答交互提示（密码/确认）
+
+裸 HTTP 等价写法（POST 一段 Python 到本地口）：
+
+    curl "http://127.0.0.1:1188/$(python -c \
+"import urllib.parse;print(urllib.parse.quote('import json;p.set_data(json.dumps(ai_bridge.run(\\\"uname -a\\\"),ensure_ascii=False))'))")"
+
+注意：AI 命令串行执行（一个 shell），重叠调用立刻返回 busy；run() 只
+回收非交互命令的输出，vim/top 等全屏程序请人工在窗口里操作。仅本机
+调用建议 --host 127.0.0.1。
 
 断开
 ====
@@ -34,17 +55,27 @@ from __future__ import annotations
 import argparse
 import os
 import queue
+import re
+import shlex
 import shutil
 import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 本文件已迁移到 client/ 子目录：把项目根目录与本目录加入 sys.path，
+# 同时兼容「python client/pty_client_mqtt.py」直接运行与包导入。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.dirname(_HERE), _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+# 直接按脚本启动时没有包上下文，相对导入会失败，显式补上。
+if not __package__:
+    __package__ = "client"
 
-from cmd_client_mqtt import (           # noqa: E402
-    MqttTransport, DEFAULT_REQUEST_TOPIC, DEFAULT_REPLY_TOPIC, DEFAULT_KEY,
+from .cmd_client_mqtt import (              # noqa: E402
+    MqttTransport, add_connection_args,
 )
-from remote_cmd import (                # noqa: E402
+from .remote_cmd import (                   # noqa: E402
     RemotePty, RemoteError, DEFAULT_PTY_TTL,
 )
 
@@ -178,6 +209,221 @@ def _info(msg):
     sys.stderr.flush()
 
 
+# ============================ AI 桥：外部进程复用本常驻 PTY ============================
+
+# CSI / SGR / OSC / 单字符转义，用于把 AI 收回的终端字节还原成纯文本
+_ANSI_RE = re.compile(rb"\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])")
+
+
+def _strip_ansi(b: bytes) -> str:
+    return _ANSI_RE.sub(b"", b).replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode("utf-8", "replace")
+
+
+class AIBridge:
+    """把这个常驻 PTY 暴露给 AI / 外部进程调用，命令全程可见。
+
+    背景：每次 ``python cmd_client_mqtt.py`` 都是新进程，要重新并发连接
+    十几个公共 broker（首个上线通常 <1s，慢时数秒）。本进程启动时已内置
+    一个本地 HTTP RPC 端口（默认 1188，见 main 的 server_http），外部
+    进程**不新建 MQTT 连接**，HTTP 下发一行 Python 即可复用本 PTY：
+
+        import json
+        p.set_data(json.dumps(ai_bridge.run("uname -a"), ensure_ascii=False))
+        ai_bridge.send("y\\n")      # 给交互提示喂键（密码/y/n）
+        ai_bridge.status()          # 会话存活 / broker 在线数 / 是否忙
+
+    run() 把命令包在一对随机标记之间写入同一个常驻 shell，回收两个标记
+    之间的输出与退出码；输入回显和输出照样实时渲染在监控窗口。PTY 只有
+    一个 shell，命令用锁串行化，重叠调用立刻拿到 busy 而不是互相串台。
+    """
+
+    def __init__(self):
+        self.pty = None
+        self.transport = None
+        self._listeners = []
+        self._llock = threading.Lock()
+        self._busy = threading.Lock()
+
+    # ---- 会话侧调用（run_session 内挂载） ----
+
+    def attach(self, pty, transport):
+        self.pty = pty
+        self.transport = transport
+
+    def feed(self, chunk: bytes):
+        """PTY 下行分流：主窗口渲染之外，给每个 run() 收集器一份副本。"""
+        with self._llock:
+            qs = list(self._listeners)
+        for q in qs:
+            try:
+                q.put_nowait(chunk)
+            except queue.Full:
+                pass
+
+    # ---- AI 侧调用（经本地 HTTP RPC 进入本进程） ----
+
+    def status(self) -> dict:
+        pty, tr = self.pty, self.transport
+        online, total, hosts = _broker_status(tr) if tr is not None else (0, 0, [])
+        return {
+            "ok": True,
+            "attached": pty is not None,
+            "end_reason": getattr(pty, "end_reason", None),
+            "busy": self._busy.locked(),
+            "sid": getattr(pty, "sid", None),
+            "brokers_online": online,
+            "brokers_total": total,
+            "brokers": hosts,
+        }
+
+    def send(self, data) -> dict:
+        """原样发按键/字节，不做标记回收（回答密码、y/n、进 vim 后操作等）。"""
+        pty = self.pty
+        if pty is None or getattr(pty, "end_reason", None):
+            return {"ok": False,
+                    "error": "pty 未连接或已结束: %s" % getattr(pty, "end_reason", None)}
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        pty.send(bytes(data))
+        return {"ok": True, "sent": len(data)}
+
+    def run(self, cmd, timeout: float = 60.0, acquire_timeout: float = 2.0) -> dict:
+        """在常驻 shell 里跑一条命令，等结束标记，返回 rc/输出；窗口全程可见。
+
+        - 超时只停止回收，不杀远端命令（输出继续在窗口里刷，可用 send 干预）；
+        - 退出码取自 ``sh -c '<cmd>'``，外层登录 shell 需为 POSIX 系（sh/bash）。
+        """
+        pty = self.pty
+        if pty is None:
+            return {"ok": False, "error": "pty 尚未连接"}
+        if pty.end_reason:
+            return {"ok": False, "error": "pty 已结束: %s" % pty.end_reason}
+        if not self._busy.acquire(timeout=max(0.0, float(acquire_timeout))):
+            return {"ok": False, "busy": True,
+                    "error": "busy：上一条 AI 命令尚未结束"}
+
+        tag = os.urandom(4).hex()
+        begin = "__AI_BEGIN_%s__" % tag
+        end = "__AI_END_%s__" % tag
+        q = self._add_listener()
+        line = ("echo %s; sh -c %s; __ai_rc=$?; echo %s:$__ai_rc\r"
+                % (begin, shlex.quote(str(cmd)), end))
+        buf = b""
+        timed_out = False
+        m_end = None
+        try:
+            pty.send(line.encode("utf-8"))
+            deadline = time.monotonic() + float(timeout)
+            end_re = re.compile(re.escape(end.encode()) + rb":(\d+)")
+            while True:
+                if pty.end_reason:
+                    break
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    timed_out = True
+                    break
+                try:
+                    chunk = q.get(timeout=min(0.5, remain))
+                except queue.Empty:
+                    continue
+                buf += chunk
+                m_end = end_re.search(buf)
+                if m_end:
+                    break
+        finally:
+            self._remove_listener(q)
+            self._busy.release()
+
+        # 真起点是「独占一行的 BEGIN + 换行」；输入回显里 BEGIN 后面是 ';'，
+        # 不会误中。结尾 END:<数字> 同理（回显里是 :$__ai_rc 字面量）。
+        m_begin = re.search(re.escape(begin.encode()) + rb"\r?\n", buf)
+        start = m_begin.end() if m_begin else 0
+        if m_end:
+            body, rc = buf[start:m_end.start()], int(m_end.group(1))
+        else:
+            body, rc = buf[start:], None
+        return {
+            "ok": rc == 0 if rc is not None else False,
+            "rc": rc,
+            "timed_out": timed_out,
+            "out": _strip_ansi(body).strip("\n"),
+            "raw_len": len(body),
+            "end_reason": pty.end_reason,
+        }
+
+    def _add_listener(self) -> queue.Queue:
+        q = queue.Queue(maxsize=20000)
+        with self._llock:
+            self._listeners.append(q)
+        return q
+
+    def _remove_listener(self, q: queue.Queue):
+        with self._llock:
+            try:
+                self._listeners.remove(q)
+            except ValueError:
+                pass
+
+
+# 模块级单例：必须在 main() 调 start_rpc_server 之前就存在，
+# 这样 HTTP RPC 的持久命名空间拿到的是本对象引用，会话建立后 attach 即生效。
+ai_bridge = AIBridge()
+
+
+# ==================== AI 桥调用方便捷函数（运行在外部调用方进程，只走本机 HTTP，不连 broker） ====================
+#
+# 与 AIBridge 本身（上面，运行在常驻窗口进程里）相反：下面这些函数给 AI /
+# 其他进程导入调用，一次 localhost HTTP 即复用常驻窗口的全部 broker 长连接。
+# 只用标准库 urllib，不依赖 requests。
+
+DEFAULT_AI_BASE = "http://127.0.0.1:1188/"
+
+
+def local_rpc(code, base=DEFAULT_AI_BASE, timeout=90):
+    """向常驻 pty_client_mqtt 的本地 HTTP RPC 口下发一段 Python 代码，返回响应文本。"""
+    import urllib.parse
+    import urllib.request
+    url = str(base).rstrip("/") + "/" + urllib.parse.quote(str(code), safe="")
+    # data=b"" 强制 POST；显式绕开系统代理（localhost 不该走代理）。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(url, data=b"", method="POST")
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _call_ai_bridge(expr, base=DEFAULT_AI_BASE, timeout=90):
+    """让窗口进程把表达式结果以 JSON 写回 body，本地解析成 dict。"""
+    import json
+    body = local_rpc(
+        "import json as _j; p.set_data(_j.dumps(%s, ensure_ascii=False))" % expr,
+        base=base, timeout=timeout)
+    return json.loads(body)
+
+
+def ai_pty_run(cmd, timeout=60, base=DEFAULT_AI_BASE, acquire_timeout=2):
+    """让常驻 PTY 窗口代跑一条 shell 命令。
+
+    返回 ``{'ok': bool, 'rc': int|None, 'out': str, 'timed_out': bool, ...}``；
+    命令回显与输出同时在窗口里可见。命令串行执行，重叠调用立即返回
+    ``{'ok': False, 'busy': True}``。
+    """
+    return _call_ai_bridge(
+        "ai_bridge.run(%r, timeout=%r, acquire_timeout=%r)"
+        % (str(cmd), float(timeout), float(acquire_timeout)),
+        base=base, timeout=float(timeout) + 30)
+
+
+def ai_pty_send(data, base=DEFAULT_AI_BASE, timeout=30):
+    """向常驻 PTY 原样喂键（str，如 ``"y\\n"`` / ``"\\x03"`` Ctrl-C），不回收输出。"""
+    return _call_ai_bridge("ai_bridge.send(%r)" % (str(data),),
+                           base=base, timeout=timeout)
+
+
+def ai_pty_status(base=DEFAULT_AI_BASE, timeout=15):
+    """查询常驻 PTY 状态：会话是否建立/已结束、是否忙、broker 在线数。"""
+    return _call_ai_bridge("ai_bridge.status()", base=base, timeout=timeout)
+
+
 # ============================ PTY 会话 ============================
 
 def _hard_exit(console, code: int, message: str, pty=None):
@@ -213,6 +459,9 @@ def _hard_exit(console, code: int, message: str, pty=None):
 
 def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     pty = RemotePty(transport, timeout=args.timeout)
+    # 挂到 AI 桥：外部经本地 HTTP RPC 调用 ai_bridge 即复用本 PTY，
+    # attach 放在 open 之前，保证最早的握手回显也能被 feed 分流到。
+    ai_bridge.attach(pty, transport)
     outq: "queue.Queue[bytes]" = queue.Queue()
     stop_ev = threading.Event()
     term = args.term or os.environ.get("TERM") or "xterm-256color"
@@ -231,6 +480,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     def on_data(chunk: bytes):
         signal_state["last"] = time.monotonic()
         outq.put(chunk)
+        ai_bridge.feed(chunk)
 
     def on_heartbeat(_ts):
         signal_state["last"] = time.monotonic()
@@ -254,6 +504,22 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         # 服务端对不存在的 cwd 已自行回退（HOME→/），会话照常用；只提示不退出
         banner += (f"[pty] 注意: {env['cwd_warning']}，"
                    f"已回退到 {env['cwd']}\n")
+    responders = getattr(pty, "responders", None) or []
+    if len(responders) > 1:
+        # 多个持相同 key 的服务端同时应答了握手：每个都开了 PTY 往同一
+        # topic 推流（界面重影/重复提示符的根源）。已按首个应答者定主，
+        # 影子端会在收到 claim/首个按键帧后自杀；但根因要人工清理。
+        winner = next((r for r in responders if r.get("winner")), responders[0])
+        banner += (
+            f"[pty][WARN] 检测到 {len(responders)} 个持相同 key 的服务端同时应答！"
+            f"仅保留 {winner.get('host')} pid={winner.get('pid')}，"
+            f"其余影子 PTY 已被通知立即关闭。\n")
+        for r in responders:
+            if not r.get("winner"):
+                banner += (f"           影子: {r.get('host')} pid={r.get('pid')} "
+                           f"owner={r.get('owner')}\n")
+        banner += ("           请停掉多余机器/容器上的旧 server_mqtt 进程，"
+                   "否则每次连接都会重复拉起并短暂干扰首屏。\n")
     if dead_timeout > 0:
         banner += (f"[pty] 心跳 {heartbeat:g}s：服务器关闭/断连后最多 "
                    f"{dead_timeout:g}s 自动退出\n")
@@ -280,8 +546,16 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
             stop_ev.set()
 
     def resize_watch():
-        last = (rows, cols)
-        while not stop_ev.wait(0.5):
+        # last=None：连 broker / 握手期间窗口可能已被拖动过，线程一启动
+        # 先无条件同步一次真实尺寸。
+        # 尺寸变化立即发 winsz；停稳后的几个 tick 再补发同尺寸、更高 iseq
+        # 的新帧兜底——多 broker 路径乱序时，配合服务端的 iseq 单调闸门，
+        # 保证最终生效的一定是当前尺寸：拖动时经慢 broker 迟到的旧（更大）
+        # 尺寸要么被服务端丢弃，要么被这里的补发覆盖，远端 PTY 不会被卡在
+        # 比本地窗口宽的尺寸上（否则 pip/gradle 的 \r 进度条会全线错位）。
+        last = None
+        resend = 0
+        while not stop_ev.wait(0.25):
             cur_sz = shutil.get_terminal_size((80, 24))
             cur = (cur_sz.lines, cur_sz.columns)
             if cur != last:
@@ -290,6 +564,13 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                 except Exception:
                     pass
                 last = cur
+                resend = 3
+            elif resend > 0:
+                try:
+                    pty.resize(cur[0], cur[1])
+                except Exception:
+                    pass
+                resend -= 1
 
     t_in = threading.Thread(target=input_loop, name="pty-input", daemon=True)
     t_resize = threading.Thread(target=resize_watch, name="pty-resize",
@@ -330,17 +611,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="pty_client_mqtt",
         description="PTY over MQTT：SSH 式远程交互终端（常驻 shell，逐键过 broker）")
-    # 连接参数（与 cmd_client_mqtt 一致）
-    p.add_argument("--request-topic", "--topic", "-t",
-                   default=DEFAULT_REQUEST_TOPIC)
-    p.add_argument("--reply-topic", "--reply", default=DEFAULT_REPLY_TOPIC)
-    p.add_argument("--key", "-k", default=DEFAULT_KEY,
-                   help="私钥：整数表达式/PEM/文件路径；空串不签名（默认）")
-    p.add_argument("--allow", "-a", dest="allow", action="store_true",
-                   default=True)
-    p.add_argument("--no-allow", dest="allow", action="store_false")
-    p.add_argument("--timeout", type=float, default=30.0,
-                   help="握手/问答等待秒数（默认 30）")
+    # 连接参数：选项名全部引用 client_mqtt 别名表，与 cmd_client_mqtt 共用同一份
+    add_connection_args(p, default_timeout=30.0)
     # PTY 参数
     p.add_argument("--shell", default="",
                    help="远端 shell，默认服务端用户登录 shell（$SHELL/passwd）")
@@ -364,8 +636,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--detach-key", default="\x1d",
                    help="本地强制脱离键（默认 Ctrl-]）")
                    
-    p.add_argument("--port", "-port", "-p", type=int, default=1188)
-    p.add_argument("--host", "-host", default="0.0.0.0")
+    p.add_argument("--port", "-port", "-p", type=int, default=1188,
+                   help="本地 AI 控制口 HTTP RPC 端口（默认 1188）；"
+                        "外部进程经它调用 ai_bridge 复用本 PTY，不再重连 broker；0=关闭")
+    p.add_argument("--host", "-host", default="0.0.0.0",
+                   help="本地 AI 控制口绑定地址（默认 0.0.0.0）；仅本机调用建议 --host 127.0.0.1")
                    
     return p
 
@@ -390,7 +665,12 @@ def main(argv=None) -> int:
     
     if args.port:
         import server_http
-        ghs=server_http.start_rpc_server(port=args.port,ip=args.host,globals=globals(),locals=locals(), )
+        # 注意：持久命名空间在此刻快照一次，ai_bridge 是模块级对象引用，
+        # 会话建立后 attach/feed 对 HTTP 调用方立即生效。
+        ghs = server_http.start_rpc_server(
+            port=args.port, ip=args.host, globals=globals(), locals=locals())
+        _info(f"本地 AI 控制口已开启：http://127.0.0.1:{args.port}/"
+              f"（示例：ai_bridge.run(\"uname -a\")；命令在本窗口实时可见）")
     
     _enable_output_vt()
     signed = bool(str(args.key or "").strip())

@@ -1,12 +1,16 @@
 import builtins
+import os
+import sys
 import threading
 import time
 import unittest
 from unittest.mock import Mock
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import ecdsa
 
-import client_mqtt
+from client import client_mqtt
 from multi_mqtt import MultiMQTTManager, get_standard_pem_bytes
 
 

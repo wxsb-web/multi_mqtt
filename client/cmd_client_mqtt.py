@@ -29,13 +29,21 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 本文件已迁移到 client/ 子目录：把项目根目录与本目录加入 sys.path，
+# 同时兼容「python client/cmd_client_mqtt.py」直接运行与包导入。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.dirname(_HERE), _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+# 直接按脚本启动时没有包上下文，相对导入会失败，显式补上。
+if not __package__:
+    __package__ = "client"
 
 logger = logging.getLogger("cmd_client_mqtt")
 
 from multi_mqtt import get_standard_pem_bytes  # noqa: E402
-import client_mqtt as _cm                        # noqa: E402  复用 REPL 基建
-from remote_cmd import (                        # noqa: E402
+from . import client_mqtt as _cm               # noqa: E402  复用 REPL 基建
+from .remote_cmd import (                      # noqa: E402
     Transport, RemoteShell as _RemoteShell, CmdResult,
     RemoteError, RemoteTimeout, RemoteRpcError, RemoteOpError, TransferTooLarge,
     DEFAULT_TIMEOUT, MAX_TRANSFER, WIRE_BUDGET,
@@ -102,6 +110,28 @@ class MqttTransport(Transport):
             client_private_key_bytes=self.key,
             allow_no_server_pubkey_response=self.allow_no_pub,
         )
+
+    def request_many(self, code: str, timeout: float = DEFAULT_TIMEOUT,
+                     gather: float = 0.8):
+        """PTY 握手专用可选能力：回收首包后再留 ``gather`` 秒收集其他持相同
+        key 的服务端进程的迟到回包，返回 ``(首包, 其余回包列表)``。
+
+        一个握手请求会被每台在线设备各执行一次；第二个回包证明存在影子
+        服务端（旧机器/旧容器/同机双进程），RemotePty 据此做归属仲裁。
+        """
+        resp = self.node.request(
+            code,
+            request_topic=self.request_topic,
+            reply_topic=self.reply_topic,
+            timeout=timeout,
+            client_private_key_bytes=self.key,
+            allow_no_server_pubkey_response=self.allow_no_pub,
+            gather_window=gather,
+        )
+        if not resp:
+            return None, []
+        extras = resp.pop("_extra_responses", None) or []
+        return resp, extras
 
     # ---- 可选能力：向任意 topic 发一帧（RemotePty 的按键/控制帧用） ----
 
@@ -700,14 +730,45 @@ def run_repl(shell: MqttRemoteShell, history_path=None):
 
 # ============================ CLI ============================
 
-def _add_common(p):
-    p.add_argument("--request-topic", "--topic", "-t", default=DEFAULT_REQUEST_TOPIC)
-    p.add_argument("--reply-topic", "--reply", default=DEFAULT_REPLY_TOPIC)
-    p.add_argument("--key", "-k", default=DEFAULT_KEY,
-                   help="私钥：整数表达式/PEM/文件路径，默认 DEFAULT_KEY；空串不签名")
-    p.add_argument("--allow", "-a", dest="allow", action="store_true", default=True)
-    p.add_argument("--no-allow", dest="allow", action="store_false")
-    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+def add_connection_args(p, default_timeout=DEFAULT_TIMEOUT):
+    """注册连接类参数。
+
+    选项名一律引用 client_mqtt 的统一别名表（alias_xxx）+ _cli_opts 生成，
+    与 client_mqtt.py 自身 CLI、rpc(**ka) 别名、%magic 命令保持完全一致；
+    pty_client_mqtt 也复用本函数，禁止再各写一份硬编码选项。
+    dest 仍沿用本模块历史名称（key/allow），_shell_from_args 无需改动。
+    """
+    p.add_argument(
+        *_cm._cli_opts(*_cm.alias_request_topic),
+        dest="request_topic", default=DEFAULT_REQUEST_TOPIC,
+        help=f"request topic（默认 {DEFAULT_REQUEST_TOPIC}）",
+    )
+    p.add_argument(
+        *_cm._cli_opts(*_cm.alias_reply_topic),
+        dest="reply_topic", default=DEFAULT_REPLY_TOPIC,
+        help=f"reply topic（默认 {DEFAULT_REPLY_TOPIC}）",
+    )
+    p.add_argument(
+        *_cm._cli_opts(*_cm.alias_private_key),
+        dest="key", default=DEFAULT_KEY,
+        help="私钥：整数表达式/PEM/文件路径，默认 DEFAULT_KEY；空串不签名",
+    )
+    p.add_argument(
+        *_cm._cli_opts(*_cm.alias_allow_no_pub),
+        dest="allow", action="store_true", default=True,
+        help="允许接收未验签服务端的回包（默认允许）",
+    )
+    p.add_argument("--no-allow", dest="allow", action="store_false",
+                   help="私钥模式下拦截未验签服务端的回包")
+    p.add_argument(
+        *_cm._cli_opts(*_cm.alias_timeout),
+        dest="timeout", type=float, default=default_timeout,
+        help=f"问答等待秒数（默认 {default_timeout}）",
+    )
+
+
+# 向后兼容旧名字
+_add_common = add_connection_args
 
 
 def _shell_from_args(args, wire_budget=WIRE_BUDGET):
@@ -725,7 +786,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="cmd_client_mqtt",
         description="通过 MQTT RPC 远程执行命令 / 就地编辑文件（远端无需改动）")
-    _add_common(parser)
+    add_connection_args(parser)
     sub = parser.add_subparsers(dest="action")
 
     p_run = sub.add_parser("run", help="执行一条 shell 命令（和 ssh 一样）")

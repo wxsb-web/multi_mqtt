@@ -1,3 +1,13 @@
+import os
+import sys
+
+# 本模块已迁移到 client/ 子目录：把项目根目录与本目录加入 sys.path，
+# 同时兼容直接运行与「from client import client_http」包导入。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.dirname(_HERE), _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from multi_mqtt import get_duplicated_kargs
 
 

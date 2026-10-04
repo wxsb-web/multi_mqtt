@@ -1,12 +1,12 @@
 # PTY over MQTT 协议参考（排错 / 二次开发用）
 
 主文档见上级 `SKILL.md`。本文件描述握手、帧格式、去重与线程模型，常量与代码均以
-`remote_cmd.py`（`_PTY_START_TEMPLATE`、`RemotePty`）和 `multi_mqtt.py` 为准。
+`client/remote_cmd.py`（`_PTY_START_TEMPLATE`、`RemotePty`）和 `multi_mqtt.py` 为准。
 
 ## 1. 拓扑
 
 ```
-本地 pty_client_mqtt / RemotePty                远端 server_mqtt.py（通用，无 PTY 专用代码）
+本地 client/pty_client_mqtt / RemotePty          远端 server_mqtt.py（通用，无 PTY 专用代码）
         |  ① 签名 RPC：整段 PTY 启动代码            |
         |  ---- sys/device/request (broadcast) -->  gms.handle_message -> exec 代码
         |  <-- sys/device/response --------------  返回 {ok, sid, topics, shell, pid}
@@ -109,9 +109,9 @@ login shell 的 argv0 带 `-` 前缀；子进程 `setsid()` + `TIOCSCTTY` 拿控
 
 ## 7. 二次开发要点
 
-- 新增传输层（HTTP/TCP/WS）只需实现 `remote_cmd.Transport`：`request(code,
+- 新增传输层（HTTP/TCP/WS）只需实现 `client.remote_cmd.Transport`：`request(code,
   timeout)` 为必需；PTY 另需 `publish`、`stream_subscribe`、`stream_unsubscribe`
-  （参考 `cmd_client_mqtt.MqttTransport`）。
+  （参考 `client.cmd_client_mqtt.MqttTransport`）。
 - 改动 PTY 服务端行为时改 `_PTY_START_TEMPLATE` 字符串本身——它是逐字下发
   执行的代码，改名/改缩进前确认模板内 `_o/_t/_th/...` 等短别名一致；
   `__PAYLOAD__` 占位符替换为 `json.dumps(json.dumps(payload))` 的双编码字面量。
