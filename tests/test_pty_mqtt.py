@@ -289,6 +289,21 @@ class RemotePtyClientTests(unittest.TestCase):
             [("aaaaaa", "host-a", 111, True),
              ("bbbbbb", "host-b", 222, False)])
 
+    def test_configure_publishes_clamped_set_frame(self):
+        tr = FakeTransport()
+        pty, _, _, _ = _open_pty(tr, "pty-set-1",
+                                 env_extra={"owner": "win-set"})
+        self.addCleanup(lambda: pty.close())
+        applied = pty.configure(interval=999, heartbeat=-5, ttl=5)
+        self.assertEqual(applied, {"interval": 60.0, "heartbeat": 0.0,
+                                   "ttl": 60.0})
+        fr = tr.published[-1][1]
+        self.assertEqual(fr["set"], {"interval": 60.0, "heartbeat": 0.0,
+                                     "ttl": 60.0})
+        self.assertEqual(fr["owner"], "win-set")
+        self.assertEqual(fr["iseq"], 1)  # claim 占 0，set 帧顺延
+        self.assertEqual(pty.configure(), {})  # 无参数不下发
+
     def test_prefetch_frames_buffered_until_owner_then_ghosts_filtered(self):
         # 握手回包到达前（属主未定）就已经在飞的首屏帧：先缓存，定主后重放，
         # 其中影子 PTY 的早期帧必须被滤掉，不进屏幕/不制造 seq 缺口。
@@ -400,6 +415,111 @@ class PtyCliPreCommandTests(unittest.TestCase):
         self.assertEqual(pcm._join_pre_command(None), "")
 
 
+class PtyHotkeyParseTests(unittest.TestCase):
+    """按键名 -> 终端字节序列，及反查显示名。"""
+
+    def test_single_byte_control_keys(self):
+        self.assertEqual(pcm._parse_key_spec("ctrl-]"), b"\x1d")
+        self.assertEqual(pcm._parse_key_spec("ctrl-a"), b"\x01")
+        self.assertEqual(pcm._parse_key_spec("ctrl-\\"), b"\x1c")
+        # 默认值就是这个原始控制字符，必须保持兼容
+        self.assertEqual(pcm._parse_key_spec("\x1d"), b"\x1d")
+
+    def test_modified_insert_xterm_encoding(self):
+        self.assertEqual(pcm._parse_key_spec("ctrl-alt-insert"),
+                         b"\x1b[2;7~")
+        self.assertEqual(pcm._parse_key_spec("shift+insert"), b"\x1b[2;2~")
+        self.assertEqual(pcm._parse_key_spec("CTRL_ALT_INSERT"), b"\x1b[2;7~")
+        self.assertEqual(pcm._parse_key_spec("ctrl-alt-shift-insert"),
+                         b"\x1b[2;8~")
+
+    def test_function_and_cursor_keys(self):
+        self.assertEqual(pcm._parse_key_spec("f1"), b"\x1bOP")
+        self.assertEqual(pcm._parse_key_spec("f9"), b"\x1b[20~")
+        self.assertEqual(pcm._parse_key_spec("insert"), b"\x1b[2~")
+        self.assertEqual(pcm._parse_key_spec("up"), b"\x1b[A")
+        self.assertEqual(pcm._parse_key_spec("ctrl-left"), b"\x1b[1;5D")
+
+    def test_disabled_and_unknown(self):
+        self.assertEqual(pcm._parse_key_spec("none"), b"")
+        self.assertEqual(pcm._parse_key_spec("off"), b"")
+        self.assertEqual(pcm._parse_key_spec(None), b"")
+        self.assertEqual(pcm._parse_key_spec("xyz"), b"xyz")
+
+    def test_describe_roundtrip(self):
+        self.assertEqual(pcm._describe_key(b"\x1d"), "ctrl-]")
+        self.assertEqual(pcm._describe_key(b"\x1b[2;7~"), "ctrl-alt-insert")
+        self.assertEqual(pcm._describe_key(b""), "禁用")
+        self.assertEqual(pcm._parse_key_spec(
+            "ctrl-alt-insert") in pcm._KEY_DISPLAY, True)
+
+
+class PtyMagicBarTests(unittest.TestCase):
+    """本地魔术命令栏：只调时间参数/本地动作，不碰 topic。"""
+
+    def _ctx(self):
+        tr = FakeTransport()
+        pty, _, _, _ = _open_pty(tr, "pty-magic-1",
+                                 env_extra={"owner": "win-magic"})
+        self.addCleanup(lambda: pty.close())
+        live = {"interval": 0.0, "heartbeat": 5.0, "ttl": 43200.0,
+                "dead_timeout": 15.0}
+        return tr, pty, {"pty": pty, "transport": tr, "live": live}
+
+    def test_detach_aliases(self):
+        for word in ("detach", "exit", "quit", "q", "d"):
+            _, pty, ctx = self._ctx()
+            do_detach, lines = pcm._run_magic(word, ctx)
+            self.assertTrue(do_detach, word)
+            self.assertTrue(lines)
+
+    def test_help_and_blank(self):
+        _, _, ctx = self._ctx()
+        do_detach, lines = pcm._run_magic("help", ctx)
+        self.assertFalse(do_detach)
+        joined = "\n".join(lines)
+        self.assertIn("detach", joined)
+        self.assertIn("heartbeat", joined)
+        self.assertNotIn("topic", joined)  # 刻意不提供 topic/key 设置
+        self.assertEqual(pcm._run_magic("   ", ctx), (False, []))
+
+    def test_remote_params_publish_set_and_clamp(self):
+        tr, pty, ctx = self._ctx()
+        n0 = len(tr.published)
+        do_detach, lines = pcm._run_magic("interval 999", ctx)
+        self.assertFalse(do_detach)
+        self.assertEqual(ctx["live"]["interval"], 60.0)  # 上限夹取
+        self.assertEqual(tr.published[n0][1]["set"], {"interval": 60.0})
+        pcm._run_magic("heartbeat 0", ctx)
+        self.assertEqual(ctx["live"]["heartbeat"], 0.0)
+        pcm._run_magic("ttl 10", ctx)
+        self.assertEqual(ctx["live"]["ttl"], 60.0)  # 下限夹取
+
+    def test_local_dead_timeout_no_frame(self):
+        tr, _, ctx = self._ctx()
+        n0 = len(tr.published)
+        pcm._run_magic("dead 3", ctx)
+        self.assertEqual(ctx["live"]["dead_timeout"], 3.0)
+        pcm._run_magic("dead 0", ctx)
+        self.assertEqual(ctx["live"]["dead_timeout"], 0.0)
+        # 纯本地参数不下发任何帧
+        self.assertEqual(len(tr.published), n0)
+
+    def test_bad_number_and_unknown_command(self):
+        _, _, ctx = self._ctx()
+        _, lines = pcm._run_magic("interval abc", ctx)
+        self.assertTrue(any("数字" in x for x in lines))
+        _, lines = pcm._run_magic("topic x", ctx)
+        self.assertTrue(any("未知" in x for x in lines))
+
+    def test_status_reports_session(self):
+        _, pty, ctx = self._ctx()
+        _, lines = pcm._run_magic("status", ctx)
+        joined = "\n".join(lines)
+        self.assertIn("pty-magic-1", joined)
+        self.assertIn("broker", joined)
+
+
 # ============================ 2. 模板静态检查（全平台） ============================
 
 class PtyTemplateStaticTests(unittest.TestCase):
@@ -441,6 +561,15 @@ class PtyTemplateStaticTests(unittest.TestCase):
         self.assertIn("_iq <= _iseq_last", self.code)
         self.assertNotIn("_iseq_recent", self.code)
         self.assertIn('"iseq"', self.code.replace("'", '"'))
+
+    def test_live_set_params_present(self):
+        # 会话内热调：_live 共享 dict + set 帧夹取，只允许时间参数
+        self.assertIn("_live", self.code)
+        self.assertIn('_fr.get("set")', self.code)
+        self.assertIn('float(_live["interval"])', self.code)
+        self.assertIn('_live.get("heartbeat"', self.code)
+        # 不允许借 set 帧改 topic / shell 等
+        self.assertNotIn('"in_topic": _ss', self.code)
 
     def test_owner_arbitration_present(self):
         # 多应答者归属仲裁：进程稳定 uid、下行帧盖 owner、外来 owner 帧
@@ -669,6 +798,26 @@ if IS_POSIX:
                 "影子 PTY 未在收到外来 owner 帧后自杀")
             self.assertEqual(_end_frame(self.net, sid).get("reason"),
                              "claim_lost")
+
+        def test_set_frame_hot_tunes_heartbeat_without_reconnect(self):
+            sid = "pty-live-set"
+            env = self._start(sid)  # 初始 heartbeat=0
+            self._send(sid, {"iseq": 0, "owner": env["owner"],
+                             "set": {"heartbeat": 1}})
+            try:
+                self.assertTrue(
+                    _wait_for(
+                        lambda: any(d.get("hb") is not None
+                                    for _, d in self.net.frames(
+                                        "pty/%s/out" % sid)),
+                        timeout=5.0),
+                    "set 热调 heartbeat 后未收到心跳帧")
+                # 非法值被忽略，会话照常工作
+                self._send(sid, {"iseq": 1, "owner": env["owner"],
+                                 "set": {"heartbeat": "abc"}})
+                self._assert_echo(sid, "ZZSETOK", iseq=2, owner=env["owner"])
+            finally:
+                self._stop(sid, iseq=3, owner=env["owner"])
 
         def test_duplicate_handshake_same_sid_returns_existing_session(self):
             # 同进程内同一 sid 重复握手（任何重复执行兜底）：返回既有会话，

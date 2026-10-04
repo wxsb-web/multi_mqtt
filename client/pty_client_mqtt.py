@@ -46,7 +46,11 @@ AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
 断开
 ====
 - 在远端 shell 里 ``exit`` / Ctrl-D（会话自然结束，客户端立即退出）；
-- 本地强制脱离：Ctrl-]（默认，可用 ``--detach-key`` 修改）；
+- 本地脱离：Ctrl-]（默认，``--detach-key`` 可改），只断 client，远端
+  tmux/shell 原封不动继续跑，稍后重连再 ``tmux at`` 即可；
+- 本地命令栏：Ctrl+Alt+Insert（默认，``--menu-key`` 可改），可执行
+  detach、status，并热调 interval/heartbeat/ttl/dead 等时间参数，
+  输入的内容不会发到远端；
 - 服务器进程被关 / 网络中断：心跳超时（``--heartbeat`` / ``--dead-timeout``）
   后客户端自动立即退出，绝不在 broker 仍在线时无限干等。
 
@@ -187,6 +191,195 @@ class _WinRawConsole:
 
 def _make_raw_console():
     return _WinRawConsole() if sys.platform == "win32" else _PosixRawConsole()
+
+
+# ============================ 退出时的本地终端复位 ============================
+
+# 脱离/被杀时远端全屏程序（tmux/vim）来不及发"恢复屏幕"序列，最后一帧
+# （tmux 绿色状态条等）会冻在本地终端里。退出前本地主动复位：
+#   ?1049l 退出备用屏幕（tmux attach 时进入的那个，退出即恢复 attach 前画面）
+#   ?1000/2/3/6l 关掉可能被远端打开的鼠标上报
+#   0m 复位颜色/粗体；?25h 显示光标
+_TERMINAL_CLEANUP = (b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l"
+                     b"\x1b[?1006l\x1b[0m\x1b[?25h\r\n")
+
+
+def _terminal_cleanup():
+    try:
+        sys.stdout.buffer.write(_TERMINAL_CLEANUP)
+        sys.stdout.buffer.flush()
+    except Exception:
+        pass
+
+
+def install_console_guards(console, on_signal=None):
+    """在终端被关 X / Ctrl-Break / kill 信号时尽量恢复本地终端模式。
+
+    正常脱离路径本来就会 console.exit()；这里兜底的是"没走正常路径"的
+    退出：强杀后 cmd 残留在 VT 输入模式，方向键会变成转义序列、历史命令
+    调不出来。注意任务管理器/TerminateProcess 对任何程序都不可拦截，
+    这里只能接住控制台关闭事件、Ctrl-Break 与 POSIX 信号。
+
+    返回 restore()，幂等，正常退出路径也可复用。
+    """
+    state = {"done": False}
+
+    def restore():
+        if state["done"]:
+            return
+        state["done"] = True
+        try:
+            console.exit()
+        except Exception:
+            pass
+        _terminal_cleanup()
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            handler_t = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+            def _handler(ctrl_type):
+                # 2=关闭控制台窗口(X) 1=Ctrl-Break 5=注销 6=关机
+                if ctrl_type in (1, 2, 5, 6):
+                    try:
+                        if on_signal is not None:
+                            on_signal()
+                    finally:
+                        restore()
+                return 0  # 交还系统默认处理：随后进程被结束
+
+            cb = handler_t(_handler)
+            # 必须保活回调对象，否则 GC 后 ctypes 会崩
+            console._cmq_ctrl_cb = cb
+            k32.SetConsoleCtrlHandler(cb, True)
+        except Exception:
+            pass
+    else:
+        import signal
+
+        def _handler(signum, _frame):
+            try:
+                if on_signal is not None:
+                    on_signal()
+            finally:
+                restore()
+                os._exit(128 + signum)
+
+        for _name in ("SIGHUP", "SIGTERM", "SIGQUIT"):
+            _sig = getattr(signal, _name, None)
+            if _sig is not None:
+                try:
+                    signal.signal(_sig, _handler)
+                except (ValueError, OSError):
+                    pass
+    return restore
+
+
+# ============================ 本地热键：按键名解析 ============================
+
+# 多字节热键（如 Ctrl+Alt+Insert 的 ESC[2;7~）到达时，ESC 可能与后续字节
+# 被拆成两次读；先缓存这么久等剩余字节，超时就把 ESC 原样放给远端。
+_HOTKEY_GAP = 0.025
+
+# 单字节控制键
+_CTRL_CHARS = {
+    "ctrl-@": 0, "ctrl-[": 27, "ctrl-\\": 28, "ctrl-]": 29,
+    "ctrl-^": 30, "ctrl-_": 31,
+}
+for _i in range(26):
+    _CTRL_CHARS["ctrl-%s" % chr(ord("a") + _i)] = _i + 1
+_CTRL_CHARS.update({
+    "space": 32, "tab": 9, "enter": 13, "cr": 13,
+    "esc": 27, "escape": 27,
+})
+# 以 ~ 结尾的 CSI 键：名字 -> 中间数字
+_CSI_TILDE_KEYS = {
+    "insert": 2, "delete": 3, "pageup": 5, "pgup": 5,
+    "pagedown": 6, "pgdn": 6, "home": 1, "end": 4,
+    "f5": 15, "f6": 17, "f7": 18, "f8": 19, "f9": 20, "f10": 21,
+    "f11": 23, "f12": 24,
+}
+# 单字母 CSI 键：方向键 [A..[D；Home/End [H/[F
+_CSI_LETTER_KEYS = {
+    "up": "A", "down": "B", "right": "C", "left": "D",
+    "home": "H", "end": "F",
+}
+# SS3 功能键 F1-F4：OP/OQ/OR/OS
+_SS3_KEYS = {"f1": "P", "f2": "Q", "f3": "R", "f4": "S"}
+_MOD_WORDS = {"ctrl": 4, "control": 4, "alt": 2, "meta": 2, "shift": 1}
+
+
+def _parse_key_spec(spec) -> bytes:
+    """把按键名解析成终端实际上报的字节序列。
+
+    支持：ctrl-]/ctrl-a（单字节）、f1-f12、insert/delete/home/end/方向键、
+    以及 shift/alt/ctrl 修饰组合（xterm 编码），如 ``ctrl-alt-insert`` ->
+    ``ESC[2;7~``。无法识别时按 latin-1 原样返回（兼容直接传原始字节）；
+    none/off/空串表示禁用。
+    """
+    if spec is None:
+        return b""
+    # 只剥普通空白：str.strip() 会把 0x1c-0x1f（含 Ctrl-] 的 0x1d）当空白
+    # 剥掉，导致直接传原始控制字节做 --detach-key 时被判成"禁用"
+    s = str(spec).strip(" \t\r\n").lower().replace("+", "-").replace("_", "-")
+    if s in ("", "none", "off", "-", "no"):
+        return b""
+    if s in _CTRL_CHARS:
+        return bytes([_CTRL_CHARS[s]])
+    tokens = s.split("-")
+    mod = 0
+    while tokens and tokens[0] in _MOD_WORDS:
+        mod |= _MOD_WORDS[tokens.pop(0)]
+    base = "-".join(tokens)
+    if base in _CTRL_CHARS:
+        # 修饰键配单字节键不产生稳定序列，只接受无修饰的写法
+        return bytes([_CTRL_CHARS[base]]) if mod == 0 else b""
+    if base in _CSI_TILDE_KEYS:
+        n = _CSI_TILDE_KEYS[base]
+        mid = (";%d" % (mod + 1)) if mod else ""
+        return ("\x1b[%d%s~" % (n, mid)).encode("latin-1")
+    if base in _CSI_LETTER_KEYS:
+        ch = _CSI_LETTER_KEYS[base]
+        if mod:
+            return ("\x1b[1;%d%s" % (mod + 1, ch)).encode("latin-1")
+        return ("\x1b[%s" % ch).encode("latin-1")
+    if base in _SS3_KEYS:
+        ch = _SS3_KEYS[base]
+        if mod:
+            return ("\x1b[1;%d%s" % (mod + 1, ch)).encode("latin-1")
+        return ("\x1bO%s" % ch).encode("latin-1")
+    return str(spec).encode("latin-1", "ignore")
+
+
+# 字节序列 -> 人类可读名字（banner 用），由上面的表反向构建
+def _build_key_display_map():
+    m = {}
+    for name, code in _CTRL_CHARS.items():
+        m.setdefault(bytes([code]), name)
+    labels = ["", "shift-", "alt-", "alt-shift-", "ctrl-", "ctrl-shift-",
+              "ctrl-alt-", "ctrl-alt-shift-"]
+    for label in labels:
+        for name in _CSI_TILDE_KEYS:
+            m.setdefault(_parse_key_spec("%s%s" % (label, name)),
+                         "%s%s" % (label, name))
+        for name in _CSI_LETTER_KEYS:
+            m.setdefault(_parse_key_spec("%s%s" % (label, name)),
+                         "%s%s" % (label, name))
+        for name in _SS3_KEYS:
+            m.setdefault(_parse_key_spec("%s%s" % (label, name)),
+                         "%s%s" % (label, name))
+    return m
+
+
+_KEY_DISPLAY = _build_key_display_map()
+
+
+def _describe_key(seq: bytes) -> str:
+    if not seq:
+        return "禁用"
+    return _KEY_DISPLAY.get(seq, repr(seq.decode("latin-1", "replace")))
 
 
 # ============================ 连接详情 ============================
@@ -429,6 +622,83 @@ def ai_pty_status(base=DEFAULT_AI_BASE, timeout=15):
 
 # ============================ PTY 会话 ============================
 
+# 本地魔术命令栏（热键唤起）：只处理本地动作和"时间类"参数，刻意不提供
+# topic/key 等连接参数（那些必须重连，参考 client_mqtt.py 的 %magic 边界）。
+_PTY_MAGIC_HELP = (
+    "本地命令（不会发到远端）：\r\n"
+    "  detach | exit | quit   脱离（远端 tmux/shell 继续运行）\r\n"
+    "  status                 会话与 broker 状态\r\n"
+    "  interval <秒>          服务端输出攒批间隔，0=实时，上限 60\r\n"
+    "  heartbeat <秒>         心跳间隔，0=关闭，上限 3600\r\n"
+    "  ttl <秒>               孤儿会话存活，60~86400\r\n"
+    "  dead <秒>              本地判死超时，0=不检测（立即生效）\r\n"
+    "  help                   本帮助；空行/Esc/Ctrl-C 取消\r\n"
+)
+
+# 参数名 -> (下限, 上限, 服务端 configure 关键字 or None 表示纯本地)
+_MAGIC_NUM_PARAMS = {
+    "interval": (0.0, 60.0, "interval"),
+    "heartbeat": (0.0, 3600.0, "heartbeat"),
+    "ttl": (60.0, 86400.0, "ttl"),
+    "dead": (0.0, 3600.0, None),
+    "dead-timeout": (0.0, 3600.0, None),
+}
+
+
+def _run_magic(line, ctx):
+    """执行一行本地魔术命令，返回 ``(是否请求脱离, 要本地打印的行列表)``。"""
+    body = (line or "").strip()
+    if not body:
+        return False, []
+    parts = body.split(None, 1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    pty = ctx["pty"]
+    live = ctx["live"]
+
+    if cmd in ("help", "?", "h"):
+        return False, _PTY_MAGIC_HELP.split("\r\n")[:-1] or [""]
+    if cmd in ("detach", "exit", "quit", "q", "d", "bye",'x'):
+        return True, ["正在脱离（远端会话保持运行）…"]
+    if cmd in ("status", "s", "st"):
+        info = getattr(pty, "server_info", None) or {}
+        online, total, _hosts = _broker_status(ctx.get("transport"))
+        lines = [
+            "sid        = %s" % getattr(pty, "sid", None),
+            "远端       = %s pid=%s owner=%s"
+            % (info.get("host"), info.get("pid"), getattr(pty, "owner", None)),
+            "broker     = 在线 %d/%d" % (online, total),
+            "interval   = %s 秒（服务端攒批）" % live.get("interval"),
+            "heartbeat  = %s 秒" % live.get("heartbeat"),
+            "ttl        = %s 秒" % live.get("ttl"),
+            "dead       = %s 秒（0=不检测）" % live.get("dead_timeout"),
+            "丢弃影子帧 = %d" % getattr(pty, "foreign_frames", 0),
+            "结束原因   = %s" % getattr(pty, "end_reason", None),
+        ]
+        return False, lines
+    spec = _MAGIC_NUM_PARAMS.get(cmd)
+    if spec is not None:
+        if not arg:
+            return False, ["%s = %s" % (cmd, live.get(cmd, live.get("dead_timeout")))]
+        try:
+            val = float(arg)
+        except ValueError:
+            return False, ["%s 需要一个数字（秒），收到: %r" % (cmd, arg)]
+        lo, hi, remote_key = spec
+        val = min(max(lo, val), hi)
+        if remote_key is None:
+            live["dead_timeout"] = val
+            return False, ["dead_timeout <- %s 秒（立即生效）" % val]
+        try:
+            applied = pty.configure(**{remote_key: val})
+        except RemoteError as exc:
+            return False, ["设置失败: %s" % exc]
+        live[remote_key] = applied[remote_key]
+        return False, ["%s <- %s 秒（已通知服务端热调）"
+                       % (remote_key, applied[remote_key])]
+    return False, ["未知本地命令: %s（输入 help 查看）" % cmd]
+
+
 def _hard_exit(console, code: int, message: str, pty=None):
     """学 client_mqtt.py 的退出风格：直接 ``os._exit``，干脆不拖泥带水。
 
@@ -447,6 +717,9 @@ def _hard_exit(console, code: int, message: str, pty=None):
         console.exit()
     except Exception:
         pass
+    # 本地终端复位：退出备用屏幕/关鼠标上报/复位颜色/显光标，清掉冻住的
+    # tmux 状态条、vim 末屏等，保证回到 cmd 后方向键/画面都是正常状态。
+    _terminal_cleanup()
     if message:
         try:
             sys.stderr.write(stime()+ message)
@@ -479,6 +752,8 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     outq: "queue.Queue[bytes]" = queue.Queue()
     stop_ev = threading.Event()
     term = args.term or os.environ.get("TERM") or "xterm-256color"
+    detach_key = _parse_key_spec(getattr(args, "detach_key", "\x1d"))
+    menu_key = _parse_key_spec(getattr(args, "menu_key", "ctrl-alt-insert"))
 
     # ---- 存活检测：输出帧和心跳帧都算"服务器还活着"的信号 ----
     heartbeat = max(0.0, float(args.heartbeat))
@@ -513,7 +788,9 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         f"[{stime()}] connected shell={env['shell']} pid={env['pid']} "
         f"({env['rows']}x{env['cols']}, interval={env['flush_interval']})\t"
         f"{env['in_topic']}\t{env['out_topic']}\n"
-        f"[pty] Ctrl-] 本地脱离；远端 exit/Ctrl-D 结束会话\n")
+        f"[pty] {_describe_key(detach_key)} 本地脱离（远端 tmux 不受影响）；"
+        f"{_describe_key(menu_key)} 本地命令栏（detach/status/时间参数）；"
+        f"远端 exit/Ctrl-D 结束会话\n")
     if env.get("cwd_warning"):
         # 服务端对不存在的 cwd 已自行回退（HOME→/），会话照常用；只提示不退出
         banner += (f"[pty] 注意: {env['cwd_warning']}，"
@@ -540,22 +817,146 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     sys.stderr.write(banner)
     sys.stderr.flush()
 
-    console = _make_raw_console()
-    detach_key = args.detach_key.encode("latin-1", "ignore") or None
+    # 会话期可变参数（本地命令栏热调；dead_timeout 纯本地，其余经 set 帧下发）
+    live = {
+        "interval": float(args.interval),
+        "heartbeat": heartbeat,
+        "ttl": float(args.ttl),
+        "dead_timeout": dead_timeout,
+    }
+    magic_ctx = {"pty": pty, "transport": transport, "live": live}
 
-    def input_loop():
+    console = _make_raw_console()
+    # 关窗口/Ctrl-Break/kill 信号时也要恢复本地终端模式，否则 cmd 残留在
+    # raw/VT 输入模式（方向键失灵）；顺手 fire-and-forget 一帧 stop。
+    install_console_guards(console, on_signal=lambda: pty.detach())
+
+    keyq: "queue.Queue[bytes]" = queue.Queue()
+    menu_ev = threading.Event()
+
+    def reader_loop():
+        # 唯一触碰本地终端输入的线程：只负责读出来塞进 keyq，热键匹配/命令栏/
+        # 透传全部在 input_loop 做，避免热键字节被拆读时错过。
         try:
             console.enter()
             while not stop_ev.is_set():
-                data = console.read()
+                try:
+                    data = console.read()
+                except OSError:
+                    break
                 if not data:
                     break
-                if detach_key and data == detach_key:
-                    sys.stderr.write("\r\n[pty] 本地脱离\r\n")
-                    break
-                pty.send(data)
-        except OSError:
-            pass
+                keyq.put(data)
+        finally:
+            stop_ev.set()
+
+    def _local_out(text: str):
+        sys.stdout.buffer.write(b"\x1b[0m" + text.encode("utf-8", "replace"))
+        sys.stdout.buffer.flush()
+
+    def _read_local_line():
+        """命令栏本地行编辑：回显不发给远端；返回 str，Esc/Ctrl-C 返回 None。"""
+        line = bytearray()
+        _local_out("\r\n\x1b[2K[pty] >> ")
+        while not stop_ev.is_set():
+            try:
+                data = keyq.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            for ch in data:
+                if ch in (13, 10):
+                    _local_out("\r\n")
+                    return line.decode("utf-8", "replace")
+                if ch == 3:
+                    _local_out("^C\r\n")
+                    return None
+                if ch == 27:
+                    _local_out("\r\n")
+                    return None
+                if ch in (127, 8):
+                    if line:
+                        del line[-1]
+                        _local_out("\b \b")
+                elif ch >= 32:
+                    line.append(ch)
+                    sys.stdout.buffer.write(bytes([ch]))
+                    sys.stdout.buffer.flush()
+        return None
+
+    def _open_menu():
+        # 打开期间主线程暂停渲染远端输出（暂存在 held 里），避免 tmux 刷新
+        # 打花本地命令行；关闭后自动补画。
+        menu_ev.set()
+        try:
+            while True:
+                line = _read_local_line()
+                if line is None:
+                    return
+                if not line.strip():
+                    return
+                do_detach, lines = _run_magic(line, magic_ctx)
+                for ln in lines:
+                    _local_out("\x1b[2K" + ln + "\r\n")
+                if do_detach:
+                    stop_ev.set()
+                    return
+                _local_out("[pty] >> ")
+        finally:
+            menu_ev.clear()
+
+    def _do_hotkey(name) -> bool:
+        if name == "detach":
+            _local_out("\r\n[pty] 本地脱离\r\n")
+            stop_ev.set()
+            return True
+        if name == "menu":
+            _open_menu()
+        return False
+
+    def input_loop():
+        # 热键精确匹配：一个读入突发恰好等于热键序列才触发（粘贴文本里
+        # 恰好含同样字节不会误触）。多字节热键以 ESC 开头且被拆读时，
+        # 按 _HOTKEY_GAP 等剩余字节；超时则把 ESC 照常放给远端。
+        seqs = [(s, n) for s, n in
+                ((detach_key, "detach"), (menu_key, "menu")) if s]
+        multi = [s for s, _ in seqs if len(s) > 1]
+        try:
+            while not stop_ev.is_set():
+                try:
+                    chunk = keyq.get(timeout=0.3)
+                except queue.Empty:
+                    continue
+                burst = bytearray(chunk)
+                while True:  # 把同一次按键已到齐的字节合并成一个突发
+                    try:
+                        burst += keyq.get_nowait()
+                    except queue.Empty:
+                        break
+                burst = bytes(burst)
+                hit = next((n for s, n in seqs if burst == s), None)
+                if hit is None and multi and burst[:1] == b"\x1b" \
+                        and any(s.startswith(burst) for s in multi):
+                    deadline = time.monotonic() + _HOTKEY_GAP
+                    extra = b""
+                    while time.monotonic() < deadline:
+                        try:
+                            c = keyq.get(
+                                timeout=max(0.0, deadline - time.monotonic()))
+                            extra += c
+                            deadline = time.monotonic() + _HOTKEY_GAP
+                        except queue.Empty:
+                            break
+                    if extra:
+                        burst += extra
+                        hit = next((n for s, n in seqs if burst == s), None)
+                if hit is not None:
+                    if _do_hotkey(hit):
+                        return
+                    continue
+                try:
+                    pty.send(burst)
+                except Exception:
+                    pass
         finally:
             stop_ev.set()
 
@@ -586,9 +987,11 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                     pass
                 resend -= 1
 
+    t_read = threading.Thread(target=reader_loop, name="pty-read", daemon=True)
     t_in = threading.Thread(target=input_loop, name="pty-input", daemon=True)
     t_resize = threading.Thread(target=resize_watch, name="pty-resize",
                                 daemon=True)
+    t_read.start()
     t_in.start()
     t_resize.start()
 
@@ -607,6 +1010,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
             sys.stderr.flush()
 
     # 主线程：远端输出原样渲染；任何退出路径都走 _hard_exit 立即收场
+    held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
     try:
         while not stop_ev.is_set():
             try:
@@ -616,13 +1020,20 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                     _hard_exit(
                         console, 0,
                         f"\r\n[pty] session ended: {pty.end_reason}\r\n", pty)
-                if dead_timeout > 0 and (time.monotonic()
-                                         - signal_state["last"]) > dead_timeout:
+                _dt = float(live["dead_timeout"])
+                if _dt > 0 and (time.monotonic()
+                                - signal_state["last"]) > _dt:
                     _hard_exit(
                         console, 3,
-                        f"\r\n[pty] {dead_timeout:g}s 收不到任何远端帧"
+                        f"\r\n[pty] {_dt:g}s 收不到任何远端帧"
                         f"（输出/心跳），服务器可能已关闭，直接断开\r\n", pty)
                 continue
+            if menu_ev.is_set():
+                held.extend(chunk)
+                continue
+            if held:
+                sys.stdout.buffer.write(held)
+                held.clear()
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
     except KeyboardInterrupt:
@@ -661,8 +1072,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "0=不检测，心跳关闭时自动失效）")
     p.add_argument("--size", default=None,
                    help="强制窗口 ROWSxCOLS，如 24x100；默认取本地终端大小")
-    p.add_argument("--detach-key", default="\x1d",
-                   help="本地强制脱离键（默认 Ctrl-]）")
+    p.add_argument("--detach-key", default="ctrl-]",
+                   help="本地脱离键：只断开 client，远端 tmux/shell 继续运行"
+                        "（默认 ctrl-]，沿用 telnet 惯例，不与 tmux 前缀冲突；"
+                        "可写 ctrl-a/f9/insert 等名字，none 禁用）")
+    p.add_argument("--menu-key", default="ctrl-alt-insert",
+                   help="本地命令栏热键：detach、status、热调 interval/"
+                        "heartbeat/ttl/dead，不会把按键发到远端（默认 "
+                        "ctrl-alt-insert；名字写法同 --detach-key，none 禁用）")
                    
     p.add_argument("--port", "-port", "-p", type=int, default=1188,
                    help="本地 AI 控制口 HTTP RPC 端口（默认 1188）；"

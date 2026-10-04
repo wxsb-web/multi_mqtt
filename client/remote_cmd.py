@@ -731,6 +731,13 @@ def _cmq_pty_start():
         _interval = max(0.0, float(_a.get("flush_interval", 0.0)))
         _ttl = min(max(60.0, float(_a.get("ttl", 43200.0))), 86400.0)
         _login = bool(_a.get("login", True))
+        # 会话期内可热调的参数（客户端本地命令栏经 set 帧修改，无需重连/重开
+        # PTY）。放在 dict 里供 in/out/heartbeat 三个线程共享读取。
+        _live = {
+            "interval": _interval,
+            "ttl": _ttl,
+            "heartbeat": max(0.0, float(_a.get("heartbeat", 0.0))),
+        }
 
         _shell = _a.get("shell")
         if not _shell:
@@ -884,6 +891,22 @@ def _cmq_pty_start():
                         _st0["reason"] = "stopped"
                         _kill()
                         return
+                    _ss = _fr.get("set")
+                    if isinstance(_ss, dict):
+                        # 会话内热调时间参数（客户端本地命令栏）：只允许
+                        # interval/heartbeat/ttl，且各自夹在安全区间。
+                        try:
+                            if "interval" in _ss:
+                                _live["interval"] = min(
+                                    max(0.0, float(_ss["interval"])), 60.0)
+                            if "heartbeat" in _ss:
+                                _live["heartbeat"] = min(
+                                    max(0.0, float(_ss["heartbeat"])), 3600.0)
+                            if "ttl" in _ss:
+                                _live["ttl"] = min(
+                                    max(60.0, float(_ss["ttl"])), 86400.0)
+                        except (TypeError, ValueError):
+                            pass
                     _wz = _fr.get("winsz")
                     if _wz:
                         _r2 = max(1, int(_wz[0]))
@@ -903,24 +926,26 @@ def _cmq_pty_start():
             _seq = 0
             _buf = b""
             _mark = _t.time()
-            _deadline = _t.time() + _ttl
+            _start = _t.time()
             _poll = _sel.poll()
             _poll.register(_mfd, _sel.POLLIN | _sel.POLLHUP | _sel.POLLERR)
             _reason = None
             try:
                 while True:
                     _now = _t.time()
-                    if _now >= _deadline:
+                    _ttl2 = float(_live["ttl"])
+                    if _now - _start >= _ttl2:
                         _st0["reason"] = "ttl"
                         _reason = "ttl"
                         break
-                    _left = max(0.05, _deadline - _now)
-                    if _interval <= 0:
+                    _left = max(0.05, _start + _ttl2 - _now)
+                    _iv = float(_live["interval"])
+                    if _iv <= 0:
                         _wait_ms = min(1000.0, _left * 1000)
                     elif _buf:
                         _wait_ms = min(
                             500.0,
-                            max(10.0, (_interval - (_now - _mark)) * 1000),
+                            max(10.0, (_iv - (_now - _mark)) * 1000),
                             _left * 1000)
                     else:
                         _wait_ms = min(500.0, _left * 1000)
@@ -948,8 +973,8 @@ def _cmq_pty_start():
                             _buf += _c2
                         _reason = _reason or _st0["reason"]
                         break
-                    if _buf and (_interval <= 0
-                                 or (_t.time() - _mark) >= _interval
+                    if _buf and (_iv <= 0
+                                 or (_t.time() - _mark) >= _iv
                                  or len(_buf) >= _frame_max):
                         _flush(_seq, _buf)
                         _seq += 1
@@ -997,11 +1022,18 @@ def _cmq_pty_start():
 
         # 心跳：服务端进程活着就周期发一帧。客户端靠它区分"shell 没输出"
         # 和"服务器已死"——否则 broker 仍在线、服务端进程被杀时，end 帧永远
-        # 发不出来，客户端会无限干等（按键全进黑洞）。
-        _hb = max(0.0, float(_a.get("heartbeat", 0.0)))
-
+        # 发不出来，客户端会无限干等（按键全进黑洞）。间隔可经 set 帧热调，
+        # 所以用 0.5s 粒度的调度循环而不是一次性 wait(heartbeat)。
         def _hb_loop():
-            while _hb > 0.0 and not _end.wait(_hb):
+            _next = _t.time()
+            while not _end.wait(0.5):
+                _h = float(_live.get("heartbeat", 0.0))
+                if _h <= 0.0:
+                    continue
+                _now = _t.time()
+                if _now < _next:
+                    continue
+                _next = _now + _h
                 try:
                     _net.publish_broadcast(
                         _out_topic,
@@ -1010,11 +1042,11 @@ def _cmq_pty_start():
                 except Exception:
                     pass
 
-        if _hb > 0.0:
-            _th.Thread(target=_hb_loop, name="pty-hb", daemon=True).start()
+        # 线程恒启动：heartbeat=0 时空转，set 帧热调成 >0 后立刻能发心跳
+        _th.Thread(target=_hb_loop, name="pty-hb", daemon=True).start()
 
         _res = {"ok": True, "sid": _sid, "owner": _uid, "host": _host,
-                "heartbeat": _hb,
+                "heartbeat": float(_live["heartbeat"]),
                 "in_topic": _in_topic, "out_topic": _out_topic,
                 "shell": _shell, "pid": _proc.pid, "term": _term,
                 "rows": _rows, "cols": _cols, "cwd": _cwd,
@@ -1823,7 +1855,9 @@ class RemotePty:
       ``{"pty": sid, "iseq": n, "owner": uid, "k": latin-1 按键}`` /
       ``{"pty": sid, "iseq": n, "owner": uid, "winsz": [rows, cols]}`` /
       ``{"pty": sid, "iseq": n, "owner": uid, "stop": true}`` /
-      ``{"pty": sid, "iseq": n, "owner": uid, "claim": true}``
+      ``{"pty": sid, "iseq": n, "owner": uid, "claim": true}`` /
+      ``{"pty": sid, "iseq": n, "owner": uid,
+      "set": {"interval": s, "heartbeat": s, "ttl": s}}``（只允许时间参数）
     - 下行（server→client，out topic）：帧带同一 ``owner``，非赢家帧一律
       丢弃（含影子 PTY 的 end 帧，不能让它终止本视图）：
       ``{"pty": sid, "seq": n, "owner": uid, "d": latin-1 输出}`` /
@@ -2026,6 +2060,27 @@ class RemotePty:
             return
         self._publish_input(
             {"pty": self.sid, "winsz": [int(rows), int(cols)]})
+
+    def configure(self, interval=None, heartbeat=None, ttl=None) -> dict:
+        """会话内热调时间参数，无需重连/重开 PTY。
+
+        - interval：服务端输出攒批间隔秒，0=实时，上限 60；
+        - heartbeat：心跳间隔秒，0=关闭，上限 3600；
+        - ttl：孤儿会话存活秒，夹在 60~86400。
+        返回实际下发（已夹取）的值，供调用方回显/记录。
+        """
+        if self.sid is None:
+            raise RemoteError("PTY 尚未 open")
+        settings = {}
+        if interval is not None:
+            settings["interval"] = min(max(0.0, float(interval)), 60.0)
+        if heartbeat is not None:
+            settings["heartbeat"] = min(max(0.0, float(heartbeat)), 3600.0)
+        if ttl is not None:
+            settings["ttl"] = min(max(60.0, float(ttl)), 86400.0)
+        if settings:
+            self._publish_input({"pty": self.sid, "set": settings})
+        return settings
 
     def detach(self) -> None:
         """请求服务端结束会话（kill 常驻 shell 及其进程组）。"""
