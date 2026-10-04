@@ -304,6 +304,15 @@ class RemotePtyClientTests(unittest.TestCase):
         self.assertEqual(fr["iseq"], 1)  # claim 占 0，set 帧顺延
         self.assertEqual(pty.configure(), {})  # 无参数不下发
 
+    def test_configure_redraw_frame(self):
+        tr = FakeTransport()
+        pty, _, _, _ = _open_pty(tr, "pty-redraw-1",
+                                 env_extra={"owner": "win-rd"})
+        self.addCleanup(lambda: pty.close())
+        applied = pty.configure(redraw=True)
+        self.assertEqual(applied["redraw"], True)
+        self.assertEqual(tr.published[-1][1]["set"], {"redraw": True})
+
     def test_prefetch_frames_buffered_until_owner_then_ghosts_filtered(self):
         # 握手回包到达前（属主未定）就已经在飞的首屏帧：先缓存，定主后重放，
         # 其中影子 PTY 的早期帧必须被滤掉，不进屏幕/不制造 seq 缺口。
@@ -436,6 +445,36 @@ class PtyCliPreCommandTests(unittest.TestCase):
         self.assertEqual((a.shell, a.heartbeat, a.dead_timeout, a.no_login,
                           a.size, a.interval, a.port),
                          ("/bin/bash", 2.0, 7.0, True, "20x80", 0.5, 0))
+
+
+class BinaryStdoutGuardTests(unittest.TestCase):
+    """RPC 执行期间 redirect_stdout(StringIO()) 不能再搞崩 PTY 渲染。"""
+
+    def setUp(self):
+        self._saved = pcm._BIN_STDOUT_CACHE
+        pcm._BIN_STDOUT_CACHE = None
+
+    def tearDown(self):
+        pcm._BIN_STDOUT_CACHE = self._saved
+
+    def test_falls_back_to_real_stdout_under_stringio_redirect(self):
+        import io
+        real = sys.stdout
+        try:
+            sys.stdout = io.StringIO()  # ai_bridge RPC 捕获 print 的情形
+            buf = pcm._bin_stdout()
+            self.assertIsNotNone(buf)
+            # 必须是解释器原始 stdout 的二进制缓冲，而不是 StringIO
+            self.assertIs(buf, getattr(real, "buffer", None)
+                          or sys.__stdout__.buffer)
+            # 复位序列此时也必须能写出，不抛异常
+            pcm._terminal_cleanup()
+        finally:
+            sys.stdout = real
+
+    def test_normal_stdout_resolves(self):
+        pcm._BIN_STDOUT_CACHE = None
+        self.assertIs(pcm._bin_stdout(), sys.stdout.buffer)
 
 
 class PtyHotkeyParseTests(unittest.TestCase):
@@ -611,6 +650,9 @@ class PtyTemplateStaticTests(unittest.TestCase):
         self.assertIn('_fr.get("set")', self.code)
         self.assertIn('float(_live["interval"])', self.code)
         self.assertIn('_live.get("heartbeat"', self.code)
+        # redraw：set 帧主动给前台进程组发 SIGWINCH 强制全屏重绘
+        self.assertIn("_sg.SIGWINCH", self.code)
+        self.assertIn('_ss.get("redraw")', self.code)
         # 不允许借 set 帧改 topic / shell 等
         self.assertNotIn('"in_topic": _ss', self.code)
 

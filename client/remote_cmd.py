@@ -895,6 +895,15 @@ def _cmq_pty_start():
                     if isinstance(_ss, dict):
                         # 会话内热调时间参数（客户端本地命令栏）：只允许
                         # interval/heartbeat/ttl，且各自夹在安全区间。
+                        if _ss.get("redraw"):
+                            # 强制前台进程组重绘：内核只在 winsz 真正变化时
+                            # 才发 SIGWINCH，同尺寸 resize 唤不醒 tmux/vim；
+                            # 客户端本地菜单关闭后用它让全屏程序整屏重画，
+                            # 抹掉菜单可能造成的滚屏残留。
+                            try:
+                                _o.killpg(_o.getpgid(_proc.pid), _sg.SIGWINCH)
+                            except Exception:
+                                pass
                         try:
                             if "interval" in _ss:
                                 _live["interval"] = min(
@@ -2061,12 +2070,15 @@ class RemotePty:
         self._publish_input(
             {"pty": self.sid, "winsz": [int(rows), int(cols)]})
 
-    def configure(self, interval=None, heartbeat=None, ttl=None) -> dict:
+    def configure(self, interval=None, heartbeat=None, ttl=None,
+                  redraw=False) -> dict:
         """会话内热调时间参数，无需重连/重开 PTY。
 
         - interval：服务端输出攒批间隔秒，0=实时，上限 60；
         - heartbeat：心跳间隔秒，0=关闭，上限 3600；
-        - ttl：孤儿会话存活秒，夹在 60~86400。
+        - ttl：孤儿会话存活秒，夹在 60~86400；
+        - redraw：给远端前台进程组发 SIGWINCH 强制整屏重绘（同尺寸 resize
+          内核不发信号，唤不醒已附着的 tmux/vim；本地菜单关闭后用它收尾）。
         返回实际下发（已夹取）的值，供调用方回显/记录。
         """
         if self.sid is None:
@@ -2078,6 +2090,8 @@ class RemotePty:
             settings["heartbeat"] = min(max(0.0, float(heartbeat)), 3600.0)
         if ttl is not None:
             settings["ttl"] = min(max(60.0, float(ttl)), 86400.0)
+        if redraw:
+            settings["redraw"] = True
         if settings:
             self._publish_input({"pty": self.sid, "set": settings})
         return settings

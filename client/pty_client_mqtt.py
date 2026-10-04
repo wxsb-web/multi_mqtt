@@ -235,10 +235,34 @@ _TERMINAL_CLEANUP = (b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l"
                      b"\x1b[?1006l\x1b[0m\x1b[?25h\r\n")
 
 
+_BIN_STDOUT_CACHE = None
+
+
+def _bin_stdout():
+    """锁定真正终端的二进制输出流（带缓存）。
+
+    ai_bridge 控制口执行 RPC 代码时会 ``redirect_stdout(StringIO())`` 临时
+    替换全局 ``sys.stdout`` 以捕获 print；StringIO 没有 ``buffer`` 属性，
+    PTY 渲染/菜单线程若每次现取 sys.stdout.buffer 就会 AttributeError 直接
+    崩掉整个会话。所以解析一次后固定用：当前 stdout 无 buffer（正被重定向）
+    时退回解释器原始 stdout（sys.__stdout__，永不受 redirect_stdout 影响）。
+    """
+    global _BIN_STDOUT_CACHE
+    if _BIN_STDOUT_CACHE is None:
+        for stream in (sys.stdout, getattr(sys, "__stdout__", None)):
+            buf = getattr(stream, "buffer", None)
+            if buf is not None:
+                _BIN_STDOUT_CACHE = buf
+                break
+    return _BIN_STDOUT_CACHE
+
+
 def _terminal_cleanup():
     try:
-        sys.stdout.buffer.write(_TERMINAL_CLEANUP)
-        sys.stdout.buffer.flush()
+        buf = _bin_stdout()
+        if buf is not None:
+            buf.write(_TERMINAL_CLEANUP)
+            buf.flush()
     except Exception:
         pass
 
@@ -770,7 +794,9 @@ def _hard_exit(console, code: int, message: str, pty=None):
         except Exception:
             pass
     try:
-        sys.stdout.buffer.flush()
+        _buf = _bin_stdout()
+        if _buf is not None:
+            _buf.flush()
     except Exception:
         pass
     os._exit(code)
@@ -870,6 +896,19 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     magic_ctx = {"pty": pty, "transport": transport, "live": live}
 
     console = _make_raw_console()
+    # 锁定终端二进制输出流：RPC 线程会临时把 sys.stdout 换成 StringIO，
+    # 本函数内所有渲染一律走 term_out，绝不再现取 sys.stdout.buffer。
+    term_out = _bin_stdout()
+
+    def _out_write(data: bytes) -> None:
+        if term_out is None:
+            return
+        try:
+            term_out.write(data)
+            term_out.flush()
+        except Exception:
+            pass
+
     # 关窗口/Ctrl-Break/kill 信号时也要恢复本地终端模式，否则 cmd 残留在
     # raw/VT 输入模式（方向键失灵）；顺手 fire-and-forget 一帧 stop。
     install_console_guards(console, on_signal=lambda: pty.detach())
@@ -894,13 +933,13 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
             stop_ev.set()
 
     def _local_out(text: str):
-        sys.stdout.buffer.write(b"\x1b[0m" + text.encode("utf-8", "replace"))
-        sys.stdout.buffer.flush()
+        _out_write(b"\x1b[0m" + text.encode("utf-8", "replace"))
 
     def _read_local_line():
-        """命令栏本地行编辑：回显不发给远端；返回 str，Esc/Ctrl-C 返回 None。"""
+        """命令栏本地行编辑（提示符由调用方画）：回显不发给远端；
+        返回 str，Esc/Ctrl-C 返回 None。回车/取消都不换行——整行随后由
+        调用方统一归位擦除，避免任何菜单字符残留在终端上。"""
         line = bytearray()
-        _local_out("\r\n\x1b[2K[pty] >> ")
         while not stop_ev.is_set():
             try:
                 data = keyq.get(timeout=0.3)
@@ -908,28 +947,27 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                 continue
             for ch in data:
                 if ch in (13, 10):
-                    _local_out("\r\n")
                     return line.decode("utf-8", "replace")
-                if ch == 3:
-                    _local_out("^C\r\n")
-                    return None
-                if ch == 27:
-                    _local_out("\r\n")
-                    return None
+                if ch == 3 or ch == 27:
+                    return None  # Ctrl-C / Esc：本地取消，绝不发给远端
                 if ch in (127, 8):
                     if line:
                         del line[-1]
                         _local_out("\b \b")
                 elif ch >= 32:
                     line.append(ch)
-                    sys.stdout.buffer.write(bytes([ch]))
-                    sys.stdout.buffer.flush()
+                    _out_write(bytes([ch]))
         return None
 
     def _open_menu():
         # 打开期间主线程暂停渲染远端输出（暂存在 held 里），避免 tmux 刷新
-        # 打花本地命令行；关闭后自动补画。
+        # 打花本地命令行；关闭后先彻底擦掉菜单再补画。
+        # ESC 7 保存远端光标（含 shell 提示符位置），ESC 8 归位：
+        # 每轮提示符都归位并 ESC[0J 清掉下方，所以 help 那 9 行、^C 等
+        # 不会累积；退出时同样归位+清下方，菜单零残留，随后 held 补画，
+        # tmux 全屏重绘 / shell 接着原来的提示符位置输出。
         menu_ev.set()
+        _local_out("\x1b7\r\n\x1b[2K[pty] >> ")
         try:
             while True:
                 line = _read_local_line()
@@ -938,14 +976,26 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                 if not line.strip():
                     return
                 do_detach, lines = _run_magic(line, magic_ctx)
-                for ln in lines:
-                    _local_out("\x1b[2K" + ln + "\r\n")
                 if do_detach:
                     stop_ev.set()
                     return
+                # 归位擦除旧提示符/上次输出，在同一区域重画（高度不累积）
+                _local_out("\x1b8\x1b[0J\r\n")
+                for ln in lines:
+                    _local_out(ln + "\r\n")
                 _local_out("[pty] >> ")
         finally:
+            # 必须先擦干净再放行渲染，否则补画的远端流会和菜单字符拼成花屏。
+            # ESC8/0J 覆盖普通 shell（光标归位+清下方）；菜单行数超过光标
+            # 下方空间时备用屏幕可能已滚屏，再让 tmux/vim 收到 SIGWINCH
+            # 整屏重绘兜底（进程即将退出的 detach 路径就不必发了）。
+            _local_out("\x1b8\x1b[0J")
             menu_ev.clear()
+            if not stop_ev.is_set():
+                try:
+                    pty.configure(redraw=True)
+                except Exception:
+                    pass
 
     def _do_hotkey(name) -> bool:
         if name == "detach":
@@ -1059,6 +1109,12 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
             try:
                 chunk = outq.get(timeout=0.3)
             except queue.Empty:
+                chunk = None
+            # 菜单刚关闭、远端又静默时，暂存的输出也要立刻补画，不能等新帧
+            if chunk is None and held and not menu_ev.is_set():
+                _out_write(bytes(held))
+                held.clear()
+            if chunk is None:
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,
@@ -1075,10 +1131,9 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                 held.extend(chunk)
                 continue
             if held:
-                sys.stdout.buffer.write(held)
+                _out_write(bytes(held))
                 held.clear()
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
+            _out_write(chunk)
     except KeyboardInterrupt:
         _hard_exit(console, 130, "\r\n[pty] interrupted\r\n", pty)
 
