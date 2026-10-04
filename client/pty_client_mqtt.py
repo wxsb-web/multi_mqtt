@@ -257,7 +257,96 @@ def _bin_stdout():
     return _BIN_STDOUT_CACHE
 
 
-def _terminal_cleanup():
+# 排队字节上限：终端读取方长时间不消费时，队列涨到这个量后新字节被丢弃
+# 而不是拖住调用方。8MB 足以吸收正常突发（整屏 cat 也就几 KB~几十 KB）。
+_TERM_QUEUE_MAX = 8 * 1024 * 1024
+
+# 会话期 stdout 异步写线程（run_session 创建）；启动前为 None。
+_OUT_WRITER = None
+# stderr 异步写线程，懒初始化（_info 在 main 最早阶段就会用到）。
+_ERR_WRITER = None
+
+
+class _TerminalWriter:
+    """终端字节异步写：单写线程 + 有界（按字节计）队列。
+
+    背景（py-spy 实证）：Windows conhost / 终端读取方停止消费时，对控制台
+    的同步 write+flush 会在原生 OS 调用上无限阻塞并占住 GIL；调用它的渲染
+    主线程一挂，进程内所有 Python 线程（含本地 HTTP 控制口）全部饿死，
+    status 等一切请求超时。
+
+    本类把唯一可能阻塞的原生 IO 隔离到一个可牺牲的 daemon 写线程上：
+    调用方 write() 只做非阻塞入队（队列满则丢新字节并记账），关键路径
+    永不碰原生写；单队列 + 单写线程保证字节顺序与原同步写一致。flush()
+    语义由写线程每次写后完成，调用方不再等待——等待会重新引入阻塞。
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, stream, max_bytes=_TERM_QUEUE_MAX, name="term-writer"):
+        self._stream = stream
+        self._max_bytes = int(max_bytes)
+        # 无界 Queue：背压靠字节记账自己判断，不依赖 Queue 的条数限制
+        self._q = queue.Queue()
+        self._queued_bytes = 0
+        self._lock = threading.Lock()
+        self.dropped = 0
+        self._closed = False
+        self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
+        self._thread.start()
+
+    def write(self, data: bytes) -> None:
+        if not data or self._closed:
+            return
+        with self._lock:
+            if self._queued_bytes >= self._max_bytes:
+                # 写线程正卡在原生 IO 上（终端不消费）：丢新字节保进程，
+                # 绝不在这里等。
+                self.dropped += len(data)
+                return
+            room = self._max_bytes - self._queued_bytes
+            if len(data) > room:
+                self.dropped += len(data) - room
+                data = data[:room]
+            self._queued_bytes += len(data)
+        self._q.put(data)
+
+    def flush(self) -> None:
+        """刷盘由写线程在每次写后完成；刻意不等待（等待=重新引入阻塞）。"""
+
+    def close(self, timeout: float = 1.5) -> None:
+        """队尾放哨兵后等写线程排空；写线程堵在原生 IO 上时超时即返回。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._q.put(self._SENTINEL)
+        self._thread.join(timeout)
+
+    def _loop(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is self._SENTINEL:
+                return
+            try:
+                self._stream.write(item)
+                self._stream.flush()
+            except Exception:
+                # 写线程不能死：死了队列只涨不刷。终端出错后输出静默丢弃。
+                pass
+            with self._lock:
+                self._queued_bytes -= len(item)
+
+
+def _terminal_cleanup(sync: bool = False):
+    """复位本地终端（退 alt screen/关鼠标/复位颜色/显光标）。
+
+    默认把复位序列排进会话 stdout 写线程队列：它必须在所有已排队的远端
+    输出之后到达终端，直接先写会插到队前造成序列错位。sync=True（控制台
+    关闭信号兜底，进程马上要被系统结束）时才直接同步写。
+    """
+    if not sync and _OUT_WRITER is not None:
+        _OUT_WRITER.write(_TERMINAL_CLEANUP)
+        return
     try:
         buf = _bin_stdout()
         if buf is not None:
@@ -287,7 +376,8 @@ def install_console_guards(console, on_signal=None):
             console.exit()
         except Exception:
             pass
-        _terminal_cleanup()
+        # 信号路径：进程随后即被系统结束，等不及异步队列，直接同步写
+        _terminal_cleanup(sync=True)
 
     if sys.platform == "win32":
         try:
@@ -455,9 +545,34 @@ def _broker_status(transport):
     return len(hosts), len(clients), hosts
 
 
+def _stderr_writer():
+    """懒初始化 stderr 异步写线程（锁定真实 stderr 的二进制缓冲）。
+
+    与 _bin_stdout 同理：只解析一次，不每次现取 sys.stderr.buffer。
+    """
+    global _ERR_WRITER
+    if _ERR_WRITER is None:
+        binerr = getattr(sys.stderr, "buffer", None)
+        if binerr is None:
+            binerr = getattr(getattr(sys, "__stderr__", None), "buffer", None)
+        if binerr is not None:
+            _ERR_WRITER = _TerminalWriter(binerr, name="pty-err")
+    return _ERR_WRITER
+
+
+def _stderr_write(text) -> bool:
+    """非阻塞写 stderr（str/bytes 皆可）；无可用流时返回 False。"""
+    w = _stderr_writer()
+    if w is None:
+        return False
+    if isinstance(text, str):
+        text = text.encode("utf-8", "replace")
+    w.write(text)
+    return True
+
+
 def _info(msg):
-    sys.stderr.write("[%s] %s\n" % (stime(), msg))
-    sys.stderr.flush()
+    _stderr_write("[%s] %s\n" % (stime(), msg))
 
 
 # ============================ AI 桥：外部进程复用本常驻 PTY ============================
@@ -784,21 +899,17 @@ def _hard_exit(console, code: int, message: str, pty=None):
         console.exit()
     except Exception:
         pass
-    # 本地终端复位：退出备用屏幕/关鼠标上报/复位颜色/显光标，清掉冻住的
-    # tmux 状态条、vim 末屏等，保证回到 cmd 后方向键/画面都是正常状态。
+    # 本地终端复位：复位序列排进 stdout 写线程（顺序在全部远端输出之后），
+    # 退出提示走 stderr。
     _terminal_cleanup()
     if message:
-        try:
-            sys.stderr.write(stime()+ message)
-            sys.stderr.flush()
-        except Exception:
-            pass
-    try:
-        _buf = _bin_stdout()
-        if _buf is not None:
-            _buf.flush()
-    except Exception:
-        pass
+        _stderr_write(stime() + message)
+    # 给写线程有限时间把队列排空（复位序列/退出提示随之落盘）；终端读取方
+    # 卡死、写线程堵在原生 IO 上时超时放弃，照样 os._exit，不再重蹈卡死覆辙。
+    if _OUT_WRITER is not None:
+        _OUT_WRITER.close(timeout=1.5)
+    if _ERR_WRITER is not None:
+        _ERR_WRITER.close(timeout=0.5)
     os._exit(code)
 
 
@@ -814,6 +925,7 @@ def _join_pre_command(parts) -> str:
 
 
 def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
+    global _OUT_WRITER
     pty = RemotePty(transport, timeout=args.timeout)
     # 挂到 AI 桥：外部经本地 HTTP RPC 调用 ai_bridge 即复用本 PTY，
     # attach 放在 open 之前，保证最早的握手回显也能被 feed 分流到。
@@ -883,8 +995,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     if dead_timeout > 0:
         banner += (f"[pty] 心跳 {heartbeat:g}s：服务器关闭/断连后最多 "
                    f"{dead_timeout:g}s 自动退出\n")
-    sys.stderr.write(banner)
-    sys.stderr.flush()
+    _stderr_write(banner)
 
     # 会话期可变参数（本地命令栏热调；dead_timeout 纯本地，其余经 set 帧下发）
     live = {
@@ -896,18 +1007,16 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     magic_ctx = {"pty": pty, "transport": transport, "live": live}
 
     console = _make_raw_console()
-    # 锁定终端二进制输出流：RPC 线程会临时把 sys.stdout 换成 StringIO，
-    # 本函数内所有渲染一律走 term_out，绝不再现取 sys.stdout.buffer。
+    # 终端输出全部交给异步写线程：唯一可能阻塞的原生控制台 IO 只发生在
+    # 那个可牺牲线程上，渲染主线程 / RPC 线程再也不会被控制台堵死。
+    # term_out 仍锁定真实二进制流（RPC 线程会把 sys.stdout 换成 StringIO）。
     term_out = _bin_stdout()
+    if term_out is not None:
+        _OUT_WRITER = _TerminalWriter(term_out, name="pty-out")
 
     def _out_write(data: bytes) -> None:
-        if term_out is None:
-            return
-        try:
-            term_out.write(data)
-            term_out.flush()
-        except Exception:
-            pass
+        if _OUT_WRITER is not None:
+            _OUT_WRITER.write(data)
 
     # 关窗口/Ctrl-Break/kill 信号时也要恢复本地终端模式，否则 cmd 残留在
     # raw/VT 输入模式（方向键失灵）；顺手 fire-and-forget 一帧 stop。
@@ -1096,11 +1205,9 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         # 留在 shell / tmux 里。
         try:
             pty.send(pre_cmd + "\r")
-            sys.stderr.write("[pty] 已自动执行前置命令: %s\n" % pre_cmd)
-            sys.stderr.flush()
+            _stderr_write("[pty] 已自动执行前置命令: %s\n" % pre_cmd)
         except Exception as exc:
-            sys.stderr.write("[pty][WARN] 前置命令发送失败: %s\n" % exc)
-            sys.stderr.flush()
+            _stderr_write("[pty][WARN] 前置命令发送失败: %s\n" % exc)
 
     # 主线程：远端输出原样渲染；任何退出路径都走 _hard_exit 立即收场
     held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
@@ -1229,7 +1336,8 @@ def main(argv=None) -> int:
         # 注意：持久命名空间在此刻快照一次，ai_bridge 是模块级对象引用，
         # 会话建立后 attach/feed 对 HTTP 调用方立即生效。
         ghs = server_http.start_rpc_server(
-            port=args.port, ip=args.host, globals=globals(), locals=locals())
+            port=args.port, ip=args.host, globals=globals(), locals=locals(),
+            log_sink=_stderr_write)
         _info(f"本地 AI 控制口已开启：http://127.0.0.1:{args.port}/"
               f"（示例：ai_bridge.run(\"uname -a\")；命令在本窗口实时可见）")
     
@@ -1250,12 +1358,14 @@ def main(argv=None) -> int:
     if hosts:
         _info("在线节点：" + ", ".join(hosts))
     elif total:
-        sys.stderr.write("[WARN] 当前没有任何 broker 在线，握手大概率超时\n")
-        sys.stderr.flush()
+        _stderr_write("[WARN] 当前没有任何 broker 在线，握手大概率超时\n")
     try:
         return run_session(transport, args, rows, cols)
     except RemoteError as exc:
-        sys.stderr.write(f"[ERROR] {type(exc).__name__}: {exc}\n")
+        _stderr_write(f"[ERROR] {type(exc).__name__}: {exc}\n")
+        # main 即将 return 退出进程，给 stderr 写线程 1s 把错误落盘
+        if _ERR_WRITER is not None:
+            _ERR_WRITER.close(timeout=1.0)
         return 2
     finally:
         transport.close()

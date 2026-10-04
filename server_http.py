@@ -146,9 +146,21 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
     websocket_path = '/ws'
     redirect_root = None
     main_loop = None
+    # 可选非阻塞日志出口 callable(str)；pty_client_mqtt 把它接到异步写
+    # 线程上，避免控制台堵塞时 BaseHTTPRequestHandler 的 print 拖死请求线程
+    log_sink = None
 
     def log_message(self, format, *args):
-        print(f"[RPC] {stime()[12:]}  {self.client_address[0]}:{self.client_address[1]} {format % args}")
+        line = (f"[RPC] {stime()[12:]}  {self.client_address[0]}:"
+                f"{self.client_address[1]} {format % args}\n")
+        sink = self.log_sink
+        if sink is not None:
+            try:
+                sink(line)
+                return
+            except Exception:
+                pass  # sink 挂了退回 print，不能让日志本身打挂请求
+        print(line)
 
     def do_GET(self):
         websocket_path = self.path.split('?', 1)[0]
@@ -365,10 +377,11 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
 def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None, daemon=True,
                      favicon_rgb=None, favicon_size=16, websocket_handler=None,
                      websocket_path='/ws', redirect_root=None, websocket_handlers=None,
-                     main_loop=None, listen=True):
+                     main_loop=None, listen=True, log_sink=None):
     if not key:
         key = ''
     RPCRequestHandler.key = key
+    RPCRequestHandler.log_sink = log_sink
     RPCRequestHandler.websocket_handler = websocket_handler
     RPCRequestHandler.websocket_path = websocket_path
     RPCRequestHandler.websocket_handlers = websocket_handlers or {}
@@ -403,7 +416,14 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     thread = threading.Thread(target=server.serve_forever, name='RPC_Server', daemon=daemon)
     thread.start()
     server.thread = thread
-    print(f"[RPC] {stime()} server at http://{ip}:{port}/{key}")
+    boot_line = f"[RPC] {stime()} server at http://{ip}:{port}/{key}\n"
+    if log_sink is not None:
+        try:
+            log_sink(boot_line)
+        except Exception:
+            print(boot_line)
+    else:
+        print(boot_line)
     return server
 
 

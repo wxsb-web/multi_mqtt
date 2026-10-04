@@ -21,6 +21,7 @@
 运行：
     cd multi_mqtt && python -m unittest tests.test_pty_mqtt -v
 """
+import io
 import json
 import os
 import sys
@@ -1046,6 +1047,135 @@ if IS_POSIX:
             # PTY 会话功能正常
             self._assert_echo(sid, "ZZHEAL42", iseq=0)
             self._stop(sid, iseq=1)
+
+
+class TerminalWriterTests(unittest.TestCase):
+    """_TerminalWriter：把原生控制台 IO 隔离到可牺牲线程，背压丢弃、
+    close 有界；以及 RPCRequestHandler.log_message 的非阻塞 sink。"""
+
+    def test_writes_in_order(self):
+        stream = io.BytesIO()
+        w = pcm._TerminalWriter(stream, max_bytes=1 << 20, name="tw-order")
+        try:
+            w.write(b"ab")
+            w.write(b"cd")
+            w.write(b"")  # 空串无害
+        finally:
+            w.close(timeout=2)
+        self.assertEqual(stream.getvalue(), b"abcd")
+
+    def test_backpressure_drops_but_never_blocks_caller(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingStream:
+            def write(self, data):
+                entered.set()
+                release.wait(5)  # 模拟终端读取方卡死：原生写无限阻塞
+                return len(data)
+
+            def flush(self):
+                pass
+
+        w = pcm._TerminalWriter(BlockingStream(), max_bytes=100,
+                                name="tw-backpressure")
+        try:
+            w.write(b"x" * 100)
+            self.assertTrue(entered.wait(2), "写线程未开始消费")
+            # 确认写线程已卡在原生写上、字节记账已满
+            time.sleep(0.1)
+            t0 = time.monotonic()
+            for _ in range(50):
+                w.write(b"y" * 10)
+            self.assertLess(time.monotonic() - t0, 1.0,
+                            "队列满时 write() 绝不能阻塞调用方")
+            self.assertEqual(w.dropped, 500)
+        finally:
+            release.set()
+            w.close(timeout=2)
+
+    def test_close_is_bounded_when_native_write_hangs(self):
+        release = threading.Event()
+
+        class HungStream:
+            def write(self, data):
+                release.wait(30)
+                return len(data)
+
+            def flush(self):
+                pass
+
+        w = pcm._TerminalWriter(HungStream(), max_bytes=1000,
+                                name="tw-hung-close")
+        w.write(b"z")
+        t0 = time.monotonic()
+        w.close(timeout=0.5)
+        self.assertLess(time.monotonic() - t0, 2.0,
+                        "写线程卡死时 close() 必须按时返回")
+        release.set()
+
+    def test_stream_error_does_not_kill_writer(self):
+        target = io.BytesIO()
+        calls = {"n": 0}
+
+        class FlakyStream:
+            def write(self, data):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise OSError("boom")
+                return target.write(data)
+
+            def flush(self):
+                target.flush()
+
+        w = pcm._TerminalWriter(FlakyStream(), name="tw-flaky")
+        try:
+            w.write(b"a")
+            w.write(b"b")
+        finally:
+            w.close(timeout=2)
+        # 首段写报错但写线程存活，后续字节照样落盘
+        self.assertEqual(target.getvalue(), b"b")
+
+    def test_oversized_chunk_truncated_and_accounted(self):
+        stream = io.BytesIO()
+        w = pcm._TerminalWriter(stream, max_bytes=10, name="tw-oversize")
+        try:
+            w.write(b"abcdefghijklmn")  # 14 > 10
+        finally:
+            w.close(timeout=2)
+        self.assertEqual(stream.getvalue(), b"abcdefghij")
+        self.assertEqual(w.dropped, 4)
+
+    def test_log_message_routes_to_nonblocking_sink(self):
+        import server_http
+        h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)
+        h.client_address = ("1.2.3.4", 5555)
+        captured = []
+        h.log_sink = captured.append  # 实例级 sink，不动类属性
+        h.log_message("GET %s", "/")
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(captured[0].startswith("[RPC]"))
+        self.assertIn("1.2.3.4:5555", captured[0])
+
+    def test_log_message_falls_back_when_sink_raises(self):
+        import server_http
+        h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)
+        h.client_address = ("1.2.3.4", 5555)
+
+        def bad_sink(_line):
+            raise RuntimeError("sink down")
+
+        h.log_sink = bad_sink
+        buf = io.StringIO()
+        old = sys.stdout
+        sys.stdout = buf
+        try:
+            h.log_message("code %s", 200)
+        finally:
+            sys.stdout = old
+        # sink 异常时退回 print，日志本身不能打挂请求线程
+        self.assertIn("[RPC]", buf.getvalue())
 
 
 if __name__ == "__main__":
