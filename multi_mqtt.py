@@ -1001,6 +1001,30 @@ class MultiMQTTManager:
         if self.enable_stats:
             self.stats.start(self.clients)
 
+    def wait_connected(self, min_count=1, timeout=10.0, poll_interval=0.05):
+        """阻塞等待，直到至少 ``min_count`` 个 broker 建立连接或 ``timeout`` 到期。
+
+        替代早期调用方写死的 ``time.sleep(2)``：最快的 broker（实测约
+        110ms）一连上就立即放行后续订阅/握手，不再无意义干等；全部 broker
+        都连不上时最多等到超时，随后台自动重连继续，调用方仍可往下走。
+
+        :return: 放行/超时时刻的在线连接数（超时也不抛异常，由调用方决定）。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self.lock:
+                snapshot = list(self.clients.values())
+            online = 0
+            for c in snapshot:
+                try:
+                    if c.is_connected():
+                        online += 1
+                except Exception:
+                    pass
+            if online >= min_count or time.monotonic() >= deadline:
+                return online
+            time.sleep(max(0.005, float(poll_interval)))
+
     # ================= [基于 Userdata 的统一回调] =================
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         host = userdata

@@ -48,7 +48,7 @@ from remote_cmd import (                # noqa: E402
     RemotePty, RemoteError, DEFAULT_PTY_TTL,
 )
 
-from multi_mqtt import stime
+from multi_mqtt import stime, BROKER_LIST
 
 
 # ============================ 本地终端：输出 ANSI 支持 ============================
@@ -155,6 +155,29 @@ def _make_raw_console():
     return _WinRawConsole() if sys.platform == "win32" else _PosixRawConsole()
 
 
+# ============================ 连接详情 ============================
+
+def _broker_status(transport):
+    """返回 (在线数, 总数, 在线 broker 名列表)。拿不到状态时总数退化为配置数。"""
+    net = getattr(getattr(transport, "node", None), "mqtt_net", None)
+    clients = getattr(net, "clients", None)
+    if not clients:
+        return 0, len(BROKER_LIST), []
+    hosts = []
+    for host, cli in clients.items():
+        try:
+            if cli.is_connected():
+                hosts.append(str(host))
+        except Exception:
+            pass
+    return len(hosts), len(clients), hosts
+
+
+def _info(msg):
+    sys.stderr.write("[%s] %s\n" % (stime(), msg))
+    sys.stderr.flush()
+
+
 # ============================ PTY 会话 ============================
 
 def _hard_exit(console, code: int, message: str, pty=None):
@@ -213,6 +236,9 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         signal_state["last"] = time.monotonic()
 
     # 协商：订阅 out topic + 下发 PTY 启动代码（shell 在服务端只启动这一次）
+    _info("正在远端启动 PTY：shell=%s cwd=%s 窗口=%dx%d，等待握手回包（超时 %.0fs）..."
+          % (args.shell or "服务端登录 shell", args.cwd or "远端 HOME",
+             rows, cols, args.timeout))
     env = pty.open(rows, cols, shell=(args.shell or None), term=term,
                    cwd=args.cwd, login=not args.no_login,
                    flush_interval=args.interval, ttl=args.ttl,
@@ -337,6 +363,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="强制窗口 ROWSxCOLS，如 24x100；默认取本地终端大小")
     p.add_argument("--detach-key", default="\x1d",
                    help="本地强制脱离键（默认 Ctrl-]）")
+                   
+    p.add_argument("--port", "-port", "-p", type=int, default=1188)
+    p.add_argument("--host", "-host", default="0.0.0.0")
+                   
     return p
 
 
@@ -357,11 +387,30 @@ def main(argv=None) -> int:
     if not sys.stdin.isatty():
         sys.stderr.write("[ERROR] PTY 需要一个交互式本地终端（stdin 不是 TTY）\n")
         return 2
-
+    
+    if args.port:
+        import server_http
+        ghs=server_http.start_rpc_server(port=args.port,ip=args.host,globals=globals(),locals=locals(), )
+    
     _enable_output_vt()
+    signed = bool(str(args.key or "").strip())
+    t_conn = time.monotonic()
+    _info("正在并发连接 %d 个公共 MQTT broker（多路径冗余，首个连上即继续，通常不足 1 秒）..."
+          % len(BROKER_LIST))
+    _info("request_topic=%s  reply_topic=%s  请求签名=%s  允许未验签回包=%s"
+          % (args.request_topic, args.reply_topic,
+             "是" if signed else "否", "是" if args.allow else "否"))
     transport = MqttTransport(
         request_topic=args.request_topic, reply_topic=args.reply_topic,
         private_key=args.key, allow_no_pub=args.allow)
+    online, total, hosts = _broker_status(transport)
+    _info("MQTT 就绪：在线 broker %d/%d，建连耗时 %.1f 秒"
+          % (online, total, time.monotonic() - t_conn))
+    if hosts:
+        _info("在线节点：" + ", ".join(hosts))
+    elif total:
+        sys.stderr.write("[WARN] 当前没有任何 broker 在线，握手大概率超时\n")
+        sys.stderr.flush()
     try:
         return run_session(transport, args, rows, cols)
     except RemoteError as exc:

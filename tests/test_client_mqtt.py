@@ -1,11 +1,13 @@
 import builtins
+import threading
+import time
 import unittest
 from unittest.mock import Mock
 
 import ecdsa
 
 import client_mqtt
-from multi_mqtt import get_standard_pem_bytes
+from multi_mqtt import MultiMQTTManager, get_standard_pem_bytes
 
 
 class ClientMqttTests(unittest.TestCase):
@@ -138,6 +140,73 @@ class ClientMqttTests(unittest.TestCase):
 
         result = node.request("print(1)", timeout=0.1)
         self.assertIsNone(result)
+
+
+class WaitConnectedTests(unittest.TestCase):
+    """wait_connected：首个 broker 上线即放行，替代写死的 sleep(2)。"""
+
+    def _manager_with_fakes(self, statuses):
+        """statuses: list[bool|Exception]，构造同数量的假 paho client。"""
+        class _FakeClient:
+            def __init__(self, state):
+                self._state = state
+
+            def is_connected(self):
+                if isinstance(self._state, Exception):
+                    raise self._state
+                return self._state
+
+        mgr = MultiMQTTManager(brokers=[], enable_stats=False)
+        mgr.clients = {"b%d" % i: _FakeClient(s) for i, s in enumerate(statuses)}
+        return mgr
+
+    def test_returns_immediately_when_one_already_connected(self):
+        mgr = self._manager_with_fakes([True, False, False])
+        t0 = time.monotonic()
+        online = mgr.wait_connected(min_count=1, timeout=2.0)
+        self.assertEqual(online, 1)
+        self.assertLess(time.monotonic() - t0, 0.1,
+                        "已有连接时必须立即放行，不该再 sleep")
+
+    def test_times_out_returning_zero_when_none_connects(self):
+        mgr = self._manager_with_fakes([False, False])
+        t0 = time.monotonic()
+        online = mgr.wait_connected(min_count=1, timeout=0.3,
+                                    poll_interval=0.02)
+        self.assertEqual(online, 0)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.25)
+
+    def test_unblocks_as_soon_as_threshold_is_reached(self):
+        class _UpClient:
+            def __init__(self, up):
+                self.up = up
+
+            def is_connected(self):
+                return self.up
+
+        mgr = MultiMQTTManager(brokers=[], enable_stats=False)
+        late = _UpClient(False)
+        mgr.clients = {"fast": _UpClient(True), "late": late}
+
+        def flip():
+            time.sleep(0.2)
+            late.up = True
+
+        threading.Thread(target=flip, daemon=True).start()
+        t0 = time.monotonic()
+        online = mgr.wait_connected(min_count=2, timeout=3.0,
+                                    poll_interval=0.02)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(online, 2)
+        self.assertGreaterEqual(elapsed, 0.15)
+        self.assertLess(elapsed, 1.0,
+                        "必须在第二个连接一上线就放行，而不是等满超时")
+
+    def test_is_connected_exception_counts_as_offline(self):
+        mgr = self._manager_with_fakes([RuntimeError("paho boom"), True])
+        online = mgr.wait_connected(min_count=1, timeout=0.2,
+                                    poll_interval=0.02)
+        self.assertEqual(online, 1)
 
 
 if __name__ == "__main__":

@@ -35,9 +35,17 @@ class MQTTClientNode:
         self.lock = threading.Lock()
         self._subscribed_topics = set()
 
-    def start(self):
+    def start(self, connect_timeout=10.0):
         self.mqtt_net.start()
-        time.sleep(2)
+        # 不再写死 sleep(2)：等第一个 broker 一连上就继续（实测最快约
+        # 0.1s）；全部连不上时最多等到超时，随后台重连继续往下走，
+        # 由后续请求自身的超时决定成败。
+        online = self.mqtt_net.wait_connected(
+            min_count=1, timeout=connect_timeout)
+        if online <= 0:
+            logger.warning(
+                "启动后 %.0fs 内没有任何 broker 连接成功，继续尝试"
+                "（paho 会在后台自动重连）", connect_timeout)
         self._subscribe_once(REPLY_TOPIC)
 
     def _subscribe_once(self, topic):

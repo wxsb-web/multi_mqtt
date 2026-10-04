@@ -186,19 +186,21 @@ class MQTTServer:
             return None
 
         self.mqtt_net.subscribe(self.request_topic)
-        #time.sleep(1)
+        # 不写死 sleep：首个 broker 一连上就宣布就绪；迟到的 broker 会在
+        # on_connect 时按 subscribed_topics 自动补订阅，不会漏消息。
+        online = self.mqtt_net.wait_connected(min_count=1, timeout=5.0)
 
         verify_enabled, verify_reason = _is_verify_enabled(self.mqtt_net)
         logger.info(
-            "🚀 [%s] 服务端已就绪，正在监听: %s , reply_topic=%s , mqtt_pub_key=%s , 验签=%s",
+            "🚀 [%s] 服务端已就绪（在线 broker %d/%d），正在监听: %s , reply_topic=%s , mqtt_pub_key=%s , 验签=%s",
             stime(),
+            online, len(getattr(self.mqtt_net, "clients", {}) or {}),
             self.request_topic,
             self.reply_topic,
             _describe_public_key(self.mqtt_net.server_public_key_bytes),
             verify_reason if verify_enabled else f"{verify_reason}",
         )
 
-        time.sleep(2)
         logger.info("[连接质量统计报告]%s", self.mqtt_net.stats.get_report(is_windows_cmd=(sys.platform=="win32")))
         if not block:
             return self

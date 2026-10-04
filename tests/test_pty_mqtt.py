@@ -34,6 +34,8 @@ from remote_cmd import (  # noqa: E402
     build_pty_start_code, PTY_FRAME_MAX,
 )
 from rpc_executor import PythonExecutor  # noqa: E402
+from multi_mqtt import BROKER_LIST  # noqa: E402
+import pty_client_mqtt as pcm  # noqa: E402
 
 IS_POSIX = os.name == "posix"
 
@@ -204,6 +206,32 @@ class RemotePtyClientTests(unittest.TestCase):
                             if _ == in_topic))
         self.assertIn(("unsub", "pty/pty-close-1/out"), tr.events)
         self.assertIsNone(pty.sid)
+
+    def test_broker_status_without_node_falls_back_to_config_count(self):
+        online, total, hosts = pcm._broker_status(FakeTransport())
+        self.assertEqual((online, hosts), (0, []))
+        self.assertEqual(total, len(BROKER_LIST))
+
+    def test_broker_status_counts_only_connected_clients(self):
+        from types import SimpleNamespace
+
+        class _Cli:
+            def __init__(self, up):
+                self._up = up
+
+            def is_connected(self):
+                return self._up
+
+        class _Boom:
+            def is_connected(self):
+                raise RuntimeError("paho 内部异常也不能炸统计")
+
+        net = SimpleNamespace(clients={
+            "up-a": _Cli(True), "down-b": _Cli(False), "boom": _Boom()})
+        tr = SimpleNamespace(node=SimpleNamespace(mqtt_net=net))
+        online, total, hosts = pcm._broker_status(tr)
+        self.assertEqual((online, total), (1, 3))
+        self.assertEqual(hosts, ["up-a"])
 
 
 # ============================ 2. 模板静态检查（全平台） ============================
