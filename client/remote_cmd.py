@@ -26,10 +26,13 @@
 """
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import posixpath
 import shlex
+import tarfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -37,14 +40,19 @@ from abc import ABC, abstractmethod
 # ---- 传输尺寸约束（均按实测的公共 broker 行为设定） --------------------------
 MAX_TRANSFER = 1 << 20          # 1 MiB：单文件经本报文通道传输的默认硬上限
 WIRE_BUDGET = 1 << 17          # 128 KiB：单条报文 JSON 转义后在线尺寸目标（实测 0.3s）
+# pull_dir 整目录压缩包：硬顶 1 MiB（用户红线，远端同样强制，调更高必被拒）；
+# 默认阈值只给 700 KiB——压缩包还要 base64（膨胀 4/3 ≈ 934KiB）外加 JSON/信封，
+# 必须稳在 broker 实测可过的 1000 KiB 线以内。
+MAX_DIR_ARCHIVE = 1 << 20
+DEFAULT_DIR_ARCHIVE_MAX = 700 << 10
 INLINE_MAX = 8192              # 命令输出小于该字节数时直接随回包返回
 DEFAULT_TIMEOUT = 60           # 单次问答默认等待秒数
 DEFAULT_STREAM_TOPIC = "sys/device/stream"  # 远端周期汇报的默认 topic
 
 # ---- PTY 会话约束 ------------------------------------------------------------
 PTY_FRAME_MAX = 1 << 14        # 16 KiB：PTY 单帧原始字节上限（最坏 latin-1 转义后 < 96KiB）
-DEFAULT_PTY_TTL = 12 * 3600    # 孤儿 PTY 会话最长存活秒数（默认 12 小时）
-MAX_PTY_TTL = 24 * 3600        # TTL 允许设定的上限
+DEFAULT_PTY_TTL = 3600*24    # 孤儿 PTY 会话最长存活秒数（默认 12 小时）
+MAX_PTY_TTL = 3600*24*30        # TTL 允许设定的上限
 
 
 # ============================ 网络层抽象（更换协议时实现它） ============================
@@ -643,6 +651,164 @@ def _cmq_dispatch():
                  "age": round(_t.time() - _v["started"], 1)}
                 for _k, _v in list(_ss2.items())]}
 
+        elif _op == "pull_dir":
+            # 整目录打包回传（替代 shell 里的 tar|base64|split 手工流）：
+            # 纯标准库 os.walk + tarfile + gzip（mtime=0 确定性输出），
+            # base64 承载——gzip 随机字节经 latin-1 映射会被 \uXXXX 膨胀 6 倍，
+            # base64 是纯 ASCII 1:1。压缩包硬顶 1MiB：超过立即中止打包并返回
+            # 结构化诊断（最大文件清单/原始字节数），绝不靠分块硬闯 broker
+            # （公共 broker 实测 1000KiB 可过、1200KiB 丢包）。
+            import tarfile as _tf3, gzip as _gz3, base64 as _b63
+            import fnmatch as _fn3, io as _io3
+            _HARD3 = 1 << 20
+            _root = _o.path.normpath(_xp(_a["path"]))
+            if not _o.path.isdir(_root0 := _root):
+                raise NotADirectoryError(_root0)
+            _pats = [str(_x) for _x in (_a.get("excludes") or []) if str(_x)]
+            _topn = min(max(1, int(_a.get("top_n", 15))), 100)
+            _mb = int(_a.get("max_bytes") or 0)
+            if _mb <= 0 or _mb > _HARD3:
+                _mb = _HARD3
+
+            def _excluded3(_relp):
+                _cs = [_c for _c in _relp.split("/") if _c not in ("", ".")]
+                for _pat in _pats:
+                    if _fn3.fnmatchcase(_relp, _pat):
+                        return True
+                    for _c in _cs:
+                        if _fn3.fnmatchcase(_c, _pat):
+                            return True
+                return False
+
+            class _PDIO(_io3.BytesIO):
+                # 边压缩边计数，超过上限即停，避免大目录在内存里构建整个包。
+                def __init__(self, limit):
+                    super().__init__()
+                    self.written = 0
+                    self.limit = limit
+
+                def write(self, b):
+                    z = super().write(b)
+                    self.written += z
+                    return z
+
+            class _PDStop(Exception):
+                pass
+
+            _entries = []
+            _nfiles = _ndirs = _nlink = _nspec = _nexcl = 0
+            _raw = 0
+            _big = []
+            for _dp, _dn3, _fns in _o.walk(_root, topdown=True, followlinks=False):
+                _rb = _o.path.relpath(_dp, _root)
+                _rb = "" if _rb == "." else _rb.replace(_o.sep, "/")
+                _keep = []
+                for _d in sorted(_dn3):
+                    if _o.path.islink(_o.path.join(_dp, _d)):
+                        _nlink += 1
+                        continue
+                    _relp = (_rb + "/" + _d) if _rb else _d
+                    if _pats and _excluded3(_relp):
+                        _nexcl += 1
+                        continue
+                    _keep.append(_d)
+                _dn3[:] = _keep  # 被排除/链接目录就地剪枝，walk 不再下钻
+                _entries.append((_dp, "." if not _rb else _rb, True))
+                _ndirs += 1
+                for _f in sorted(_fns):
+                    _ap = _o.path.join(_dp, _f)
+                    _relp = (_rb + "/" + _f) if _rb else _f
+                    if _pats and _excluded3(_relp):
+                        _nexcl += 1
+                        continue
+                    _m = _o.lstat(_ap).st_mode
+                    if _st.S_ISLNK(_m):
+                        _nlink += 1
+                        continue
+                    if not _st.S_ISREG(_m):
+                        _nspec += 1
+                        continue
+                    _sz = _o.path.getsize(_ap)
+                    _nfiles += 1
+                    _raw += _sz
+                    _big.append((_sz, _relp))
+                    _entries.append((_ap, _relp, False))
+
+            def _too_large3(_reached):
+                _big.sort(key=lambda _z: _z[0], reverse=True)
+                _top = _big[:_topn]
+                _lines = "\n".join("    %10d  ./%s" % (_sz, _rp)
+                                   for _sz, _rp in _top)
+                _msg = (
+                    "远程目录打包被拒绝: %r 压缩后已达 %d 字节, 超过上限 %d 字节"
+                    "（压缩包硬顶 1MiB，不允许调更高）。\n"
+                    "- 原始文件合计 %d 字节；文件 %d 个/目录 %d 个；排除命中 %d 项；"
+                    "跳过符号链接 %d 个/特殊文件 %d 个。\n"
+                    "- 本次 excludes: %s\n"
+                    "- 最大的 %d 个文件（优先考虑排除它们）:\n%s\n"
+                    "- 处理建议:\n"
+                    "  1) 带 --exclude 重拉，例如 --exclude build --exclude out "
+                    "--exclude .git --exclude __pycache__ --exclude '*.pyc'；\n"
+                    "  2) MQTT 单报文实测 1000KiB 可过、1200KiB 丢包，base64 还会"
+                    "膨胀 4/3，所以默认阈值只有 700KiB；大文件/大目录必须在远端"
+                    "就地处理（grep/sed/tar 分流/curl），不要经报文通道回传；\n"
+                    "  3) apk/图片/so/pyc 等二进制压缩率极低，应优先排除。"
+                ) % (_root, _reached, _mb, _raw, _nfiles, _ndirs, _nexcl,
+                     _nlink, _nspec,
+                     ("[" + ", ".join(_pats) + "]") if _pats else "(无)",
+                     len(_top), _lines or "    (无)")
+                return {"ok": False, "reason": "too_large", "error": _msg,
+                        "path": _root, "reached_bytes": _reached, "max_bytes": _mb,
+                        "raw_bytes": _raw, "files": _nfiles, "dirs": _ndirs,
+                        "excluded": _nexcl, "skipped_links": _nlink,
+                        "skipped_special": _nspec, "excludes": _pats,
+                        "largest": [{"path": _rp, "size": _sz}
+                                    for _sz, _rp in _top]}
+
+            class _GuardedReader:
+                # tarfile.addfile 以 16KiB 块调 read()：每块前看压缩输出计数，
+                # 越过上限即中止——即使是单个 2GB 不可压缩文件，内存也只多一块。
+                def __init__(self, fh, counter):
+                    self._fh = fh
+                    self._c = counter
+
+                def read(self, n=-1):
+                    if self._c.written > self._c.limit:
+                        raise _PDStop()
+                    return self._fh.read(n)
+
+            _io3b = _PDIO(_mb)
+            _aborted = False
+            try:
+                with _gz3.GzipFile(filename="", mode="wb", fileobj=_io3b,
+                                   compresslevel=9, mtime=0) as _gzf:
+                    with _tf3.open(fileobj=_gzf, mode="w") as _tar:
+                        for _ap, _arc, _isd in _entries:
+                            _ti = _tar.gettarinfo(_ap, arcname=_arc)
+                            if _isd:
+                                _tar.addfile(_ti)
+                            else:
+                                with open(_ap, "rb") as _fh2:
+                                    _tar.addfile(_ti, _GuardedReader(_fh2, _io3b))
+                            if _io3b.written > _mb:
+                                raise _PDStop()
+            except _PDStop:
+                _aborted = True
+            if _aborted:
+                _res = _too_large3(_io3b.written)
+            else:
+                _blob = _io3b.getvalue()
+                if len(_blob) > _mb:
+                    _res = _too_large3(len(_blob))
+                else:
+                    _res = {"ok": True, "path": _root,
+                            "b64": _b63.b64encode(_blob).decode("ascii"),
+                            "md5": _hl.md5(_blob).hexdigest(),
+                            "arc_bytes": len(_blob), "max_bytes": _mb,
+                            "raw_bytes": _raw, "files": _nfiles, "dirs": _ndirs,
+                            "skipped_links": _nlink, "skipped_special": _nspec,
+                            "excluded": _nexcl, "excludes": _pats}
+
         else:
             _res = {"ok": False, "error": "unknown op: %r" % (_op,)}
 
@@ -1133,6 +1299,56 @@ def _iter_wire_chunks(s: str, budget: int = WIRE_BUDGET):
         i = best
 
 
+# ============================ pull_dir 本地解压 ============================
+
+def _is_within(base: str, target: str) -> bool:
+    base = os.path.abspath(base)
+    target = os.path.abspath(target)
+    return base == target or target.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def _validate_tar_member(member: tarfile.TarInfo) -> str:
+    """拒绝一切逃逸/非普通条目：绝对路径、盘符、.. 穿越、硬/软链接、设备文件。
+
+    返回校验过的 posix 风格成员名。pull_dir 远端只写目录/普通文件，这里是
+    防"回包在传输途中被替换"的纵深防线。
+    """
+    name = member.name.replace("\\", "/")
+    if not name or name.startswith("/") or posixpath.isabs(name):
+        raise RemoteError(f"非法 tar 条目（绝对路径）: {member.name!r}")
+    if ":" in name.split("/")[0]:  # Windows 盘符 C:
+        raise RemoteError(f"非法 tar 条目（盘符）: {member.name!r}")
+    parts = [p for p in name.split("/") if p]
+    if any(p == ".." for p in parts):
+        raise RemoteError(f"非法 tar 条目（.. 穿越）: {member.name!r}")
+    if member.issym() or member.islnk():
+        raise RemoteError(f"非法 tar 条目（链接）: {member.name!r}")
+    if not (member.isdir() or member.isfile()):
+        raise RemoteError(f"非法 tar 条目（特殊文件）: {member.name!r}")
+    return "/".join(parts) + ("/" if member.isdir() else "")
+
+
+def safe_extract_tar(archive: bytes, dest: str) -> int:
+    """把 pull_dir 回来的 tar.gz 字节安全解压到 dest，返回条目数。"""
+    dest = os.path.abspath(dest)
+    os.makedirs(dest, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
+        members = []
+        for m in tf.getmembers():
+            _validate_tar_member(m)
+            target = os.path.join(dest, *m.name.split("/"))
+            if not _is_within(dest, target):
+                raise RemoteError(f"非法 tar 条目（越界）: {m.name!r}")
+            members.append(m)
+        # 3.12+ 官方 data filter 再兜一层（uid/setuid/特殊设备等）；
+        # 旧版解释器没有 filter 参数，条目已在上面手工校验过。
+        try:
+            tf.extractall(dest, members=members, filter="data")
+        except TypeError:
+            tf.extractall(dest, members=members)
+    return len(members)
+
+
 # ============================ 异常 / 结果对象 ============================
 
 class RemoteError(RuntimeError):
@@ -1162,6 +1378,19 @@ class RemoteOpError(RemoteError):
 
 class TransferTooLarge(RemoteError):
     """试图经报文通道传输超过 MAX_TRANSFER 的文件/数据。"""
+
+
+class DirArchiveTooLarge(TransferTooLarge):
+    """pull_dir 压缩包超过允许大小（远端强制 1 MiB 硬顶）。
+
+    ``env`` 是远端返回的结构化诊断：raw_bytes/files/dirs/excluded/
+    skipped_links/skipped_special/excludes/largest[{path,size}]，
+    ``str(exc)`` 已是面向调用方 AI 的完整中文说明与建议。
+    """
+
+    def __init__(self, message, env=None):
+        super().__init__(message)
+        self.env = env or {}
 
 
 class CmdResult:
@@ -1336,6 +1565,11 @@ class RemoteShell:
                 off += r["n"]
                 if r["eof"]:
                     break
+                if r["n"] == 0:
+                    # n=0 却不宣告 eof（远端暂存被截断/实现异常）：继续拉
+                    # 只会无限重放同一帧，必须显式失败让 finally 去 drop。
+                    raise RemoteError(
+                        f"远端暂存读取停滞: id={sid} off={off} 返回 n=0 且未 eof")
         finally:
             try:
                 self._call("drop", id=sid)
@@ -1412,7 +1646,7 @@ class RemoteShell:
         script = f"""set -e
 PKS={shlex.quote(pkgs)}
 FORCE_MGR={shlex.quote(str(manager or ""))}
-DO_UPDATE={shlex.quote("" if update else "0")}
+DO_UPDATE={shlex.quote("" if update is None or update is True else "0")}
 if [ -n "$FORCE_MGR" ]; then
   M="$FORCE_MGR"
   command -v "$M" >/dev/null 2>&1 || {{ echo "package manager not found: $M" >&2; exit 127; }}
@@ -1488,6 +1722,35 @@ fi
         r = self.run("command -v -- %s || true" % shlex.quote(str(name)))
         p = r.text.strip()
         return p or None
+
+    def tmux_capture_pane(self, session=0, max_lines=9999, reverse=False,
+                     socket="", capture_args="-J", timeout=None) -> str:
+        """抓取远端 tmux 窗格内容（capture-pane + show-buffer），返回文本。
+
+        参数语义与 qgb.U.tmux_capture_pane 对齐：
+        - ``session=0``：目标窗格；``0``/``None``/``""`` 表示 tmux 默认目标；
+          支持 ``'sess'`` / ``'sess:win'`` / ``'sess:win.pane'``（含空格也可，
+          自动 shell 引号）。
+        - ``max_lines=9999``：向上回溯行数（capture-pane ``-S -N``），负值夹到 0。
+        - ``reverse=True``：行序倒转（最新一行在最上，本地做，不发额外请求）。
+        - ``socket``：tmux ``-S`` 套接字路径（多 server / 非默认 socket 时用）。
+        - ``capture_args='-J'``：原样透传给 capture-pane 的额外参数
+          （``-J`` 合并折行；要保留 ANSI 颜色可加 ``-e``）。
+        远端先 ``unset TMUX``，在 tmux 会话内调用也不会被拒。
+        """
+        sock = ("-S " + shlex.quote(str(socket).strip())) if socket else ""
+        sess = "" if session in (None, "") else str(session).strip()
+        tgt = ("-t " + shlex.quote(sess)) if sess else ""
+        n = max(0, int(max_lines))
+        script = ("unset TMUX; "
+                  f"tmux {sock} capture-pane -S -{n} {tgt} {capture_args} "
+                  f"&& tmux {sock} show-buffer")
+        out = self.run(script, timeout=timeout, check=True).text
+        if reverse:
+            lines = out.split("\n")
+            lines.reverse()
+            out = "\n".join(lines)
+        return out
 
     # ---------- 周期汇报 / 持续输出（像 ssh 里跑 top，但是订阅推送模型） ----------
 
@@ -1593,6 +1856,11 @@ fi
             off += r["n"]
             if r["eof"]:
                 break
+            if r["n"] == 0:
+                # 文件可能在读取间隔被截断到当前 offset，或服务端异常：
+                # n=0 且不 eof 时继续循环永不退出，显式失败。
+                raise RemoteError(
+                    f"远端读取停滞: {path} off={off} 返回 n=0 且未 eof")
         return b"".join(parts)
 
     def read_text(self, path, encoding="utf-8", allow_large=False) -> str:
@@ -1654,6 +1922,11 @@ fi
                 if r["eof"]:
                     total = r["size"]
                     break
+                if r["n"] == 0:
+                    # 与 read/_fetch_stash 同款停滞保护：n=0 且不 eof 时
+                    # 无限循环会把本地 .cmqpart 写个不停，必须立即失败。
+                    raise RemoteError(
+                        f"远端下载停滞: {remote} off={off} 返回 n=0 且未 eof")
         os.replace(tmp, local)
         digest = None
         if verify:
@@ -1702,6 +1975,69 @@ fi
         if r.get("bytes") != size:
             raise RemoteError(f"上传大小不一致: local={size} remote={r.get('bytes')}")
         return r
+
+    # ---------- 整目录打包拉取（压缩包硬顶 1 MiB） ----------
+
+    @staticmethod
+    def _normalize_dir_max(max_bytes) -> int:
+        if max_bytes is None:
+            return DEFAULT_DIR_ARCHIVE_MAX
+        mb = int(max_bytes)
+        if mb <= 0:
+            raise ValueError("max_bytes 必须是正整数（字节）")
+        if mb > MAX_DIR_ARCHIVE:
+            raise DirArchiveTooLarge(
+                f"请求的压缩包上限 {mb} 字节超过硬顶 {MAX_DIR_ARCHIVE} 字节（1MiB）："
+                "公共 broker 单报文实测 1000KiB 可过、1200KiB 丢包，压缩包还要 "
+                "base64 膨胀 4/3，默认阈值仅 700KiB。请改用 --exclude 排除构建产物"
+                "/依赖目录，或在远端就地处理大文件，不要把超 1MiB 的包经 MQTT 回传。")
+        return mb
+
+    def pull_dir_bytes(self, remote, excludes=(), max_bytes=None) -> "tuple[bytes, dict]":
+        """远端整目录打包（纯标准库 tar.gz），返回 ``(压缩包 bytes, 元信息)``。
+
+        - ``excludes``：fnmatch 模式，对**任意层级的目录/文件名组件**与相对路径
+          匹配（如 ``"build"``、``"__pycache__"``、``"*.pyc"``），目录命中即剪枝；
+        - 压缩包大小在远端强制：``max_bytes`` 默认 700 KiB，硬顶 1 MiB，超限抛
+          :class:`DirArchiveTooLarge`，异常消息自带最大文件清单与排除建议；
+        - 回包经 md5 + arc_bytes 双校验；符号链接/特殊文件远端一律跳过。
+        """
+        import hashlib
+        mb = self._normalize_dir_max(max_bytes)
+        try:
+            env = self._call(
+                "pull_dir", path=str(remote),
+                excludes=[str(x) for x in excludes], max_bytes=mb)
+        except RemoteOpError as e:
+            if (e.env or {}).get("reason") == "too_large":
+                raise DirArchiveTooLarge(str(e), e.env) from e
+            raise
+        try:
+            blob = base64.b64decode(env["b64"], validate=True)
+        except Exception as e:
+            raise RemoteError(f"pull_dir 回包 base64 解码失败: {e}") from e
+        if len(blob) != int(env.get("arc_bytes", -1)):
+            raise RemoteError(
+                f"pull_dir 大小不一致: 本地解码 {len(blob)} != 远端 arc_bytes "
+                f"{env.get('arc_bytes')}（可能报文被截断/污染，重试或缩小范围）")
+        if hashlib.md5(blob).hexdigest() != env.get("md5"):
+            raise RemoteError(
+                "pull_dir 校验失败: 压缩包 md5 与远端不一致（报文可能损坏，重试）")
+        return blob, env
+
+    def pull_dir(self, remote, local, excludes=(), max_bytes=None) -> dict:
+        """整目录拉取并安全解压到 ``local``（不存在自动建）。
+
+        返回元信息：local/files/dirs/arc_bytes/raw_bytes/md5/excluded/
+        skipped_links/skipped_special/excludes。压缩包超限时抛
+        :class:`DirArchiveTooLarge`（内含面向 AI 的完整诊断与建议）。
+        """
+        blob, env = self.pull_dir_bytes(remote, excludes=excludes, max_bytes=max_bytes)
+        local_abs = os.path.abspath(str(local))
+        n = safe_extract_tar(blob, local_abs)
+        env["local"] = local_abs
+        env["extracted"] = n
+        return env
 
     # ---------- 目录 / 元信息 ----------
 
@@ -2046,13 +2382,19 @@ class RemotePty:
         PTY 帧没有 req_id，不经过网络层的首帧去重，而 publish 会广播到
         所有 broker，同一帧必然被服务端收多份；序号让服务端只放行首帧。
         owner 让同时应答的影子 PTY 收到第一帧即自杀。
+
+        注意：打号与 publish 必须在同一把锁内原子完成。否则两个线程
+        （键盘线程发 k、resize 线程发 winsz）可能 A 拿到 iseq=1、B 拿到
+        iseq=2 后 B 先 publish、A 后 publish；服务端 _in_loop 的单调闸门
+        会把晚到的 iseq=1 当旧帧永久丢弃，表现为按键偶发丢失。publish
+        对本地网络层只是把一帧推进 broker 队列，持锁代价可接受。
         """
         with self._ilock:
             if self.owner:
                 payload["owner"] = self.owner
             payload["iseq"] = self._iseq
             self._iseq += 1
-        self.tr.publish(self.in_topic, payload)
+            self.tr.publish(self.in_topic, payload)
 
     def send(self, data) -> None:
         """把本地按键字节写入远端 PTY（latin-1 承载，可逐键也可合并）。"""

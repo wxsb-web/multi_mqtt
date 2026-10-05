@@ -105,7 +105,15 @@ login shell 的 argv0 带 `-` 前缀；子进程 `setsid()` + `TIOCSCTTY` 拿控
 | `DEFAULT_PTY_TTL` / `MAX_PTY_TTL` | 12h / 24h | 孤儿会话寿命 |
 | `WIRE_BUDGET` | 128KiB | 文件分块单报文目标在线尺寸 |
 | `MAX_TRANSFER` | 1MiB | 文件经报文通道传输硬上限 |
+| `MAX_DIR_ARCHIVE` / `DEFAULT_DIR_ARCHIVE_MAX` | 1MiB / 700KiB | `pull_dir` 压缩包硬顶（客户端+远端双侧强制）/默认阈值（base64×4/3 后仍 <1000KiB） |
 | broker 实测 | 1000KiB 可过 / 1200KiB 丢 | 大文件必须远端就地处理 |
+
+`pull_dir`（普通签名 RPC op，非 PTY）：payload `{op:"pull_dir", path, excludes[],
+max_bytes, top_n}`；远端纯标准库 `os.walk`（exclude 按路径组件+相对路径 fnmatch，
+命中目录即剪枝）→ `tarfile+gzip(mtime=0)` 边压边计数、超限即停 → 成功回
+`{ok,b64,md5,arc_bytes,raw_bytes,files,dirs,excluded,skipped_links,skipped_special,
+excludes}`，超限回 `{ok:false,reason:"too_large",largest:[{path,size}]...}`，
+客户端映射为 `DirArchiveTooLarge`。符号链接/特殊文件不入包。
 
 ## 7. 二次开发要点
 

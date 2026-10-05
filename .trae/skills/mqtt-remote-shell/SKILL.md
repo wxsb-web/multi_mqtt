@@ -1,6 +1,6 @@
 ---
 name: mqtt-remote-shell
-description: 通过公共 MQTT broker 像 SSH 一样操作远端设备，含一次性命令、就地 grep/编辑、文件传输与交互式 PTY 终端。当用户要求在 MQTT 设备或容器上跑命令、改文件、开远程终端（ssh/pty/remote shell/远程执行）时使用；纯本地任务不要用。
+description: 通过mqtt 像 SSH 一样操作远端设备，含一次性命令、就地 grep/编辑、文件传输与交互式 PTY 终端。当用户要求在 MQTT 设备或容器上跑命令、改文件、开远程终端（ssh/pty/remote shell/远程执行）时使用；纯本地任务不要用。
 ---
 
 # MQTT 远程 Shell / PTY（像 SSH 一样用）
@@ -71,6 +71,22 @@ python client/cmd_client_mqtt.py write /root/x.txt --data "hello"
 python client/cmd_client_mqtt.py edit /etc/app.conf --old "v1" --new "v2"   # 精确替换，默认备份 .bak
 ```
 
+整目录拉取（远端纯 Python 标准库打包，**不依赖 tar/base64 等外部命令**）：
+
+```bash
+# 打包 → 校验(md5) → 安全解压到本地目录；--exclude 可重复，fnmatch 匹配任意层级目录/文件名组件
+python client/cmd_client_mqtt.py pull-dir /root/proj ./proj_mirror \
+    --exclude .git --exclude build --exclude __pycache__ --exclude '*.pyc'
+python client/cmd_client_mqtt.py getdir /etc/nginx ./nginx_mirror   # 别名 getdir/pulldir
+python client/cmd_client_mqtt.py pull-dir /root/proj --tgz proj.tgz # 只存压缩包不解压
+python client/cmd_client_mqtt.py pull-dir /root/proj ./m --max-bytes 1048576  # 默认 700KiB，硬顶 1MiB
+```
+
+压缩包超限时**远端拒绝打包**并返回面向 AI 的诊断（中文）：已达字节数、原始总
+字节、文件/目录数、**最大的 15 个文件清单**、本次 excludes、以及缩小范围的具
+体建议。客户端抛 `DirArchiveTooLarge`（`.env` 为结构化字段）。REPL 里对应
+`%getdir <远端目录> [本地目录] [--exclude P]... [--tgz PATH]`。
+
 Python API（多步编排、要结构化结果时用，避免反复起进程）：
 
 ```python
@@ -87,13 +103,25 @@ try:
     matches = sh.grep("ERROR", paths=("src",), fixed=False)
     sh.edit_replace("/etc/x", "old", "new", backup=True)
     sh.download("/var/log/app.log", "./app.log")   # >1MiB 默认拒绝
+    # 整目录：tar.gz 在远端用纯标准库打包，回包 md5+长度双校验后安全解压
+    meta = sh.pull_dir("/root/proj", "./proj_mirror",
+                       excludes=[".git", "build", "__pycache__", "*.pyc"])
+    blob, meta = sh.pull_dir_bytes("/etc/nginx")   # 只要压缩包字节
+    # 抓远端 tmux 窗格：
+    txt = sh.tmux_capture_pane("main:2.1", max_lines=500, capture_args="-J -e")
 finally:
     sh.close()
 ```
 
+`pull_dir(remote, local, excludes=(), max_bytes=None) -> meta`：
+`excludes` 为 fnmatch 模式（匹配任意层级路径组件或相对路径，目录命中即剪枝）；
+`max_bytes` 默认 700KiB（base64 后仍 < 1000KiB 报文线），**硬顶 1MiB**，超限抛
+`DirArchiveTooLarge`（异常文本含最大文件清单与排除建议，`.env.largest` 可程序化读取）；
+符号链接/设备文件远端跳过。内部安全解压拒绝绝对路径/`..` 穿越/链接条目。
+
 可用方法：`run/py/info/cd/grep/edit_replace/append_text/read/write/download/upload/
-ls/stat/exists/mkdir/rm/mv/cp/chmod/hash/install_packages/apt_install/pip_install/
-which/stream/monitor`。详见 [remote_cmd.py](file:///c:/test/github/multi_mqtt/client/remote_cmd.py) 中 `RemoteShell`。
+pull_dir/pull_dir_bytes/ls/stat/exists/mkdir/rm/mv/cp/chmod/hash/install_packages/
+apt_install/pip_install/which/tmux_capture_pane/stream/monitor`。详见 [remote_cmd.py](file:///c:/test/github/multi_mqtt/client/remote_cmd.py) 中 `RemoteShell`。
 
 ## 5. 交互式 PTY（人类终端 / 全屏程序）
 
@@ -139,7 +167,34 @@ pty.detach()               # 或对端 exit 后 pty.end_reason 置位
 ```bash
 # 人类先在一台终端里开着（建议只绑本机）；窗口就是监控屏
 python client/pty_client_mqtt.py -k "123+456" --host 127.0.0.1
+# Windows 本机须用 C:\QGB\miniforge3\python.exe（3.14，含 paho）；
+# PATH 默认的 Anaconda 3.7 无法导入本仓库代码（新式类型注解语法）
 ```
+
+### AI 30 秒上手（其他 AI 先看这段）
+
+1. **先探活**：`GET http://127.0.0.1:1188/r=ai_bridge.status()`，看 `attached` / `busy` / `end_reason` / `brokers_online`。
+2. **跑命令**：Python 环境用 `ai_pty_run(...)`；只有 HTTP 时用 `/r=ai_bridge.run("...")`。
+3. `busy=true` 就等上一条结束，**不要并发**；`end_reason` 非 null 说明监控窗口已退出，请人类重启（AI 自己无法启动，PTY 要求交互 TTY）。
+4. 命令全程在人类窗口可见；`run()` 返回结构 `{ok, rc, out, timed_out, ...}`。
+
+### 裸 HTTP：优先用最短的 `/r=表达式`
+
+控制口把 **URL 路径直接当 Python 源码执行**，返回值按优先级取：
+`p.set_data(...)` 显式响应体 → 持久命名空间里的变量 `r` → print 捕获的 stdout。
+所以单表达式一条路径就够，不必 `import json` + 百分号编码整串代码：
+
+```
+GET http://127.0.0.1:1188/r=ai_bridge.status()
+GET http://127.0.0.1:1188/r=ai_bridge.run("uname%20-a")
+GET http://127.0.0.1:1188/r=ai_bridge.send("y\n")
+```
+
+注意：
+
+- 路径里的空格、引号等仍需 percent-encode；参数一复杂就改用 Python helper（`ai_pty_run/send`），不要在 URL 里堆多语句。
+- 需要精确 JSON 字符串时才用编码后的 `p.set_data(json.dumps(obj, ensure_ascii=False))`。
+- `r` 留在持久命名空间，会被下一次 `/r=...` 覆盖，不要依赖上一次的残留值。
 
 ```python
 # AI / 任意进程：只是一次 localhost HTTP，不碰 broker
@@ -156,7 +211,7 @@ ai_pty_send("y\n")                     # 交互提示喂键（确认/密码）�
 - 命令经同一常驻 shell 执行（cd/export 状态保持）；**串行化**，重叠调用立即返回 `{'ok': False, 'busy': True}`，不要并发。
 - `run()` 用标记回收输出和退出码，超时只停止回收、不杀远端命令（输出继续在窗口刷，可再 `send` 干预）；返回的 `out` 已剥 ANSI。
 - 全屏/真交互程序（vim/top/密码 TUI）不要用 `run()`，人工在窗口操作或只用 `send()` 喂键。
-- 窗口进程退出（Ctrl-]/exit）后调用返回 `pty 已结束`；控制口默认 1188，`--port 0` 关闭；裸 HTTP 也可：POST `http://127.0.0.1:1188/<urlencoded python>`，用 `p.set_data(...)` 定响应体。
+- 窗口进程退出（Ctrl-]/exit）后调用返回 `pty 已结束`；控制口默认 1188，`--port 0` 关闭；裸 HTTP 首选 `GET /r=<表达式>`（见上），多语句才 percent-encode 后走 `p.set_data(...)`。
 
 ## 7. 协议速览（排错用，完整版见 `references/protocol.md`）
 
@@ -170,7 +225,7 @@ ai_pty_send("y\n")                     # 交互提示喂键（确认/密码）�
 
 ## 8. 红线与常见问题
 
-- **单报文 1MiB 是 broker 实测硬上限**（1000KiB 可过、1200KiB 丢，512KiB 已需数秒）。大文件/大输出一律远端就地处理：`grep/sed/curl/tar/apt/pip`，不要 cat 大文件回传。
+- **单报文 1MiB 是 broker 实测硬上限**（1000KiB 可过、1200KiB 丢，512KiB 已需数秒）。大文件/大输出一律远端就地处理：`grep/sed/curl/tar/apt/pip`，不要 cat 大文件回传。整目录回传用 `pull-dir`（纯 Python 打包、md5 校验）：压缩包硬顶 1MiB、默认阈值 700KiB（base64 膨胀 4/3 后仍可过线），超限远端拒绝并返回最大文件清单与 exclude 建议——按建议缩小范围重试，不要自己拼 `tar|base64|split` 手工分块。
 - PTY 只能在 POSIX 服务端建立（依赖 openpty/termios）；Windows 只能当客户端。
 - 启动有固有延迟：`node.start()` 固定等 2s + 各 broker 建连 0.1~13s；首次命令超时就把 `--timeout` 调大。
 - PTY 里输出卡顿：公共 broker 延迟高时加 `-i 0.1~0.5` 攒批，牺牲一点实时性换帧数。
@@ -183,6 +238,10 @@ ai_pty_send("y\n")                     # 交互提示喂键（确认/密码）�
 python client/cmd_client_mqtt.py info
 python client/cmd_client_mqtt.py run "uptime; df -h; free -m"
 python client/cmd_client_mqtt.py run "journalctl -u myapp -n 200 --no-pager" --cmd-timeout 60
+
+# 拉整个小源码目录回本地（纯 Python 打包，替代手工 tar|base64|split；先排除产物目录）
+python client/cmd_client_mqtt.py pull-dir /root/proj ./proj \
+    --exclude .git --exclude build --exclude out --exclude __pycache__ --exclude '*.pyc'
 
 # 只想看持续刷新的 top（这个子命令本身是订阅推送模型，Ctrl-C 停）
 python client/cmd_client_mqtt.py top

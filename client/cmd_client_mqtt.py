@@ -46,7 +46,9 @@ from . import client_mqtt as _cm               # noqa: E402  复用 REPL 基建
 from .remote_cmd import (                      # noqa: E402
     Transport, RemoteShell as _RemoteShell, CmdResult,
     RemoteError, RemoteTimeout, RemoteRpcError, RemoteOpError, TransferTooLarge,
+    DirArchiveTooLarge,
     DEFAULT_TIMEOUT, MAX_TRANSFER, WIRE_BUDGET,
+    MAX_DIR_ARCHIVE, DEFAULT_DIR_ARCHIVE_MAX,
 )
 
 DEFAULT_REQUEST_TOPIC = "sys/device/request"
@@ -258,6 +260,11 @@ _REPL_HELP = """\
   %cat <rpath>        查看远端小文本文件（<1MiB）
   %get <r> [local]    下载远端小文件（默认当前目录，>1MiB 默认拒绝）
   %put <l> [remote]   上传本地小文件（默认会话目录，>1MiB 默认拒绝）
+  %getdir <r> [local] [--exclude P ...] [--tgz PATH]
+                       整目录 tar.gz 打包拉取（纯 Python 打包，默认压缩包
+                       ≤700KiB，硬顶 1MiB 超限拒绝并给出最大文件清单）
+  %tmux [sess[:win[.pane]]] [-n 行数] [-r] [-S sock] [--args '-J -e']
+                       抓取远端 tmux 窗格（capture-pane，默认回溯 9999 行）
   %py <code>          直接执行一行 Python（逃生舱）
   %topic [%t] / %reply / %key [%k] / %allow [%a] / %timeout / %his / %status [%s]
   %help (%?) / %exit (%quit)
@@ -358,6 +365,101 @@ def run_live(shell, *, stats, cmd=None, interval=1.0, count=0, ttl=600.0,
         if redraw:
             out.write("\x1b[?25h")
             out.flush()
+
+
+def _parse_getdir_args(arg):
+    """解析 `%getdir <远端目录> [本地目录] [--exclude P]... [--tgz PATH]`。
+
+    返回 (remote, local, excludes, tgz)；解析失败返回 None。
+    """
+    import shlex
+    try:
+        toks = shlex.split(arg)
+    except ValueError:
+        return None
+    if not toks:
+        return None
+    remote = toks[0]
+    local = "."
+    excludes = []
+    tgz = None
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        if t == "--exclude" and i + 1 < len(toks):
+            excludes.append(toks[i + 1]); i += 2
+        elif t.startswith("--exclude="):
+            excludes.append(t.split("=", 1)[1]); i += 1
+        elif t == "--tgz" and i + 1 < len(toks):
+            tgz = toks[i + 1]; i += 2
+        elif t.startswith("--tgz="):
+            tgz = t.split("=", 1)[1]; i += 1
+        elif local == ".":
+            local = t; i += 1
+        else:
+            return None
+    return remote, local, excludes, tgz
+
+
+def _do_pull_dir(shell, remote, local, excludes, tgz, max_bytes, print_fn):
+    """CLI / REPL 共用的 pull-dir 执行体。"""
+    if tgz:
+        blob, meta = shell.pull_dir_bytes(remote, excludes=excludes,
+                                          max_bytes=max_bytes)
+        tgz_abs = os.path.abspath(tgz)
+        os.makedirs(os.path.dirname(tgz_abs) or ".", exist_ok=True)
+        tmp = tgz_abs + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(blob)
+        os.replace(tmp, tgz_abs)
+        print_fn(f"已保存压缩包 -> {tgz_abs} ({meta['arc_bytes']}B, "
+                 f"md5={meta['md5']}, {meta['files']} 文件/{meta['dirs']} 目录, "
+                 f"原始 {meta['raw_bytes']}B, 排除 {meta['excluded']} 项)",
+                 color=_cm.C.GREEN)
+    else:
+        meta = shell.pull_dir(remote, local, excludes=excludes,
+                              max_bytes=max_bytes)
+        print_fn(f"已拉取目录 -> {meta['local']}（解压 {meta['extracted']} 条, "
+                 f"压缩包 {meta['arc_bytes']}B, md5={meta['md5']}, "
+                 f"{meta['files']} 文件/{meta['dirs']} 目录, "
+                 f"原始 {meta['raw_bytes']}B, 排除 {meta['excluded']} 项, "
+                 f"跳过链接 {meta['skipped_links']}/特殊 {meta['skipped_special']}）",
+                 color=_cm.C.GREEN)
+
+
+def _parse_tmux_args(arg):
+    """解析 `%tmux [session] [-n 行数] [-r] [-S sock] [--args ARGS]`。
+
+    返回 (session, max_lines, reverse, socket, capture_args)；失败返回 None。
+    """
+    import shlex
+    try:
+        toks = shlex.split(arg)
+    except ValueError:
+        return None
+    session, max_lines, reverse, socket, cargs = "0", 9999, False, "", "-J"
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-n", "--max-lines") and i + 1 < len(toks):
+            try:
+                max_lines = int(toks[i + 1])
+            except ValueError:
+                return None
+            i += 2
+        elif t in ("-r", "--reverse"):
+            reverse = True; i += 1
+        elif t in ("-S", "--socket") and i + 1 < len(toks):
+            socket = toks[i + 1]; i += 2
+        elif t == "--args" and i + 1 < len(toks):
+            cargs = toks[i + 1]; i += 2
+        elif t.startswith("--args="):
+            cargs = t.split("=", 1)[1]; i += 1
+        elif not t.startswith("-"):
+            session = t; i += 1
+        else:
+            return None
+    return session, max_lines, reverse, socket, cargs
 
 
 def _parse_watch(line):
@@ -593,6 +695,25 @@ def run_repl(shell: MqttRemoteShell, history_path=None):
                 r = shell.upload(ap[0], rp)
                 print_fn(f"已上传 -> {r['path']} ({r['bytes']}B, {r['mode']})",
                          color=_cm.C.GREEN)
+        elif cmd in ("getdir", "pulldir", "pull-dir"):
+            parsed = _parse_getdir_args(arg)
+            if parsed is None:
+                print_fn("用法: %getdir <远端目录> [本地目录] [--exclude P]... "
+                         "[--tgz PATH]", color=_cm.C.YELLOW)
+                return
+            try:
+                _do_pull_dir(shell, *parsed, max_bytes=None, print_fn=print_fn)
+            except DirArchiveTooLarge as exc:
+                print_fn(f"[拒绝] {exc}", color=_cm.C.RED)
+        elif cmd in ("tmux", "tmuxcap", "tmux-capture"):
+            parsed = _parse_tmux_args(arg)
+            if parsed is None:
+                print_fn("用法: %tmux [sess[:win[.pane]]] [-n 行数] [-r] "
+                         "[-S sock] [--args '-J -e']", color=_cm.C.YELLOW)
+                return
+            sys.stdout.write(shell.tmux_capture(
+                parsed[0], max_lines=parsed[1], reverse=parsed[2],
+                socket=parsed[3], capture_args=parsed[4]))
         elif cmd == "edit":
             if not arg:
                 print_fn("用法: %edit <远端路径>", color=_cm.C.YELLOW)
@@ -832,6 +953,21 @@ def main(argv=None):
     p_put.add_argument("--mode", default=None)
     p_put.add_argument("--allow-large", action="store_true")
 
+    p_pd = sub.add_parser(
+        "pull-dir", aliases=["pulldir", "getdir"],
+        help="整目录 tar.gz 打包拉取并解压（纯 Python 打包；支持 --exclude、"
+             "md5 校验；压缩包硬顶 1MiB，默认 700KiB，超限返回诊断）")
+    p_pd.add_argument("remote", help="远端目录")
+    p_pd.add_argument("local", nargs="?", default=".", help="本地解压目录（默认 .）")
+    p_pd.add_argument("--exclude", action="append", default=[], metavar="PAT",
+                      help="fnmatch 排除模式，可重复，如 --exclude build "
+                           "--exclude '*.pyc'（对任意层级目录/文件名组件匹配）")
+    p_pd.add_argument("--max-bytes", type=int, default=DEFAULT_DIR_ARCHIVE_MAX,
+                      help=f"压缩包字节上限（默认 {DEFAULT_DIR_ARCHIVE_MAX}，"
+                           f"硬顶 {MAX_DIR_ARCHIVE}）")
+    p_pd.add_argument("--tgz", metavar="PATH",
+                      help="不解压，只把 tar.gz 压缩包保存到该路径")
+
     p_write = sub.add_parser("write", help="内容写入远端文件（--data 或 stdin）")
     p_write.add_argument("path")
     p_write.add_argument("--data")
@@ -865,6 +1001,21 @@ def main(argv=None):
         "watch", help="周期执行命令并实时刷新输出，如: watch -i 2 df -h")
     p_watch.add_argument("cmd", help="远端 shell 命令（建议引号包起来）")
     _add_live(p_watch)
+
+    p_tmux = sub.add_parser(
+        "tmux-capture", aliases=["tmuxcap", "tmux"],
+        help="抓取远端 tmux 窗格内容（capture-pane + show-buffer）")
+    p_tmux.add_argument("session", nargs="?", default="0",
+                        help="目标窗格（默认 0；支持 sess / sess:win / sess:win.pane）")
+    p_tmux.add_argument("-n", "--max-lines", type=int, default=9999,
+                        help="向上回溯行数（默认 9999）")
+    p_tmux.add_argument("-r", "--reverse", action="store_true",
+                        help="行序倒转（最新一行在最上）")
+    p_tmux.add_argument("-S", "--socket", default="",
+                        help="tmux -S 套接字路径（多 server 时用）")
+    p_tmux.add_argument("--args", default="-J", metavar="ARGS",
+                        help="透传给 capture-pane 的额外参数（默认 -J 合并折行；"
+                             "保留 ANSI 颜色用 '-J -e'）")
 
     sub.add_parser("repl", help="交互式 shell（无参数时默认）")
 
@@ -934,6 +1085,16 @@ def main(argv=None):
             sys.stderr.write(f"OK {r['path']} {r['bytes']}B mode={r['mode']} "
                              f"sha256={r['sha256']}\n")
             return 0
+        if action in ("pull-dir", "pulldir", "getdir"):
+            def _cli_print(msg, **_ka):
+                sys.stderr.write(str(msg) + "\n")
+            try:
+                _do_pull_dir(sh, args.remote, args.local, args.exclude,
+                             args.tgz, args.max_bytes, _cli_print)
+            except DirArchiveTooLarge as exc:
+                sys.stderr.write(f"[ERROR] DirArchiveTooLarge:\n{exc}\n")
+                return 2
+            return 0
         if action == "write":
             data = args.data.encode("utf-8") if args.data is not None \
                 else sys.stdin.buffer.read()
@@ -964,6 +1125,11 @@ def main(argv=None):
                 interval=args.interval, count=args.count, ttl=args.ttl,
                 redraw=(False if args.scroll else None))
             return 0 if n > 0 else 3
+        if action in ("tmux-capture", "tmuxcap", "tmux"):
+            sys.stdout.write(sh.tmux_capture(
+                args.session, max_lines=args.max_lines, reverse=args.reverse,
+                socket=args.socket, capture_args=args.args))
+            return 0
     except RemoteError as exc:
         # 红线/超时/远端错误：CLI 边界打一行人话，不抛 traceback
         sys.stderr.write(f"[ERROR] {type(exc).__name__}: {exc}\n")

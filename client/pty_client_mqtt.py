@@ -39,6 +39,14 @@ AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
     curl "http://127.0.0.1:1188/$(python -c \
 "import urllib.parse;print(urllib.parse.quote('import json;p.set_data(json.dumps(ai_bridge.run(\\\"uname -a\\\"),ensure_ascii=False))'))")"
 
+本地诊断日志（broker 连接/重连、每笔 [RPC] 请求、告警等）**不写终端**，
+全部进进程内环形缓冲，避免和远端 shell 画面穿插；随时经 RPC 口取回：
+
+    curl "http://192.168.1.3:1188/r=get_log()"          # 最近 200 行
+    curl "http://192.168.1.3:1188/r=get_log(50)"        # 最近 50 行
+    curl "http://192.168.1.3:1188/r=clear_log()"        # 清空
+    # 窗口前的人也可以直接按命令栏热键输 log（自擦覆盖层，不留痕迹）
+
 注意：AI 命令串行执行（一个 shell），重叠调用立刻返回 busy；run() 只
 回收非交互命令的输出，vim/top 等全屏程序请人工在窗口里操作。仅本机
 调用建议 --host 127.0.0.1。
@@ -60,6 +68,7 @@ fire-and-forget 发一帧 stop，不做 pty.close/transport.stop 那套慢清理
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import queue
 import re
@@ -68,6 +77,7 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 
 # 本文件已迁移到 client/ 子目录：把项目根目录与本目录加入 sys.path，
 # 同时兼容「python client/pty_client_mqtt.py」直接运行与包导入。
@@ -104,7 +114,7 @@ alias_term         = ('term', 'terminal')
 alias_cwd          = ('cwd', 'dir', 'workdir')
 alias_interval     = ('interval', 'i', 'flush_interval', 'flush')
 alias_heartbeat    = ('heartbeat', 'hb')
-alias_ttl          = ('max_shell_live_time','ttl',)
+alias_ttl          = ('max_shell_live_time','ttl','DEFAULT_PTY_TTL')
 alias_dead_timeout = ('dead_timeout', 'deadtime', 'dead')
 alias_size         = ('size', 'geometry')
 alias_no_login     = ('no_login', 'nologin')
@@ -113,6 +123,8 @@ alias_menu_key     = ('menu_key', 'menukey', 'magic_key')
 alias_rpc_port     = ('port', 'rpc_port', 'p')
 alias_rpc_host     = ('host', 'rpc_host')
 alias_command      = ('command', 'cmd')
+# 本地命令栏查看诊断日志（只读，不碰会话参数）
+alias_log          = ('log', 'logs')
 
 # 魔术栏的"脱离"：语义等同退出，exit/quit 直接复用 client_mqtt 的别名表，
 # PTY 语境再补 detach 系列（顺序无所谓，匹配一律用 in）。
@@ -571,8 +583,132 @@ def _stderr_write(text) -> bool:
     return True
 
 
+# ==================== 本地日志：只进环形缓冲，绝不写 PTY 终端 ====================
+#
+# 远端 shell 的画面走 stdout（_OUT_WRITER）。本地诊断若写 stderr——_info、
+# [WARN]、每笔 HTTP RPC 的 [RPC] 请求行、multi_mqtt.basicConfig 挂到 root 的
+# MultiMQTT/paho INFO——在同一个终端里就会和远端画面互相穿插。开启本地 HTTP
+# RPC 口后，所有本地日志一律只进本进程环形缓冲，终端一个字节都不写，需要时
+# 走 RPC 口查看（浏览器外任意机器 curl 即可）：
+#
+#     curl "http://127.0.0.1:1188/r=get_log()"          # 最近 200 行
+#     curl "http://192.168.1.3:1188/r=get_log(50)"      # 最近 50 行
+#     curl "http://192.168.1.3:1188/r=clear_log()"      # 清空
+#
+# 人类在窗口前也可直接用本地命令栏的 log（自擦覆盖层，不留痕迹）。--port 0
+# 关闭 RPC 口时没有查看通道，退回旧行为：日志照旧镜像到 stderr。
+
+_LOG_MAX_CHARS = 256 * 1024   # 缓冲约 256KB，超量丢最旧
+_LOG_MAX_LINES = 2000
+_LOG_LINE_CLIP = 4096         # 单行（异常栈/帧转储）超长截断，防一条撑爆缓冲
+
+
+class _LogRing:
+    """线程安全的定长日志环形缓冲（行数 + 字符数双限，超量从最旧开始丢）。"""
+
+    def __init__(self, max_chars=_LOG_MAX_CHARS, max_lines=_LOG_MAX_LINES):
+        self._lines = deque()
+        self._chars = 0
+        self._max_chars = int(max_chars)
+        self._max_lines = int(max_lines)
+        self._lock = threading.Lock()
+
+    def write(self, text) -> None:
+        if not text:
+            return
+        if isinstance(text, bytes):
+            text = text.decode("utf-8", "replace")
+        for line in str(text).splitlines():
+            if len(line) > _LOG_LINE_CLIP:
+                line = line[:_LOG_LINE_CLIP] + "…(共%d字符，已截断)" % len(line)
+            with self._lock:
+                self._lines.append(line)
+                self._chars += len(line) + 1
+                while (len(self._lines) > self._max_lines
+                       or self._chars > self._max_chars):
+                    old = self._lines.popleft()
+                    self._chars -= len(old) + 1
+
+    def tail(self, n=200) -> str:
+        with self._lock:
+            items = list(self._lines) if (n is None or n <= 0) \
+                else list(self._lines)[-int(n):]
+        return "\n".join(items)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._lines.clear()
+            self._chars = 0
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._lines)
+
+
+_LOCAL_LOG = _LogRing()
+# RPC 口未成功起监听前保持旧行为（镜像 stderr），保证启动致命错误仍可见；
+# main() 起口成功后置 False，此后本地日志只进环形缓冲。
+_LOG_MIRROR_STDERR = True
+
+
+def _emit_local(text) -> None:
+    """本地诊断日志的唯一入口：先入环形缓冲；无 RPC 查看通道时再镜像 stderr。"""
+    _LOCAL_LOG.write(text)
+    if _LOG_MIRROR_STDERR:
+        _stderr_write(text)
+
+
+def get_log(n: int = 200) -> str:
+    """返回最近 n 行本地日志（n<=0 或 None 返回缓冲内全部）。
+
+    经本地 HTTP RPC 口调用，不与 PTY 画面争抢终端::
+
+        curl "http://127.0.0.1:1188/r=get_log()"
+        curl "http://192.168.1.3:1188/r=get_log(100)"
+    """
+    return _LOCAL_LOG.tail(n)
+
+
+def clear_log() -> dict:
+    """清空本地日志环形缓冲（HTTP RPC：``/r=clear_log()``）。"""
+    _LOCAL_LOG.clear()
+    return {"ok": True, "cleared": True}
+
+
+class _RingLogHandler(logging.Handler):
+    """把 logging 记录（MultiMQTT/paho/cmd_client_mqtt/server_http 等）导入环形缓冲。"""
+
+    def emit(self, record) -> None:
+        try:
+            _LOCAL_LOG.write(self.format(record) + "\n")
+        except Exception:
+            # 日志失败永远不能反噬业务线程
+            pass
+
+
+def _install_ring_logging() -> None:
+    """会话期所有 logging 只进环形缓冲（幂等）。
+
+    multi_mqtt 导入时已用 basicConfig 在 root 挂了写 stderr 的 StreamHandler，
+    broker 重连/paho 收发的 INFO 会直接插进远端画面；这里在 root 补一个 ring
+    handler 并移除 StreamHandler，级别维持 INFO。
+    """
+    root = logging.getLogger()
+    if not any(isinstance(h, _RingLogHandler) for h in root.handlers):
+        handler = _RingLogHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        root.addHandler(handler)
+    for h in list(root.handlers):
+        # _RingLogHandler 直接继承 logging.Handler，不会被这里误删
+        if isinstance(h, logging.StreamHandler):
+            root.removeHandler(h)
+    if root.level == logging.NOTSET or root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+
+
 def _info(msg):
-    _stderr_write("[%s] %s\n" % (stime(), msg))
+    _emit_local("[%s] %s\n" % (stime(), msg))
 
 
 # ============================ AI 桥：外部进程复用本常驻 PTY ============================
@@ -818,6 +954,9 @@ def _magic_help_lines():
                  % _alias_usage(alias_detach))
     lines.append("  %s   会话与 broker 状态"
                  % _alias_usage(_cm.alias_status))
+    lines.append("  %s [n]   查看最近本地日志（不写终端，默认 20 行，上限 100；"
+                 "更多走 HTTP RPC r=get_log(n)）"
+                 % _alias_usage(alias_log))
     for canon, aliases, _remote, _bounds, desc in _PTY_MAGIC_SPECS:
         lines.append("  %s <秒>   %s"
                      % (_alias_usage((canon,) + aliases[1:]), desc))
@@ -858,6 +997,22 @@ def _run_magic(line, ctx):
             "结束原因   = %s" % getattr(pty, "end_reason", None),
         ]
         return False, lines
+    if cmd in alias_log:
+        # 只读查看：覆盖层自擦，终端不留痕；行数夹 1~100，防止整屏滚动
+        if arg:
+            try:
+                n = int(float(arg))
+            except ValueError:
+                return False, ["log 参数应为行数（数字），收到: %r" % arg]
+        else:
+            n = 20
+        n = max(1, min(n, 100))
+        text = get_log(n)
+        body = text.split("\n") if text else ["（暂无本地日志）"]
+        header = ("本地日志（最近 %d 行，缓冲共 %d 行；"
+                  "更多走 HTTP RPC：r=get_log(n)）："
+                  % (len(body) if text else 0, len(_LOCAL_LOG)))
+        return False, [header] + body
     for canon, aliases, remote_key, (lo, hi), _desc in _PTY_MAGIC_SPECS:
         if cmd not in aliases:
             continue
@@ -995,7 +1150,13 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     if dead_timeout > 0:
         banner += (f"[pty] 心跳 {heartbeat:g}s：服务器关闭/断连后最多 "
                    f"{dead_timeout:g}s 自动退出\n")
-    _stderr_write(banner)
+    if getattr(args, "port", 0):
+        banner += ("[pty] 本地诊断日志不写终端：命令栏输 log，或 "
+                   "curl \"http://<本机IP>:%d/r=get_log()\" 查看\n"
+                   % args.port)
+    # banner 及之后的本地日志只进环形缓冲（RPC 口开启时终端零污染），
+    # 不再 _stderr_write 插进远端画面。
+    _emit_local(banner)
 
     # 会话期可变参数（本地命令栏热调；dead_timeout 纯本地，其余经 set 帧下发）
     live = {
@@ -1205,9 +1366,9 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         # 留在 shell / tmux 里。
         try:
             pty.send(pre_cmd + "\r")
-            _stderr_write("[pty] 已自动执行前置命令: %s\n" % pre_cmd)
+            _emit_local("[pty] 已自动执行前置命令: %s\n" % pre_cmd)
         except Exception as exc:
-            _stderr_write("[pty][WARN] 前置命令发送失败: %s\n" % exc)
+            _emit_local("[pty][WARN] 前置命令发送失败: %s\n" % exc)
 
     # 主线程：远端输出原样渲染；任何退出路径都走 _hard_exit 立即收场
     held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
@@ -1314,6 +1475,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    global _LOG_MIRROR_STDERR
     args = build_parser().parse_args(argv)
 
     if args.size:
@@ -1333,13 +1495,23 @@ def main(argv=None) -> int:
     
     if args.port:
         import server_http
-        # 注意：持久命名空间在此刻快照一次，ai_bridge 是模块级对象引用，
-        # 会话建立后 attach/feed 对 HTTP 调用方立即生效。
-        ghs = server_http.start_rpc_server(
-            port=args.port, ip=args.host, globals=globals(), locals=locals(),
-            log_sink=_stderr_write)
+        # 注意：持久命名空间在此刻快照一次，ai_bridge/get_log 都是模块级
+        # 对象引用，会话建立后 attach/feed 对 HTTP 调用方立即生效。
+        # 起口成功即切换为"本地日志只进环形缓冲"：包括下面的启动 _info、
+        # 每笔 [RPC] 请求行和 root 上的 MultiMQTT/paho logging，终端零写入；
+        # 起口失败则保留 stderr 镜像，致命错误用户照样看得见。
+        _LOG_MIRROR_STDERR = False
+        try:
+            ghs = server_http.start_rpc_server(
+                port=args.port, ip=args.host, globals=globals(), locals=locals(),
+                log_sink=_emit_local)
+        except Exception:
+            _LOG_MIRROR_STDERR = True
+            raise
+        _install_ring_logging()
         _info(f"本地 AI 控制口已开启：http://127.0.0.1:{args.port}/"
-              f"（示例：ai_bridge.run(\"uname -a\")；命令在本窗口实时可见）")
+              f"（示例：ai_bridge.run(\"uname -a\")；"
+              f"本地日志：curl \"http://127.0.0.1:{args.port}/r=get_log()\"）")
     
     _enable_output_vt()
     signed = bool(str(args.key or "").strip())
@@ -1358,7 +1530,7 @@ def main(argv=None) -> int:
     if hosts:
         _info("在线节点：" + ", ".join(hosts))
     elif total:
-        _stderr_write("[WARN] 当前没有任何 broker 在线，握手大概率超时\n")
+        _emit_local("[WARN] 当前没有任何 broker 在线，握手大概率超时\n")
     try:
         return run_session(transport, args, rows, cols)
     except RemoteError as exc:

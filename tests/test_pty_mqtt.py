@@ -517,8 +517,124 @@ class PtyHotkeyParseTests(unittest.TestCase):
             "ctrl-alt-insert") in pcm._KEY_DISPLAY, True)
 
 
+class LocalLogBufferTests(unittest.TestCase):
+    """本地日志环形缓冲：只进内存缓冲，RPC 模式下绝不镜像写 stderr。"""
+
+    def setUp(self):
+        pcm._LOCAL_LOG.clear()
+        self._mirror = pcm._LOG_MIRROR_STDERR
+        pcm._LOG_MIRROR_STDERR = False
+
+    def tearDown(self):
+        pcm._LOG_MIRROR_STDERR = self._mirror
+        pcm._LOCAL_LOG.clear()
+
+    def test_ring_tail_and_clear(self):
+        ring = pcm._LogRing(max_chars=10 ** 9, max_lines=10 ** 9)
+        for i in range(5):
+            ring.write("line%d\n" % i)
+        self.assertEqual(ring.tail(2), "line3\nline4")
+        self.assertEqual(ring.tail(0), "line0\nline1\nline2\nline3\nline4")
+        self.assertEqual(len(ring), 5)
+        ring.clear()
+        self.assertEqual(ring.tail(10), "")
+        self.assertEqual(len(ring), 0)
+
+    def test_ring_eviction_by_chars_and_lines(self):
+        ring = pcm._LogRing(max_chars=30, max_lines=1000)
+        for i in range(20):
+            ring.write("x%02d\n" % i)
+        text = ring.tail(0)
+        self.assertNotIn("x00", text)  # 超字符上限，最旧的已被丢掉
+        self.assertIn("x19", text)
+        ring2 = pcm._LogRing(max_chars=10 ** 6, max_lines=3)
+        for i in range(5):
+            ring2.write("y%d\n" % i)
+        self.assertEqual(ring2.tail(0), "y2\ny3\ny4")
+
+    def test_ring_accepts_bytes_and_splits_multiline(self):
+        ring = pcm._LogRing()
+        ring.write(b"a\nb\r\nc\rd")
+        self.assertEqual(ring.tail(0), "a\nb\nc\nd")
+
+    def test_long_line_is_clipped(self):
+        ring = pcm._LogRing()
+        ring.write("a" * (pcm._LOG_LINE_CLIP + 50) + "\n")
+        out = ring.tail(1)
+        self.assertIn("已截断", out)
+        self.assertLessEqual(len(out), pcm._LOG_LINE_CLIP + 40)
+
+    def test_get_log_and_clear_log_helpers(self):
+        pcm._emit_local("hello-local-log\n")
+        self.assertIn("hello-local-log", pcm.get_log())
+        r = pcm.clear_log()
+        self.assertTrue(r["ok"] and r["cleared"])
+        self.assertEqual(pcm.get_log(), "")
+
+    def test_emit_does_not_touch_stderr_in_rpc_mode(self):
+        calls = []
+        orig = pcm._stderr_write
+        pcm._stderr_write = lambda text: calls.append(text)
+        try:
+            pcm._emit_local("quiet-line\n")
+        finally:
+            pcm._stderr_write = orig
+        self.assertEqual(calls, [])  # 终端零写入
+        self.assertIn("quiet-line", pcm.get_log())
+
+    def test_emit_mirrors_stderr_without_rpc(self):
+        pcm._LOG_MIRROR_STDERR = True
+        calls = []
+        orig = pcm._stderr_write
+        pcm._stderr_write = lambda text: calls.append(text)
+        try:
+            pcm._emit_local("loud-line\n")
+        finally:
+            pcm._stderr_write = orig
+        self.assertEqual(calls, ["loud-line\n"])
+        self.assertIn("loud-line", pcm.get_log())
+
+    def test_install_ring_logging_reroutes_and_idempotent(self):
+        import logging as pylog
+        root = pylog.getLogger()
+        saved_handlers = list(root.handlers)
+        saved_level = root.level
+        probe = io.StringIO()
+        root.addHandler(pylog.StreamHandler(probe))
+        try:
+            pcm._install_ring_logging()
+            self.assertEqual(
+                sum(isinstance(h, pcm._RingLogHandler) for h in root.handlers), 1)
+            self.assertFalse(
+                any(isinstance(h, pylog.StreamHandler) for h in root.handlers))
+            pylog.getLogger("MultiMQTT.ring_test").info("ring-logging-marker-77")
+            self.assertNotIn("ring-logging-marker-77", probe.getvalue())
+            self.assertIn("ring-logging-marker-77", pcm.get_log())
+            # 幂等：再装一次不得叠加 handler
+            pcm._install_ring_logging()
+            self.assertEqual(
+                sum(isinstance(h, pcm._RingLogHandler) for h in root.handlers), 1)
+        finally:
+            for h in list(root.handlers):
+                if h not in saved_handlers:
+                    root.removeHandler(h)
+            for h in saved_handlers:
+                if h not in root.handlers:
+                    root.addHandler(h)
+            root.setLevel(saved_level)
+
+
 class PtyMagicBarTests(unittest.TestCase):
     """本地魔术命令栏：只调时间参数/本地动作，不碰 topic。"""
+
+    def setUp(self):
+        # 单测里绝不允许 _emit_local 镜像写真实终端
+        self._mirror = pcm._LOG_MIRROR_STDERR
+        pcm._LOG_MIRROR_STDERR = False
+
+    def tearDown(self):
+        pcm._LOG_MIRROR_STDERR = self._mirror
+        pcm._LOCAL_LOG.clear()
 
     def _ctx(self):
         tr = FakeTransport()
@@ -601,6 +717,33 @@ class PtyMagicBarTests(unittest.TestCase):
         joined = "\n".join(lines)
         self.assertIn("pty-magic-1", joined)
         self.assertIn("broker", joined)
+
+    def test_log_command_reads_ring_and_stays_local(self):
+        _, _, ctx = self._ctx()
+        pcm._emit_local("magic-ring-marker-42\n")
+        do_detach, lines = pcm._run_magic("log", ctx)
+        joined = "\n".join(lines)
+        self.assertFalse(do_detach)
+        self.assertIn("magic-ring-marker-42", joined)
+        self.assertIn("get_log", joined)  # 提示 HTTP RPC 入口
+
+    def test_log_aliases_and_bad_argument(self):
+        _, _, ctx = self._ctx()
+        for word in ("log", "logs"):
+            do_detach, lines = pcm._run_magic(word, ctx)
+            self.assertFalse(do_detach, word)
+            self.assertTrue(lines, word)
+        _, lines = pcm._run_magic("log abc", ctx)
+        self.assertTrue(any("数字" in x for x in lines))
+
+    def test_log_command_capped_at_100_lines(self):
+        _, _, ctx = self._ctx()
+        for i in range(150):
+            pcm._emit_local("cap-line-%03d\n" % i)
+        _, lines = pcm._run_magic("log 1000", ctx)  # 超上限夹到 100
+        self.assertEqual(len(lines), 101)           # 1 行头 + 100 行日志
+        self.assertIn("cap-line-149", "\n".join(lines))
+        self.assertNotIn("cap-line-000", "\n".join(lines))
 
 
 # ============================ 2. 模板静态检查（全平台） ============================
