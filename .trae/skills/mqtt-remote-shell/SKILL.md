@@ -188,6 +188,9 @@ python client/pty_client_mqtt.py -k "123+456" --host 127.0.0.1
 GET http://127.0.0.1:1188/r=ai_bridge.status()
 GET http://127.0.0.1:1188/r=ai_bridge.run("uname%20-a")
 GET http://127.0.0.1:1188/r=ai_bridge.send("y\n")
+GET http://192.168.1.3:1188/r=get_log()
+GET http://192.168.1.3:1188/r=get_log(50)
+GET http://192.168.1.3:1188/r=clear_log()
 ```
 
 注意：
@@ -195,6 +198,7 @@ GET http://127.0.0.1:1188/r=ai_bridge.send("y\n")
 - 路径里的空格、引号等仍需 percent-encode；参数一复杂就改用 Python helper（`ai_pty_run/send`），不要在 URL 里堆多语句。
 - 需要精确 JSON 字符串时才用编码后的 `p.set_data(json.dumps(obj, ensure_ascii=False))`。
 - `r` 留在持久命名空间，会被下一次 `/r=...` 覆盖，不要依赖上一次的残留值。
+- **本地日志不打终端**：broker 连接/重连、MultiMQTT/paho 的 logging、每笔 `[RPC]` 请求行、`[WARN]`/banner 全进进程内环形缓冲（约 256KB/2000 行，超量丢最旧），避免和远端 shell 画面穿插。用 `/r=get_log(n)` 取最近 n 行（默认 200，n<=0 全部）、`/r=clear_log()` 清空；人类可在窗口命令栏（Ctrl+Alt+Insert）输 `log [n]` 看最近 100 行（自擦覆盖层）。仅会话退出时的致命错误仍直写 stderr（终端已复位）；`--port 0` 关 RPC 口时无查看通道，日志退回 stderr 镜像。
 
 ```python
 # AI / 任意进程：只是一次 localhost HTTP，不碰 broker

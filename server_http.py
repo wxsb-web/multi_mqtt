@@ -381,7 +381,13 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     if not key:
         key = ''
     RPCRequestHandler.key = key
-    RPCRequestHandler.log_sink = log_sink
+    # 普通函数直接挂类属性会触发描述符协议：self.log_sink 取到的是
+    # bound method func(handler, line)，log_message 里 sink(line) 必抛
+    # TypeError（被 except 吞掉），于是每笔请求都静默退回 print(line)
+    # 直写终端——pty_client_mqtt 场景下就是插进远端 shell 画面。包一层
+    # staticmethod 后 self.log_sink 取回原函数；bound method/实例级赋值不受影响。
+    RPCRequestHandler.log_sink = (staticmethod(log_sink)
+                                  if callable(log_sink) else log_sink)
     RPCRequestHandler.websocket_handler = websocket_handler
     RPCRequestHandler.websocket_path = websocket_path
     RPCRequestHandler.websocket_handlers = websocket_handlers or {}

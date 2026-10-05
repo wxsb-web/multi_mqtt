@@ -1320,6 +1320,48 @@ class TerminalWriterTests(unittest.TestCase):
         # sink 异常时退回 print，日志本身不能打挂请求线程
         self.assertIn("[RPC]", buf.getvalue())
 
+    def test_class_level_plain_function_sink_via_start_server(self):
+        # 生产路径回归：start_rpc_server 把普通函数挂到类属性后，
+        # self.log_sink 不得变成 bound method（否则 sink(line) 多收一个
+        # handler 参数抛 TypeError 被吞，静默退回 print 直写终端）。
+        import server_http
+        h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)
+        h.client_address = ("1.2.3.4", 5555)
+
+        plain_calls = []
+
+        def plain_sink(line):
+            plain_calls.append(line)
+
+        class _BoundSink:
+            def __init__(self):
+                self.lines = []
+
+            def sink(self, line):
+                self.lines.append(line)
+
+        bound = _BoundSink()
+        old = server_http.RPCRequestHandler.log_sink
+        buf = io.StringIO()
+        try:
+            server_http.start_rpc_server(listen=False, log_sink=plain_sink)
+            self.assertIs(h.log_sink, plain_sink)  # 取回原函数，而非 bound method
+            old_stdout = sys.stdout
+            sys.stdout = buf
+            try:
+                h.log_message("GET %s", "/")
+            finally:
+                sys.stdout = old_stdout
+            self.assertEqual(len(plain_calls), 1)
+            self.assertEqual(buf.getvalue(), "")  # 不得触发 fallback print
+
+            # bound method 形态的 sink 同样不能被二次绑定
+            server_http.start_rpc_server(listen=False, log_sink=bound.sink)
+            h.log_message("POST %s", "/x")
+            self.assertEqual(len(bound.lines), 1)
+        finally:
+            server_http.RPCRequestHandler.log_sink = old
+
 
 if __name__ == "__main__":
     unittest.main()
