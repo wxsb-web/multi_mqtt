@@ -405,16 +405,22 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     RPCRequestHandler.redirect_root = redirect_root
     RPCRequestHandler.main_loop = main_loop
 
-    # 构造持久命名空间：合并调用方传入的 globals / locals。
-    # 该命名空间只在服务器启动时构造一次，之后所有请求共享。
-    persistent_ns = {}
-    if globals:
-        persistent_ns.update(globals)
-    if locals:
-        persistent_ns.update(locals)
-    persistent_ns['__name__'] = '__rpc_exec__'
+    # 持久命名空间：默认零拷贝，直接持有调用方传入的 globals 字典引用，
+    # 不做任何浅拷贝。这样服务器启动之后调用方才赋值的名字（例如 MQTT
+    # 服务端实例 gms）在后续 HTTP RPC 中实时可见，与 MQTT 通道行为一致。
+    # 模块级调用时 globals() 与 locals() 本就是同一个 dict；只有二者都
+    # 未提供时才让执行器自建空字典。若确实需要与调用方字典隔离的快照，
+    # 直接改用 PythonExecutor(..., copy_globals=True)。
+    if isinstance(globals, dict):
+        persistent_ns = globals
+    elif isinstance(locals, dict):
+        persistent_ns = locals
+    else:
+        persistent_ns = None
 
     # 只创建一个 PythonExecutor，请求级上下文通过 execute(globals=...) 注入。
+    # 不在这里强写 __name__：执行器内部用 setdefault，模块字典自带 __name__
+    # 不会被覆盖；自建空字典时由执行器补成 __rpc_exec__。
     RPCRequestHandler.executor = rpc_executor.PythonExecutor(
         globals=persistent_ns,
         main_loop=main_loop,
