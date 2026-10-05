@@ -711,7 +711,7 @@ def run_repl(shell: MqttRemoteShell, history_path=None):
                 print_fn("用法: %tmux [sess[:win[.pane]]] [-n 行数] [-r] "
                          "[-S sock] [--args '-J -e']", color=_cm.C.YELLOW)
                 return
-            sys.stdout.write(shell.tmux_capture(
+            sys.stdout.write(shell.tmux_capture_pane(
                 parsed[0], max_lines=parsed[1], reverse=parsed[2],
                 socket=parsed[3], capture_args=parsed[4]))
         elif cmd == "edit":
@@ -1126,7 +1126,7 @@ def main(argv=None):
                 redraw=(False if args.scroll else None))
             return 0 if n > 0 else 3
         if action in ("tmux-capture", "tmuxcap", "tmux"):
-            sys.stdout.write(sh.tmux_capture(
+            sys.stdout.write(sh.tmux_capture_pane(
                 args.session, max_lines=args.max_lines, reverse=args.reverse,
                 socket=args.socket, capture_args=args.args))
             return 0

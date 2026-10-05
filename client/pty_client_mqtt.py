@@ -39,13 +39,28 @@ AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
     curl "http://127.0.0.1:1188/$(python -c \
 "import urllib.parse;print(urllib.parse.quote('import json;p.set_data(json.dumps(ai_bridge.run(\\\"uname -a\\\"),ensure_ascii=False))'))")"
 
-本地诊断日志（broker 连接/重连、每笔 [RPC] 请求、告警等）**不写终端**，
-全部进进程内环形缓冲，避免和远端 shell 画面穿插；随时经 RPC 口取回：
+本地诊断日志与 PTY 画面彻底分离
+====================================
+本终端窗口**只渲染远端 shell**；broker 连接/重连、每笔 [RPC] 请求、
+告警、任何库的 print / stdout / stderr 一律不写终端，全部进进程内
+环形缓冲，查看通道有三个：
 
-    curl "http://192.168.1.3:1188/r=get_log()"          # 最近 200 行
-    curl "http://192.168.1.3:1188/r=get_log(50)"        # 最近 50 行
-    curl "http://192.168.1.3:1188/r=clear_log()"        # 清空
-    # 窗口前的人也可以直接按命令栏热键输 log（自擦覆盖层，不留痕迹）
+  ① 浏览器全屏实时日志台（首选，和普通控制台一样，无工具栏）：
+
+        http://192.168.1.3:1188/        # 根路径自动跳 log_html 页面
+        # 页面经 WebSocket /wslog 先收全量快照再实时增量推送，
+        # 滚到底自动跟随，向上翻则暂停，带极简 ANSI 着色；
+        # 手机/同局域网其他机器也能直接开
+
+  ② HTTP RPC 取文本：
+
+        curl "http://192.168.1.3:1188/r=get_log()"     # 最近 200 行
+        curl "http://192.168.1.3:1188/r=get_log(50)"   # 最近 50 行
+        curl "http://192.168.1.3:1188/r=clear_log()"   # 清空
+
+  ③ 窗口前的人按命令栏热键输 log（自擦覆盖层，不留痕迹）。
+
+--port 0 关闭 HTTP 口时没有查看通道，退回旧行为：日志镜像到 stderr。
 
 注意：AI 命令串行执行（一个 shell），重叠调用立刻返回 busy；run() 只
 回收非交互命令的输出，vim/top 等全屏程序请人工在窗口里操作。仅本机
@@ -68,12 +83,15 @@ fire-and-forget 发一帧 stop，不做 pty.close/transport.stop 那套慢清理
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import logging
 import os
 import queue
 import re
 import shlex
 import shutil
+import socket
 import sys
 import threading
 import time
@@ -85,6 +103,10 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# 必须在 import multi_mqtt 之前：multi_mqtt 在 import 时会 basicConfig 往 root
+# 挂写 stderr 的 StreamHandler，paho/broker 的 INFO 会插进 PTY 远端画面。
+# 本进程的终端只渲染远端 shell，一切本地日志走环形缓冲 + 浏览器实时日志台。
+os.environ.setdefault("CMQ_NO_STDERR_LOG", "1")
 # 直接按脚本启动时没有包上下文，相对导入会失败，显式补上。
 if not __package__:
     __package__ = "client"
@@ -248,6 +270,7 @@ _TERMINAL_CLEANUP = (b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l"
 
 
 _BIN_STDOUT_CACHE = None
+_BIN_STDERR_CACHE = None
 
 
 def _bin_stdout():
@@ -256,8 +279,10 @@ def _bin_stdout():
     ai_bridge 控制口执行 RPC 代码时会 ``redirect_stdout(StringIO())`` 临时
     替换全局 ``sys.stdout`` 以捕获 print；StringIO 没有 ``buffer`` 属性，
     PTY 渲染/菜单线程若每次现取 sys.stdout.buffer 就会 AttributeError 直接
-    崩掉整个会话。所以解析一次后固定用：当前 stdout 无 buffer（正被重定向）
-    时退回解释器原始 stdout（sys.__stdout__，永不受 redirect_stdout 影响）。
+    崩掉整个会话。会话期 sys.stdout/sys.stderr 还会被换成 _RingTextIO
+    （本地日志导流），同样没有 buffer。所以解析一次后固定用：当前流无
+    buffer（正被重定向）时退回解释器原始流（sys.__stdout__，永不受重定向
+    影响）。
     """
     global _BIN_STDOUT_CACHE
     if _BIN_STDOUT_CACHE is None:
@@ -267,6 +292,23 @@ def _bin_stdout():
                 _BIN_STDOUT_CACHE = buf
                 break
     return _BIN_STDOUT_CACHE
+
+
+def _bin_stderr():
+    """锁定真正终端的二进制错误流（带缓存），与 _bin_stdout 同理。
+
+    会话期 sys.stderr 被换成 _RingTextIO（本地日志导流）后，致命退出提示
+    仍需写到真实 stderr（此时终端已复位）；这里固定解析一次，回退
+    sys.__stderr__。
+    """
+    global _BIN_STDERR_CACHE
+    if _BIN_STDERR_CACHE is None:
+        for stream in (sys.stderr, getattr(sys, "__stderr__", None)):
+            buf = getattr(stream, "buffer", None)
+            if buf is not None:
+                _BIN_STDERR_CACHE = buf
+                break
+    return _BIN_STDERR_CACHE
 
 
 # 排队字节上限：终端读取方长时间不消费时，队列涨到这个量后新字节被丢弃
@@ -564,9 +606,7 @@ def _stderr_writer():
     """
     global _ERR_WRITER
     if _ERR_WRITER is None:
-        binerr = getattr(sys.stderr, "buffer", None)
-        if binerr is None:
-            binerr = getattr(getattr(sys, "__stderr__", None), "buffer", None)
+        binerr = _bin_stderr()
         if binerr is not None:
             _ERR_WRITER = _TerminalWriter(binerr, name="pty-err")
     return _ERR_WRITER
@@ -583,20 +623,20 @@ def _stderr_write(text) -> bool:
     return True
 
 
-# ==================== 本地日志：只进环形缓冲，绝不写 PTY 终端 ====================
+# ==================== 本地日志：环形缓冲 + 浏览器实时日志台，绝不写 PTY 终端 ====================
 #
-# 远端 shell 的画面走 stdout（_OUT_WRITER）。本地诊断若写 stderr——_info、
-# [WARN]、每笔 HTTP RPC 的 [RPC] 请求行、multi_mqtt.basicConfig 挂到 root 的
-# MultiMQTT/paho INFO——在同一个终端里就会和远端画面互相穿插。开启本地 HTTP
-# RPC 口后，所有本地日志一律只进本进程环形缓冲，终端一个字节都不写，需要时
-# 走 RPC 口查看（浏览器外任意机器 curl 即可）：
-#
-#     curl "http://127.0.0.1:1188/r=get_log()"          # 最近 200 行
-#     curl "http://192.168.1.3:1188/r=get_log(50)"      # 最近 50 行
-#     curl "http://192.168.1.3:1188/r=clear_log()"      # 清空
-#
-# 人类在窗口前也可直接用本地命令栏的 log（自擦覆盖层，不留痕迹）。--port 0
-# 关闭 RPC 口时没有查看通道，退回旧行为：日志照旧镜像到 stderr。
+# 架构（终端与日志彻底分离）：
+# - 终端（stdout）只渲染**远端 shell**字节流（_OUT_WRITER→真实控制台缓冲）；
+# - 本地一切诊断——_info/[WARN]/banner、multi_mqtt/paho 的 logging、每笔
+#   [RPC] 请求行、任何库的 print / sys.stdout / sys.stderr 直写——全部进
+#   本进程唯一的 _LOCAL_LOG 环形缓冲；
+# - 查看通道有三个，都不碰 PTY 终端：
+#   ① 浏览器全屏实时日志台（仿 realtime_editor）：
+#       http://192.168.1.3:1188/         （根路径自动跳 log_html）
+#       WebSocket /wslog 先推全量快照再实时增量推送，跟普通控制台一样；
+#   ② HTTP RPC 取文本：curl "http://.../r=get_log()" / r=get_log(50)；
+#   ③ 窗口前的人用本地命令栏 log（自擦覆盖层）。
+# --port 0 关闭 HTTP 口时没有查看通道，退回旧行为：日志镜像到 stderr。
 
 _LOG_MAX_CHARS = 256 * 1024   # 缓冲约 256KB，超量丢最旧
 _LOG_MAX_LINES = 2000
@@ -604,36 +644,73 @@ _LOG_LINE_CLIP = 4096         # 单行（异常栈/帧转储）超长截断，�
 
 
 class _LogRing:
-    """线程安全的定长日志环形缓冲（行数 + 字符数双限，超量从最旧开始丢）。"""
+    """线程安全的定长日志环形缓冲（行数 + 字符数双限，超量从最旧开始丢）。
+
+    每行带进程内单调递增序号；订阅在同一把锁内完成并原子返回当前快照，
+    因此订阅者"快照 + 之后增量"不会重行也不会漏行。监听回调只允许非阻塞
+    （LogHub 用有界队列接收），绝不能拖慢写日志的业务线程。
+    """
 
     def __init__(self, max_chars=_LOG_MAX_CHARS, max_lines=_LOG_MAX_LINES):
         self._lines = deque()
+        self._seq = 0
         self._chars = 0
         self._max_chars = int(max_chars)
         self._max_lines = int(max_lines)
         self._lock = threading.Lock()
+        self._listeners = []
+
+    def _append_locked(self, line: str) -> None:
+        self._seq += 1
+        seq = self._seq
+        self._lines.append((seq, line))
+        self._chars += len(line) + 1
+        while (len(self._lines) > self._max_lines
+               or self._chars > self._max_chars):
+            old_seq, old = self._lines.popleft()
+            self._chars -= len(old) + 1
+        for cb in self._listeners:
+            try:
+                cb(seq, line)
+            except Exception:
+                # 监听者出错不影响日志主链路
+                pass
 
     def write(self, text) -> None:
         if not text:
             return
         if isinstance(text, bytes):
             text = text.decode("utf-8", "replace")
-        for line in str(text).splitlines():
-            if len(line) > _LOG_LINE_CLIP:
-                line = line[:_LOG_LINE_CLIP] + "…(共%d字符，已截断)" % len(line)
-            with self._lock:
-                self._lines.append(line)
-                self._chars += len(line) + 1
-                while (len(self._lines) > self._max_lines
-                       or self._chars > self._max_chars):
-                    old = self._lines.popleft()
-                    self._chars -= len(old) + 1
+        with self._lock:
+            for line in str(text).splitlines():
+                if len(line) > _LOG_LINE_CLIP:
+                    line = line[:_LOG_LINE_CLIP] \
+                        + "…(共%d字符，已截断)" % len(line)
+                self._append_locked(line)
 
     def tail(self, n=200) -> str:
         with self._lock:
             items = list(self._lines) if (n is None or n <= 0) \
                 else list(self._lines)[-int(n):]
-        return "\n".join(items)
+        return "\n".join(line for _seq, line in items)
+
+    def subscribe(self, cb):
+        """登记监听回调 cb(seq, line)；原子返回 (当前快照, 退订函数)。
+
+        快照在同一把锁内取，回调只会收到快照之后的新行。
+        """
+        with self._lock:
+            self._listeners.append(cb)
+            snapshot = list(self._lines)
+
+        def unsubscribe():
+            with self._lock:
+                try:
+                    self._listeners.remove(cb)
+                except ValueError:
+                    pass
+
+        return snapshot, unsubscribe
 
     def clear(self) -> None:
         with self._lock:
@@ -675,6 +752,68 @@ def clear_log() -> dict:
     return {"ok": True, "cleared": True}
 
 
+class _RingTextIO(io.TextIOBase):
+    """把 print/sys.stdout/sys.stderr 的直写导入日志环的文本流替身。
+
+    PTY 会话期 sys.stdout/sys.stderr 会被替换成本类实例：任何库的 stray
+    print、traceback、未走 logging 的输出都进浏览器日志台，而真实 PTY 终端
+    一个字节都收不到。刻意**不提供 buffer 属性**——这样 PTY 渲染侧的
+    _bin_stdout/_bin_stderr 解析会自动回退到 sys.__stdout__/__stderr__
+    （解释器原始真实控制台，永远不受重定向影响）。
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._tail = ""
+        self._lock = threading.Lock()
+
+    # 3.14 起 io.TextIOBase 的 encoding/errors/line_buffering 是只读属性，
+    # 不能在 __init__ 里直接赋值；用 property 覆盖。
+    @property
+    def encoding(self) -> str:
+        return "utf-8"
+
+    @property
+    def errors(self) -> str:
+        return "replace"
+
+    @property
+    def line_buffering(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self):
+        raise OSError("ring log stream has no underlying file descriptor")
+
+    def write(self, data) -> int:
+        if data is None:
+            return 0
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", "replace")
+        if not data:
+            return 0
+        # \r\n、单独 \r（进度条覆写）统一按换行切；末尾无换行的残片留到下次
+        with self._lock:
+            buf = self._tail + str(data)
+            parts = re.split(r"\r\n|\r|\n", buf)
+            self._tail = parts.pop()
+        for line in parts:
+            _LOCAL_LOG.write(line + "\n")
+        return len(data)
+
+    def flush(self) -> None:
+        # 行级即时入环，无底层缓冲要刷
+        pass
+
+
 class _RingLogHandler(logging.Handler):
     """把 logging 记录（MultiMQTT/paho/cmd_client_mqtt/server_http 等）导入环形缓冲。"""
 
@@ -686,12 +825,269 @@ class _RingLogHandler(logging.Handler):
             pass
 
 
+# ==================== 浏览器实时日志台（WebSocket，仿 realtime_editor） ====================
+
+# 每个日志台连接的内存积压上限：浏览器卡住/慢消费时丢旧行，绝不反压业务线程
+_LOG_WS_QUEUE = 1000
+# 增量帧的攒批窗口：把 0.15s 内的行合并成一帧，日志风暴时不刷爆浏览器
+_LOG_WS_BATCH = 0.15
+
+
+class LogHub:
+    """环形日志到浏览器 WebSocket 的广播枢纽。
+
+    每个连接：先原子取当前快照（snapshot 帧），之后新行经有界队列 + 独立
+    写线程增量推送（lines 帧，攒批合帧）；队列满丢最旧并在恢复时插一行
+    丢弃提示。慢/死连接只影响自己，绝不拖慢写日志的 broker/渲染线程。
+    """
+
+    def __init__(self, ring: "_LogRing"):
+        self._ring = ring
+
+    def _frame(self, msg_type: str, text: str, **extra) -> str:
+        payload = {"type": msg_type, "text": text,
+                   "server_time": time.time(), **extra}
+        return json.dumps(payload, ensure_ascii=False)
+
+    def serve(self, websocket, _request) -> None:
+        q: "queue.Queue" = queue.Queue(maxsize=_LOG_WS_QUEUE)
+        state = {"dropped": 0}
+
+        def push(seq, line):
+            try:
+                q.put_nowait((seq, line))
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait((seq, line))
+                    state["dropped"] += 1
+                except (queue.Empty, queue.Full):
+                    state["dropped"] += 1
+
+        snapshot, unsubscribe = self._ring.subscribe(push)
+        stop_ev = threading.Event()
+
+        def writer_loop():
+            # 先发快照（订阅在发快照之前完成，期间新行已在队列，顺序天然正确）
+            snap_text = "\n".join(line for _s, line in snapshot)
+            try:
+                websocket.send(self._frame(
+                    "snapshot", snap_text, lines=len(snapshot),
+                    buffered=len(self._ring)))
+            except OSError:
+                stop_ev.set()
+                return
+            while not stop_ev.is_set():
+                try:
+                    first = q.get(timeout=_LOG_WS_BATCH)
+                except queue.Empty:
+                    continue
+                batch = [first[1]]
+                # 顺带抽干队列里已到的行合成一帧
+                while len(batch) < 500:
+                    try:
+                        batch.append(q.get_nowait()[1])
+                    except queue.Empty:
+                        break
+                dropped = state["dropped"]
+                if dropped:
+                    state["dropped"] = 0
+                    batch.insert(0, "…日志台积压，已丢弃 %d 旧行…" % dropped)
+                try:
+                    websocket.send(self._frame("lines", "\n".join(batch)))
+                except OSError:
+                    stop_ev.set()
+                    return
+
+        writer = threading.Thread(target=writer_loop, name="log-ws-writer",
+                                  daemon=True)
+        writer.start()
+        try:
+            while not stop_ev.is_set():
+                try:
+                    raw = websocket.receive()
+                except (ConnectionError, OSError, ValueError):
+                    break
+                if raw is None:
+                    break
+                # 页面只发心跳；其他内容忽略（日志台对本机进程只读）
+                if raw.strip() == "ping":
+                    try:
+                        websocket.send(json.dumps({"type": "pong",
+                                                   "server_time": time.time()}))
+                    except OSError:
+                        break
+        finally:
+            stop_ev.set()
+            unsubscribe()
+            try:
+                websocket.close()
+            except Exception:
+                pass
+
+
+# 模块级单例：必须在 main() 调 start_rpc_server 之前存在（handler 引用它）
+_LOG_HUB = LogHub(_LOCAL_LOG)
+
+
+def _lan_ip() -> str:
+    """取本机主网卡 IPv4（仅用于提示浏览器/手机访问地址；失败返回 127.0.0.1）。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 53))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def log_html(response):
+    """浏览器全屏实时日志台页面（HTTP RPC：``/log_html(p)``，根路径自动跳转）。
+
+    页面无任何上下工具栏：整个视口就是一个黑底等宽控制台，WebSocket 接
+    /wslog，先收快照再收增量，滚到底部自动跟随、向上翻则暂停。
+    """
+    response.set_header("Content-Type", "text/html; charset=utf-8")
+    response.set_header("Cache-Control", "no-store")
+    response.set_data(_LOG_PAGE)
+
+
+_LOG_PAGE = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pty local log</title>
+<style>
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden;
+  background: #0c0c0c; color: #d8d8d8; }
+#log {
+  height: 100vh; width: 100vw; margin: 0; padding: 6px 10px 10px;
+  border: 0; outline: 0; overflow: auto; white-space: pre-wrap;
+  word-break: break-all; scrollbar-width: thin;
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Cascadia Mono", monospace;
+}
+#jump {
+  position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+  padding: 5px 14px; border-radius: 14px; display: none; cursor: pointer;
+  background: rgba(60, 120, 200, .92); color: #fff; font: 12px/1.4 system-ui, sans-serif;
+  user-select: none; box-shadow: 0 2px 10px rgba(0,0,0,.5);
+}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<div id="jump">新日志 ↓ 点击回到底部</div>
+<script>
+const logEl = document.getElementById('log');
+const jumpEl = document.getElementById('jump');
+let socket, reconnectTimer, follow = true, documentCount = 0;
+
+// ---- 极简 ANSI SGR 着色（其余 CSI/OSC 序列剥掉，保证只做日志查看不做终端仿真） ----
+const SGR = {
+  0:['',''], 1:['font-weight:bold',''], 2:['opacity:.75',''], 3:['font-style:italic',''],
+  4:['text-decoration:underline',''], 9:['text-decoration:line-through',''],
+  22:['font-weight:normal;opacity:1;font-style:normal',''], 23:['font-style:normal',''],
+  24:['text-decoration:none',''], 27:['',''], 39:['color:',''], 49:['background:',''],
+};
+const FG30=['#2e2e2e','#c73535','#3f9b45','#b5a326','#3b6ec4','#a347b8','#2e8f8f','#c8c8c8'];
+const FG90=['#707070','#f06868','#5fd070','#e8d250','#6c9cf0','#cd78e0','#4ec9c9','#ffffff'];
+function cube(n){const v=[0,95,135,175,215,255];
+  return 'rgb('+v[Math.floor(n/36)]+','+v[Math.floor((n%36)/6)]+','+v[n%6]+')';}
+function color256(n){return n<16?null:n<232?cube(n-16):'rgb('+[8+10*(n-232),8+10*(n-232),8+10*(n-232)].join(',')+')';}
+let curStyle='';
+function sgrStyle(params){
+  let css=curStyle;
+  for(let i=0;i<params.length;i++){
+    const p=params[i];
+    if(p===0) css='';
+    else if(SGR[p]) css += ';' + (p===39||p===49 ? SGR[p][0] : SGR[p][0]);
+    else if(p>=30&&p<=37) css += ';color:' + FG30[p-30];
+    else if(p>=90&&p<=97) css += ';color:' + FG90[p-90];
+    else if(p>=40&&p<=47) css += ';background:' + FG30[p-40];
+    else if(p>=100&&p<=107) css += ';background:' + FG90[p-100];
+    else if((p===38||p===48)&&params[i+1]===5){const c=color256(+params[i+2]);if(c)css+=';'+(p===38?'color:':'background:')+c;i+=2;}
+    else if((p===38||p===48)&&params[i+1]===2){const[r,g,b]=params.slice(i+2,i+5);css+=';'+(p===38?'color:':'background:')+`rgb(${r},${g},${b})`;i+=4;}
+  }
+  return css;
+}
+const ANSI_RE = /\x1b(?:\][^\x07\x1b]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-Z\\-_])/g;
+function appendText(raw){
+  if(!raw) return;
+  let last=0, css=curStyle;
+  raw.replace(ANSI_RE,(m,off)=>{
+    if(off>last) pushSpan(raw.slice(last,off),css);
+    if(m[1]==='['){
+      const code=m.charCodeAt(m.length-1);
+      if(code===109){const params=m.slice(2,-1).split(';').map(x=>x===''?0:+x);curStyle=sgrStyle(params);css=curStyle;}
+    }
+    last=off+m.length; return m;
+  });
+  if(last<raw.length) pushSpan(raw.slice(last),css);
+}
+function pushSpan(text,css){
+  if(!text) return;
+  let span=document.createElement('span');
+  if(css){span.setAttribute('style',css.replace(/^;+/,''));}
+  span.textContent=text; logEl.appendChild(span);
+}
+function appendBlock(text){
+  if(!text) return;
+  const wasFollow=follow;
+  const parts=text.split('\n');
+  for(let i=0;i<parts.length;i++){
+    if(i>0) logEl.appendChild(document.createElement('br'));
+    appendText(parts[i]);
+  }
+  // 帧边界永远落在行末：补一个换行，下一帧第一行不会接到本行尾巴
+  logEl.appendChild(document.createElement('br'));
+  documentCount += text.length + 1;
+  if(documentCount > 4_000_000) {
+    logEl.textContent=''; documentCount=0;
+    appendText('…前面的日志已被浏览器裁剪…');
+    logEl.appendChild(document.createElement('br'));
+  }
+  if(wasFollow) pinBottom();
+}
+function atBottom(){ return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 24; }
+function pinBottom(){ logEl.scrollTop = logEl.scrollHeight; }
+logEl.addEventListener('scroll',()=>{
+  follow=atBottom(); jumpEl.style.display=follow?'none':'block';
+},{passive:true});
+jumpEl.addEventListener('click',()=>{follow=true;pinBottom();jumpEl.style.display='none';});
+document.addEventListener('click',()=>{ if(!follow){follow=true;pinBottom();jumpEl.style.display='none';} },true);
+
+function connect(){
+  clearTimeout(reconnectTimer);
+  socket=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/wslog');
+  socket.onopen=()=>{ document.title='pty local log'; };
+  socket.onclose=()=>{ appendBlock('\n[连接断开，1s 后重连]\n'); reconnectTimer=setTimeout(connect,1000); };
+  socket.onerror=()=>{};
+  socket.onmessage=(ev)=>{
+    const msg=JSON.parse(ev.data);
+    if(msg.type==='snapshot'){ logEl.textContent=''; curStyle='';
+      appendText(msg.text);
+      if(msg.text) logEl.appendChild(document.createElement('br'));
+      pinBottom(); }
+    else if(msg.type==='lines'){ appendBlock(msg.text); if(follow) pinBottom(); }
+    else if(msg.type==='pong'){ /* keepalive */ }
+  };
+}
+setInterval(()=>{ if(socket&&socket.readyState===WebSocket.OPEN) socket.send('ping'); }, 10000);
+connect();
+</script>
+</body>
+</html>"""
+
+
 def _install_ring_logging() -> None:
     """会话期所有 logging 只进环形缓冲（幂等）。
 
-    multi_mqtt 导入时已用 basicConfig 在 root 挂了写 stderr 的 StreamHandler，
-    broker 重连/paho 收发的 INFO 会直接插进远端画面；这里在 root 补一个 ring
-    handler 并移除 StreamHandler，级别维持 INFO。
+    正常路径下 multi_mqtt import 前已置 CMQ_NO_STDERR_LOG，root 上只有
+    NullHandler；这里仍防御性移除一切 StreamHandler——paho 或第三方库也可能
+    自己往 root 挂控制台 handler——再补 ring handler，级别维持 INFO。
     """
     root = logging.getLogger()
     if not any(isinstance(h, _RingLogHandler) for h in root.handlers):
@@ -705,6 +1101,22 @@ def _install_ring_logging() -> None:
             root.removeHandler(h)
     if root.level == logging.NOTSET or root.level > logging.INFO:
         root.setLevel(logging.INFO)
+
+
+def _install_log_capture() -> None:
+    """开启"终端只显示远端 shell"模式：logging + stdout + stderr 全部进日志环。
+
+    必须在起好 HTTP 日志口之后调用。先锁定解释器原始控制台的二进制流
+    （PTY 渲染/致命错误仍直写真实终端），再接管 logging 与文本级
+    stdout/stderr；幂等。
+    """
+    _bin_stdout()
+    _bin_stderr()
+    _install_ring_logging()
+    if not isinstance(sys.stdout, _RingTextIO):
+        sys.stdout = _RingTextIO("<stdout>")
+    if not isinstance(sys.stderr, _RingTextIO):
+        sys.stderr = _RingTextIO("<stderr>")
 
 
 def _info(msg):
@@ -1151,8 +1563,9 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         banner += (f"[pty] 心跳 {heartbeat:g}s：服务器关闭/断连后最多 "
                    f"{dead_timeout:g}s 自动退出\n")
     if getattr(args, "port", 0):
-        banner += ("[pty] 本地诊断日志不写终端：命令栏输 log，或 "
-                   "curl \"http://<本机IP>:%d/r=get_log()\" 查看\n"
+        banner += ("[pty] 本地日志与本画面完全分离：浏览器开 "
+                   "http://<本机IP>:%d/ 即全屏实时日志台；"
+                   "命令栏输 log，或 curl 同口 /r=get_log()\n"
                    % args.port)
     # banner 及之后的本地日志只进环形缓冲（RPC 口开启时终端零污染），
     # 不再 _stderr_write 插进远端画面。
@@ -1475,7 +1888,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    global _LOG_MIRROR_STDERR
+    global _LOG_MIRROR_STDERR,transport
     args = build_parser().parse_args(argv)
 
     if args.size:
@@ -1492,26 +1905,6 @@ def main(argv=None) -> int:
     if not sys.stdin.isatty():
         sys.stderr.write("[ERROR] PTY 需要一个交互式本地终端（stdin 不是 TTY）\n")
         return 2
-    
-    if args.port:
-        import server_http
-        # 注意：持久命名空间在此刻快照一次，ai_bridge/get_log 都是模块级
-        # 对象引用，会话建立后 attach/feed 对 HTTP 调用方立即生效。
-        # 起口成功即切换为"本地日志只进环形缓冲"：包括下面的启动 _info、
-        # 每笔 [RPC] 请求行和 root 上的 MultiMQTT/paho logging，终端零写入；
-        # 起口失败则保留 stderr 镜像，致命错误用户照样看得见。
-        _LOG_MIRROR_STDERR = False
-        try:
-            ghs = server_http.start_rpc_server(
-                port=args.port, ip=args.host, globals=globals(), locals=locals(),
-                log_sink=_emit_local)
-        except Exception:
-            _LOG_MIRROR_STDERR = True
-            raise
-        _install_ring_logging()
-        _info(f"本地 AI 控制口已开启：http://127.0.0.1:{args.port}/"
-              f"（示例：ai_bridge.run(\"uname -a\")；"
-              f"本地日志：curl \"http://127.0.0.1:{args.port}/r=get_log()\"）")
     
     _enable_output_vt()
     signed = bool(str(args.key or "").strip())
@@ -1531,6 +1924,31 @@ def main(argv=None) -> int:
         _info("在线节点：" + ", ".join(hosts))
     elif total:
         _emit_local("[WARN] 当前没有任何 broker 在线，握手大概率超时\n")
+        
+    if args.port:
+        import server_http
+        # 注意：持久命名空间在此刻快照一次，ai_bridge/get_log 都是模块级
+        # 对象引用，会话建立后 attach/feed 对 HTTP 调用方立即生效。
+        # 起口成功即切换为"本地日志只进环形缓冲"：包括下面的启动 _info、
+        # 每笔 [RPC] 请求行和 root 上的 MultiMQTT/paho logging，终端零写入；
+        # 起口失败则保留 stderr 镜像，致命错误用户照样看得见。
+        _LOG_MIRROR_STDERR = False
+        try:
+            ghs = server_http.start_rpc_server(
+                port=args.port, ip=args.host, globals=globals(), locals=locals(),
+                log_sink=_emit_local,
+                websocket_handler=_LOG_HUB.serve, websocket_path="/wslog",
+                redirect_root="/log_html(p)")
+        except Exception:
+            _LOG_MIRROR_STDERR = True
+            raise
+        # 起口成功后再接管 stdout/stderr/logging：浏览器日志台与 RPC 取日志
+        # 两个查看通道都已就绪，PTY 终端从此只渲染远端 shell。
+        _install_log_capture()
+        lan = _lan_ip()
+        _info(f"本地 AI 控制口已开启：http://{lan}:{args.port}/"
+              f"根路径自动跳转 /log_html(p)")
+    
     try:
         return run_session(transport, args, rows, cols)
     except RemoteError as exc:

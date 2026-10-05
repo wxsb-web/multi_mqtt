@@ -447,7 +447,7 @@ class PtyIseqOrderingTests(unittest.TestCase):
                          "实际 publish 顺序必须与序号一致，旧帧不能晚发被服务端丢弃")
 
 
-# ==================== tmux_capture ====================
+# ==================== tmux_capture_pane ====================
 
 class TmuxCaptureTests(unittest.TestCase):
     """验证生成的远端脚本与 reverse 行为（不真连 tmux，截获 run）。"""
@@ -470,7 +470,7 @@ class TmuxCaptureTests(unittest.TestCase):
 
     def test_default_script_matches_qgb_semantics(self):
         sh, cap = self._shell()
-        out = sh.tmux_capture()
+        out = sh.tmux_capture_pane()
         s = cap["script"]
         self.assertIn("unset TMUX", s)
         self.assertIn("capture-pane -S -9999 -t 0 -J", s)
@@ -480,7 +480,7 @@ class TmuxCaptureTests(unittest.TestCase):
 
     def test_session_window_pane_and_socket_quoted(self):
         sh, cap = self._shell()
-        sh.tmux_capture("my sess:2.1", max_lines=50,
+        sh.tmux_capture_pane("my sess:2.1", max_lines=50,
                         socket="/tmp/tmux-1000/default", capture_args="-J -e")
         s = cap["script"]
         self.assertIn("-S /tmp/tmux-1000/default", s)
@@ -490,21 +490,21 @@ class TmuxCaptureTests(unittest.TestCase):
 
     def test_none_session_omits_target(self):
         sh, cap = self._shell()
-        sh.tmux_capture(None)
+        sh.tmux_capture_pane(None)
         self.assertNotIn(" -t ", cap["script"])
 
     def test_negative_max_lines_clamped_to_zero(self):
         sh, cap = self._shell()
-        sh.tmux_capture(0, max_lines=-5)
+        sh.tmux_capture_pane(0, max_lines=-5)
         self.assertIn("capture-pane -S -0 ", cap["script"])
 
     def test_reverse_flips_lines(self):
         sh, _cap = self._shell("a\nb\nc")
-        self.assertEqual(sh.tmux_capture(reverse=True), "c\nb\na")
+        self.assertEqual(sh.tmux_capture_pane(reverse=True), "c\nb\na")
 
     def test_no_reverse_keeps_order(self):
         sh, _cap = self._shell("a\nb\nc")
-        self.assertEqual(sh.tmux_capture(), "a\nb\nc")
+        self.assertEqual(sh.tmux_capture_pane(), "a\nb\nc")
 
 
 if __name__ == "__main__":

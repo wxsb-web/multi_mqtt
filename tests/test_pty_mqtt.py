@@ -24,10 +24,13 @@
 import io
 import json
 import os
+import struct
 import sys
 import threading
 import time
 import unittest
+import urllib.request
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1361,6 +1364,423 @@ class TerminalWriterTests(unittest.TestCase):
             self.assertEqual(len(bound.lines), 1)
         finally:
             server_http.RPCRequestHandler.log_sink = old
+
+
+class LogRingSubscribeTests(unittest.TestCase):
+    """_LogRing.subscribe：快照 + 增量不重不漏、退订即停、坏监听不反噬。"""
+
+    def test_snapshot_then_incremental_no_dup_no_gap(self):
+        ring = pcm._LogRing(max_chars=10 ** 9, max_lines=10 ** 9)
+        ring.write("old-1\n"); ring.write("old-2\n")
+        got = []
+        snapshot, unsubscribe = ring.subscribe(lambda seq, line: got.append(line))
+        try:
+            self.assertEqual([line for _s, line in snapshot], ["old-1", "old-2"])
+            ring.write("new-3\n"); ring.write("new-4\n")
+            deadline = time.time() + 2
+            while len(got) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(got, ["new-3", "new-4"])  # 只收快照之后的，不重不漏
+        finally:
+            unsubscribe()
+        ring.write("after-unsub\n")
+        time.sleep(0.05)
+        self.assertNotIn("after-unsub", got)
+
+    def test_listener_exception_never_breaks_ring_or_other_listeners(self):
+        ring = pcm._LogRing(max_chars=10 ** 9, max_lines=10 ** 9)
+
+        def bad_cb(_seq, _line):
+            raise RuntimeError("listener boom")
+
+        good = []
+        snapshot, unsub_bad = ring.subscribe(bad_cb)
+        _snap2, unsub_good = ring.subscribe(lambda seq, line: good.append(line))
+        try:
+            ring.write("survive-1\n")
+            deadline = time.time() + 2
+            while len(good) < 1 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(good, ["survive-1"])
+            self.assertIn("survive-1", ring.tail(0))
+        finally:
+            unsub_bad(); unsub_good()
+
+    def test_concurrent_subscribers_each_get_full_tail(self):
+        ring = pcm._LogRing(max_chars=10 ** 9, max_lines=10 ** 9)
+        for i in range(50):
+            ring.write("c%02d\n" % i)
+        results = []
+        unsubs = []
+        try:
+            for _ in range(4):
+                snap, unsub = ring.subscribe(lambda *_: None)
+                results.append(len(snap))
+                unsubs.append(unsub)
+            self.assertEqual(results, [50, 50, 50, 50])
+        finally:
+            for u in unsubs:
+                u()
+
+
+class RingTextIOTests(unittest.TestCase):
+    """_RingTextIO：print/stdout/stderr 导流进日志环，且无 buffer 可被渲染侧误用。"""
+
+    def setUp(self):
+        pcm._LOCAL_LOG.clear()
+        self._mirror = pcm._LOG_MIRROR_STDERR
+        pcm._LOG_MIRROR_STDERR = False
+
+    def tearDown(self):
+        pcm._LOG_MIRROR_STDERR = self._mirror
+        pcm._LOCAL_LOG.clear()
+
+    def test_line_splitting_and_tail_fragment(self):
+        rio = pcm._RingTextIO("<test-out>")
+        n = rio.write("a\nb\r\nc\rd")
+        self.assertEqual(n, len("a\nb\r\nc\rd"))
+        self.assertEqual(pcm.get_log(0), "a\nb\nc")  # 残片 d 等换行才入环
+        rio.write("\n")
+        self.assertEqual(pcm.get_log(0), "a\nb\nc\nd")
+
+    def test_accepts_bytes_and_print(self):
+        rio = pcm._RingTextIO("<test-bytes>")
+        rio.write(b"bytes-line\n")
+        print("print-line", file=rio)
+        text = pcm.get_log(0)
+        self.assertIn("bytes-line", text)
+        self.assertIn("print-line", text)
+
+    def test_no_buffer_and_terminal_shims(self):
+        rio = pcm._RingTextIO("<test-shim>")
+        self.assertFalse(hasattr(rio, "buffer"))  # 强制 _bin_stdout 回退 sys.__stdout__
+        self.assertTrue(rio.writable())
+        self.assertFalse(rio.readable())
+        self.assertFalse(rio.isatty())
+        with self.assertRaises(OSError):
+            rio.fileno()
+        rio.flush()  # no-op，不报错
+
+    def test_install_log_capture_reroutes_stdout_stderr_and_is_idempotent(self):
+        import logging as pylog
+        old_out, old_err = sys.stdout, sys.stderr
+        root = pylog.getLogger()
+        saved_handlers = list(root.handlers)
+        saved_level = root.level
+        try:
+            pcm._install_log_capture()
+            self.assertIsInstance(sys.stdout, pcm._RingTextIO)
+            self.assertIsInstance(sys.stderr, pcm._RingTextIO)
+            self.assertFalse(hasattr(sys.stdout, "buffer"))
+            print("capture-stdout-51")
+            sys.stderr.write("capture-stderr-52\n")
+            pylog.getLogger("MultiMQTT.capture_test").info("capture-logging-53")
+            text = pcm.get_log(0)
+            self.assertIn("capture-stdout-51", text)
+            self.assertIn("capture-stderr-52", text)
+            self.assertIn("capture-logging-53", text)
+            # 幂等：不得二次包裹
+            pcm._install_log_capture()
+            self.assertEqual(sum(isinstance(h, pcm._RingLogHandler)
+                                 for h in root.handlers), 1)
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            for h in list(root.handlers):
+                if h not in saved_handlers:
+                    root.removeHandler(h)
+            for h in saved_handlers:
+                if h not in root.handlers:
+                    root.addHandler(h)
+            root.setLevel(saved_level)
+
+
+class _FakeWebSocket:
+    """LogHub.serve 用的假 WebSocket：脚本化入站消息，记录所有出站帧。"""
+
+    def __init__(self, incoming=(), stop_after_drain=False):
+        self._incoming = list(incoming)
+        self.sent = []
+        self.closed = False
+        self._stop = threading.Event()
+        self._send_gate = None  # 可选：第一次 lines 发送前阻塞（测积压丢行）
+
+    def block_first_lines_until_released(self):
+        ev = threading.Event()
+        self._send_gate = ev
+        return ev
+
+    def release_stop(self):
+        self._stop.set()
+
+    def send(self, message):
+        self.sent.append(message)
+        if self._send_gate is not None:
+            try:
+                msg = json.loads(message)
+            except ValueError:
+                return
+            if msg.get("type") == "lines":
+                self._send_gate.wait(5)
+
+    def receive(self):
+        if self._incoming:
+            return self._incoming.pop(0)
+        self._stop.wait(5)
+        return None
+
+    def close(self):
+        self.closed = True
+
+
+class LogHubTests(unittest.TestCase):
+    """LogHub：snapshot 先行、增量 lines、ping/pong、积压丢最旧并插提示。"""
+
+    def _frames(self, ws, timeout=3.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                return [json.loads(s) for s in ws.sent]
+            except ValueError:
+                pass
+            time.sleep(0.02)
+        return [json.loads(s) for s in ws.sent]
+
+    def test_snapshot_then_lines_and_pong(self):
+        ring = pcm._LogRing(max_chars=10 ** 9, max_lines=10 ** 9)
+        ring.write("snap-a\n"); ring.write("snap-b\n")
+        hub = pcm.LogHub(ring)
+        ws = _FakeWebSocket(incoming=("ping",))
+        t = threading.Thread(target=hub.serve, args=(ws, None), daemon=True)
+        t.start()
+        time.sleep(0.2)  # 等 snapshot 发出
+        ring.write("live-1\n"); ring.write("live-2\n")
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            frames = self._frames(ws)
+            blob = "\n".join(f.get("text", "") for f in frames
+                             if f.get("type") == "lines")
+            if "live-1" in blob and "live-2" in blob:
+                break
+            time.sleep(0.02)
+        ws.release_stop()
+        t.join(timeout=3)
+        frames = self._frames(ws)
+        types = [f["type"] for f in frames]
+        self.assertEqual(types[0], "snapshot")  # 快照必须在最前
+        snap = frames[0]
+        self.assertIn("snap-a", snap["text"])
+        self.assertIn("snap-b", snap["text"])
+        self.assertEqual(snap["lines"], 2)
+        blob = "\n".join(f.get("text", "") for f in frames
+                         if f.get("type") == "lines")
+        self.assertIn("live-1", blob)
+        self.assertIn("live-2", blob)
+        self.assertIn("pong", types)
+        self.assertTrue(ws.closed)
+
+    def test_slow_consumer_drops_oldest_with_notice(self):
+        ring = pcm._LogRing(max_chars=10 ** 9, max_lines=10 ** 9)
+        hub = pcm.LogHub(ring)
+        ws = _FakeWebSocket()
+        gate = ws.block_first_lines_until_released()
+        t = threading.Thread(target=hub.serve, args=(ws, None), daemon=True)
+        t.start()
+        time.sleep(0.2)  # snapshot 已发出，writer 正堵在第一条 lines 上
+        for i in range(pcm._LOG_WS_QUEUE + 100):
+            ring.write("burst-%04d\n" % i)
+        time.sleep(0.3)
+        gate.set()  # 放行：首帧应带积压丢弃提示
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            frames = self._frames(ws)
+            blob = "\n".join(f.get("text", "") for f in frames
+                             if f.get("type") == "lines")
+            if "burst-1099" in blob:
+                break
+            time.sleep(0.02)
+        ws.release_stop()
+        t.join(timeout=3)
+        frames = self._frames(ws)
+        notices = [f["text"] for f in frames
+                   if "已丢弃" in f.get("text", "")]
+        self.assertTrue(notices, "慢消费积压时必须插入丢弃提示")
+        self.assertIn("100", notices[0])
+        self.assertIn("burst-1099",
+                      "\n".join(f.get("text", "") for f in frames))
+
+
+class LogHtmlPageTests(unittest.TestCase):
+    """log_html：整页就是全屏控制台，无工具栏，直连 /wslog。"""
+
+    def test_page_fullscreen_and_wslog_only(self):
+        class FakeResponse:
+            def __init__(self):
+                self.headers = {}
+                self.data = None
+
+            def set_header(self, key, value):
+                self.headers[key] = value
+
+            def set_data(self, data):
+                self.data = data
+
+        resp = FakeResponse()
+        pcm.log_html(resp)
+        self.assertIn("text/html", resp.headers["Content-Type"])
+        self.assertEqual(resp.headers["Cache-Control"], "no-store")
+        page = resp.data
+        self.assertIs(page, pcm._LOG_PAGE)
+        self.assertIn("/wslog", page)
+        self.assertIn("100vh", page)       # 整个视口即控制台
+        self.assertIn("snapshot", page)
+        self.assertIn("appendBlock", page)
+        self.assertNotIn("<toolbar", page)
+        self.assertNotIn('role="toolbar"', page)
+
+
+class LogConsoleEndToEndTests(unittest.TestCase):
+    """真实 HTTP 口端到端：页面/302/取日志 RPC + 裸 WebSocket 收 snapshot/lines。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import logging as pylog
+        import server_http
+        cls._server_http = server_http
+        cls._old_out, cls._old_err = sys.stdout, sys.stderr
+        cls._root = pylog.getLogger()
+        cls._saved_handlers = list(cls._root.handlers)
+        cls._saved_level = cls._root.level
+        cls._mirror = pcm._LOG_MIRROR_STDERR
+        pcm._LOCAL_LOG.clear()
+        pcm._LOG_MIRROR_STDERR = False
+        cls.server = server_http.start_rpc_server(
+            port=0, ip="127.0.0.1", globals={"log_html": pcm.log_html,
+                                             "get_log": pcm.get_log,
+                                             "clear_log": pcm.clear_log},
+            log_sink=pcm._emit_local,
+            websocket_handler=pcm._LOG_HUB.serve, websocket_path="/wslog",
+            redirect_root="/log_html(p)")
+        cls.port = cls.server.server_address[1]
+        pcm._install_log_capture()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.server.shutdown()
+        finally:
+            sys.stdout, sys.stderr = cls._old_out, cls._old_err
+            for h in list(cls._root.handlers):
+                if h not in cls._saved_handlers:
+                    cls._root.removeHandler(h)
+            for h in cls._saved_handlers:
+                if h not in cls._root.handlers:
+                    cls._root.addHandler(h)
+            cls._root.setLevel(cls._saved_level)
+            pcm._LOG_MIRROR_STDERR = cls._mirror
+            pcm._LOCAL_LOG.clear()
+
+    def _get(self, path):
+        return urllib.request.urlopen(
+            "http://127.0.0.1:%d%s" % (self.port, path), timeout=5)
+
+    def test_page_rpc_and_root_redirect(self):
+        with self._get("/log_html(p)") as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.headers["Content-Type"])
+            body = resp.read().decode("utf-8", "replace")
+            self.assertIn("/wslog", body)
+            self.assertIn("100vh", body)
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            opener.open("http://127.0.0.1:%d/" % self.port, timeout=5)
+            self.fail("根路径应 302 跳转日志台")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 302)
+            self.assertEqual(e.headers["Location"], "/log_html(p)")
+            e.close()
+
+    def test_wslog_snapshot_then_stdout_and_logging_frames(self):
+        import socket as _socket
+        import logging as pylog
+        key = b"1234567890abcdef"
+        sock = _socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            handshake = (
+                b"GET /wslog HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                b"Connection: Upgrade\r\nSec-WebSocket-Key: "
+                + __import__("base64").b64encode(key)
+                + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            sock.sendall(handshake)
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = sock.recv(4096)
+                self.assertTrue(chunk, "握手无响应")
+                resp += chunk
+            self.assertIn(b"101 Switching Protocols", resp)
+
+            def recv_frame():
+                def rd(n):
+                    data = b""
+                    while len(data) < n:
+                        chunk = sock.recv(n - len(data))
+                        if not chunk:
+                            raise ConnectionError("websocket 已断开")
+                        data += chunk
+                    return data
+                h0, h1 = rd(2)
+                opcode = h0 & 0x0F
+                length = h1 & 0x7F
+                if length == 126:
+                    length = struct.unpack("!H", rd(2))[0]
+                elif length == 127:
+                    length = struct.unpack("!Q", rd(8))[0]
+                payload = rd(length) if length else b""
+                return opcode, payload.decode("utf-8", "replace")
+
+            opcode, payload = recv_frame()
+            self.assertEqual(opcode, 0x1)
+            self.assertEqual(json.loads(payload)["type"], "snapshot")
+
+            print("e2e-stdout-marker-91")
+            pylog.getLogger("MultiMQTT.e2e").info("e2e-logging-marker-92")
+            blob = ""
+            deadline = time.time() + 5
+            while time.time() < deadline and not (
+                    "e2e-stdout-marker-91" in blob
+                    and "e2e-logging-marker-92" in blob):
+                _op, frame = recv_frame()
+                if _op == 0x1:
+                    blob += json.loads(frame).get("text", "") + "\n"
+            self.assertIn("e2e-stdout-marker-91", blob)
+            self.assertIn("e2e-logging-marker-92", blob)
+
+            # 应用层心跳：发 mask 文本帧 ping，LogHub 回 JSON 文本帧 pong
+            mask = b"\x01\x02\x03\x04"
+            ping = b"ping"
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(ping))
+            sock.sendall(b"\x81" + bytes((0x80 | len(ping),)) + mask + masked)
+            pong_seen = False
+            pong_deadline = time.time() + 5
+            while time.time() < pong_deadline and not pong_seen:
+                opcode, payload = recv_frame()
+                if opcode == 0x1:
+                    try:
+                        pong_seen = json.loads(payload).get("type") == "pong"
+                    except ValueError:
+                        pass
+            self.assertTrue(pong_seen)
+        finally:
+            sock.close()
+
+        with self._get("/r=get_log()") as resp:
+            text = resp.read().decode("utf-8", "replace")
+            self.assertIn("e2e-stdout-marker-91", text)
+            self.assertIn("e2e-logging-marker-92", text)
 
 
 if __name__ == "__main__":

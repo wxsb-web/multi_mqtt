@@ -208,6 +208,17 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             traceback.print_exc()
         finally:
             websocket.close()
+            # 升级后连接已脱离 HTTP keep-alive 循环：主动关底层 socket，
+            # 否则要等下一轮解析失败才回收（浏览器日志台频繁开关时堆积 fd）。
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self.connection.close()
+            except OSError:
+                pass
 
     def do_POST(self):
         self.handle_rpc()

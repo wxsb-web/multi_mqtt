@@ -188,6 +188,9 @@ python client/pty_client_mqtt.py -k "123+456" --host 127.0.0.1
 GET http://127.0.0.1:1188/r=ai_bridge.status()
 GET http://127.0.0.1:1188/r=ai_bridge.run("uname%20-a")
 GET http://127.0.0.1:1188/r=ai_bridge.send("y\n")
+# 实时日志首选浏览器，不必刷 RPC：
+#   浏览器开 http://192.168.1.3:1188/  → 根路径自动 302 到全屏日志台
+#   页面经 WebSocket /wslog 先推快照再推增量（snapshot/lines 帧）
 GET http://192.168.1.3:1188/r=get_log()
 GET http://192.168.1.3:1188/r=get_log(50)
 GET http://192.168.1.3:1188/r=clear_log()
@@ -198,7 +201,7 @@ GET http://192.168.1.3:1188/r=clear_log()
 - 路径里的空格、引号等仍需 percent-encode；参数一复杂就改用 Python helper（`ai_pty_run/send`），不要在 URL 里堆多语句。
 - 需要精确 JSON 字符串时才用编码后的 `p.set_data(json.dumps(obj, ensure_ascii=False))`。
 - `r` 留在持久命名空间，会被下一次 `/r=...` 覆盖，不要依赖上一次的残留值。
-- **本地日志不打终端**：broker 连接/重连、MultiMQTT/paho 的 logging、每笔 `[RPC]` 请求行、`[WARN]`/banner 全进进程内环形缓冲（约 256KB/2000 行，超量丢最旧），避免和远端 shell 画面穿插。用 `/r=get_log(n)` 取最近 n 行（默认 200，n<=0 全部）、`/r=clear_log()` 清空；人类可在窗口命令栏（Ctrl+Alt+Insert）输 `log [n]` 看最近 100 行（自擦覆盖层）。仅会话退出时的致命错误仍直写 stderr（终端已复位）；`--port 0` 关 RPC 口时无查看通道，日志退回 stderr 镜像。
+- **终端与日志彻底分离**：PTY 窗口只渲染远端 shell；broker 连接/重连、MultiMQTT/paho 的 logging、每笔 `[RPC]` 请求行、`[WARN]`/banner，乃至任何库的 print / stdout / stderr 全部进进程内环形缓冲（约 256KB/2000 行，超量丢最旧），真实终端零写入。查看通道：① 浏览器全屏实时日志台 `http://<本机IP>:1188/`（无工具栏、黑底等宽、滚到底自动跟随、上翻暂停、ANSI 着色、慢消费丢旧行不反压业务线程，手机同局域网可开）；② `/r=get_log(n)` 取最近 n 行（默认 200，n<=0 全部）、`/r=clear_log()` 清空；③ 窗口命令栏（Ctrl+Alt+Insert）输 `log [n]`（自擦覆盖层）。实现约定：组合方在 import multi_mqtt 前置 `CMQ_NO_STDERR_LOG=1`（import 期只挂 NullHandler），起 RPC 口成功后 `_install_log_capture()` 锁定真实控制台二进制流并把 root logging + sys.stdout/stderr 换成环；`_RingTextIO` 刻意无 buffer，PTY 渲染侧自动回退 `sys.__stdout__`。仅会话退出时的致命错误仍直写真实 stderr（终端已复位）；`--port 0` 关 RPC 口时无查看通道，日志退回 stderr 镜像。
 
 ```python
 # AI / 任意进程：只是一次 localhost HTTP，不碰 broker

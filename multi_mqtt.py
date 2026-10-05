@@ -38,7 +38,15 @@ from collections import OrderedDict
 from paho.mqtt import client as mqtt_client
 from paho.mqtt.enums import CallbackAPIVersion
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 组合方（如 pty_client_mqtt）需要把全部日志导去自己的环形缓冲/Web 控制台，
+# 而不是让本模块在 import 时往 root 挂一个写 stderr 的 StreamHandler（会插进
+# PTY 远端画面）。约定：import 本模块前设置环境变量 CMQ_NO_STDERR_LOG=1，
+# 这里只挂 NullHandler 占位，root level 仍由组合方按需配置（日志记录照常
+# 向 root 传播，组合方挂自己的 handler 即可收到）。
+if os.environ.get("CMQ_NO_STDERR_LOG"):
+    logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
+else:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MultiMQTT")
 
 # =========================================================================
