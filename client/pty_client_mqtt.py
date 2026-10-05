@@ -18,7 +18,7 @@
     python client/pty_client_mqtt.py                    # 交互式 PTY（默认参数）
     python client/pty_client_mqtt.py -i 0.2             # 服务端最多 0.2s 攒批
     python client/pty_client_mqtt.py --shell /bin/bash --cwd /root
-    python client/pty_client_mqtt.py -t q -k 2**128 "tmux at"
+    python client/pty_client_mqtt.py -t q -k 2333 "tmux at"
                                                         # SSH 式：连上自动执行
                                                         # 前置命令，随后留在会话里
 
@@ -83,6 +83,7 @@ fire-and-forget 发一帧 stop，不做 pty.close/transport.stop 那套慢清理
 from __future__ import annotations
 
 import argparse
+import codecs
 import io
 import json
 import logging
@@ -196,6 +197,31 @@ class _PosixRawConsole:
         self._termios.tcsetattr(self.fd, self._termios.TCSANOW, self.old)
 
 
+def _new_input_transcoder(cp):
+    """把按"控制台输入代码页"编码的 VT 输入字节增量转成 UTF-8。
+
+    VT 输入流里的可打印字符沿用控制台输入 CP（中文系统默认 936/GBK），
+    右键粘贴 / 中文 IME 敲入的汉字到达 ``os.read`` 时是 GBK 而不是 UTF-8，
+    直接透传给远端 UTF-8 PTY 就乱码。不能靠把输入 CP 改成 65001 解决：
+    实测 conhost 自带的粘贴路径在 CP65001 下会把每个汉字写成固定坏字节
+    （U+00B0），信息不可逆丢失；保留系统 CP 时字节是合法 GBK，可完整转码。
+
+    用增量解码器：一次 read 可能恰好落在双字节字符中间，半截序列必须留到
+    下次拼接，绝不能当场替换成 U+FFFD。所有 VT 控制序列都是纯 ASCII，
+    转码对转义字节透明。
+    """
+    name = "utf-8" if cp in (0, 65001) else "cp%d" % cp
+    try:
+        dec = codecs.getincrementaldecoder(name)(errors="replace")
+    except LookupError:
+        dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def feed(data: bytes) -> bytes:
+        return dec.decode(data).encode("utf-8", "replace")
+
+    return feed
+
+
 class _WinRawConsole:
     """Windows 输入：优先 ENABLE_VIRTUAL_TERMINAL_INPUT（ReadFile 直接给 VT 序列），
     老系统 / 失败时退回 msvcrt.getwch + 按键翻译。"""
@@ -208,6 +234,7 @@ class _WinRawConsole:
         self.h = self.k.GetStdHandle(-10)  # STD_INPUT_HANDLE
         self.old_mode = None
         self.use_vt = False
+        self._transcode = _new_input_transcoder(65001)
 
     def enter(self):
         import ctypes
@@ -217,10 +244,15 @@ class _WinRawConsole:
             if self.k.SetConsoleMode(self.h, self.ENABLE_VIRTUAL_TERMINAL_INPUT):
                 self.use_vt = True
         self.k.SetConsoleOutputCP(65001)
+        # 只改输出 CP，不动输入 CP：见 _new_input_transcoder 的说明。
+        try:
+            self._transcode = _new_input_transcoder(self.k.GetConsoleCP())
+        except Exception:
+            pass
 
     def read(self) -> bytes:
         if self.use_vt:
-            return os.read(0, 4096)
+            return self._transcode(os.read(0, 4096))
         return self._msvcrt_read()
 
     def exit(self):
@@ -256,6 +288,54 @@ class _WinRawConsole:
 
 def _make_raw_console():
     return _WinRawConsole() if sys.platform == "win32" else _PosixRawConsole()
+
+
+# ============================ 本地剪贴板粘贴 ============================
+
+# Shift+Insert 在 conhost 的 VT 输入模式下不会触发系统粘贴：控制台把按键
+# 翻译成 xterm 序列直接交给应用（现象：远端 shell 收到字面 ^[[2;2~）。
+# 客户端截下该序列，自己读剪贴板发 UTF-8，既补回粘贴功能，也绕开 conhost
+# 自带粘贴在非 UTF-8 输入 CP 下发本地编码、在 CP65001 下直接丢汉字的两条坏路。
+_PASTE_KEY_SEQ = b"\x1b[2;2~"
+
+
+def _normalize_paste_text(text: str) -> bytes:
+    """剪贴板文本转成发往 PTY 的字节：UTF-8 编码，换行统一为 CR。
+
+    conhost 右键粘贴与回车键上报的换行都是 ``\\r``；剪贴板里常见的
+    ``\\r\\n`` / ``\\n`` 不统一会导致 tmux/全屏程序光标行为不一致。
+    """
+    text = text.replace("\r\n", "\r").replace("\n", "\r")
+    return text.encode("utf-8", "replace")
+
+
+def _read_clipboard_text_win() -> str:
+    """纯 ctypes 读 CF_UNICODETEXT 剪贴板文本；无文本/失败返回空串。"""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    u32 = ctypes.windll.user32
+    # 必须显式声明 64 位句柄原型，否则 ctypes 默认 c_int 返回值截断句柄。
+    u32.GetClipboardData.restype = wintypes.HANDLE
+    u32.GetClipboardData.argtypes = [wintypes.UINT]
+    k32.GlobalLock.restype = wintypes.LPVOID
+    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    if not u32.OpenClipboard(0):
+        return ""
+    try:
+        hdata = u32.GetClipboardData(13)  # CF_UNICODETEXT
+        if not hdata:
+            return ""
+        ptr = k32.GlobalLock(hdata)
+        if not ptr:
+            return ""
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            k32.GlobalUnlock(hdata)
+    finally:
+        u32.CloseClipboard()
 
 
 # ============================ 退出时的本地终端复位 ============================
@@ -1567,6 +1647,8 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                    "http://<本机IP>:%d/ 即全屏实时日志台；"
                    "命令栏输 log，或 curl 同口 /r=get_log()\n"
                    % args.port)
+    if sys.platform == "win32":
+        banner += "[pty] 粘贴：右键 或 Shift+Insert，中文按 UTF-8 发送\n"
     # banner 及之后的本地日志只进环形缓冲（RPC 口开启时终端零污染），
     # 不再 _stderr_write 插进远端画面。
     _emit_local(banner)
@@ -1680,6 +1762,24 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                 except Exception:
                     pass
 
+    def _do_paste() -> None:
+        # Shift+Insert：conhost 已把按键交给本进程，直接读本地剪贴板发远端，
+        # 不经过 conhost 的粘贴路径，任何语言文本都是干净 UTF-8。
+        if sys.platform != "win32":
+            return
+        try:
+            text = _read_clipboard_text_win()
+        except Exception:
+            text = ""
+        if not text:
+            return
+        data = _normalize_paste_text(text)
+        if data:
+            try:
+                pty.send(data)
+            except Exception:
+                pass
+
     def _do_hotkey(name) -> bool:
         if name == "detach":
             _local_out("\r\n[pty] 本地脱离\r\n")
@@ -1687,6 +1787,8 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
             return True
         if name == "menu":
             _open_menu()
+        elif name == "paste":
+            _do_paste()
         return False
 
     def input_loop():
@@ -1695,6 +1797,10 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         # 按 _HOTKEY_GAP 等剩余字节；超时则把 ESC 照常放给远端。
         seqs = [(s, n) for s, n in
                 ((detach_key, "detach"), (menu_key, "menu")) if s]
+        # Shift+Insert 本地粘贴（仅 Windows：POSIX 终端一般自行完成粘贴，
+        # 不会把序列交给应用；万一收到也照旧透传）。
+        if sys.platform == "win32":
+            seqs.append((_PASTE_KEY_SEQ, "paste"))
         multi = [s for s, _ in seqs if len(s) > 1]
         try:
             while not stop_ev.is_set():

@@ -410,7 +410,7 @@ class PtyCliPreCommandTests(unittest.TestCase):
 
     def test_quoted_command_after_options(self):
         args = pcm.build_parser().parse_args(
-            ["-t", "q", "-k", "2**128", "tmux at"])
+            ["-t", "q", "-k", "123+456", "tmux at"])
         self.assertEqual(pcm._join_pre_command(args.command), "tmux at")
 
     def test_unquoted_words_joined_like_ssh(self):
@@ -518,6 +518,72 @@ class PtyHotkeyParseTests(unittest.TestCase):
         self.assertEqual(pcm._describe_key(b""), "禁用")
         self.assertEqual(pcm._parse_key_spec(
             "ctrl-alt-insert") in pcm._KEY_DISPLAY, True)
+
+
+class PtyInputTranscodeTests(unittest.TestCase):
+    """Windows VT 输入流按输入 CP 增量转 UTF-8：修右键粘贴中文乱码。"""
+
+    def test_gbk_full_chunk(self):
+        feed = pcm._new_input_transcoder(936)
+        out = feed("导航Abc".encode("gbk") + b"\r")
+        self.assertEqual(out, "导航Abc\r".encode("utf-8"))
+
+    def test_gbk_split_across_reads(self):
+        # 双字节汉字被两次 read 从中间切开时不能出 U+FFFD
+        feed = pcm._new_input_transcoder(936)
+        raw = "导航".encode("gbk")  # b5 bc ba bd
+        self.assertEqual(feed(raw[:1]), b"")
+        self.assertEqual(feed(raw[1:2]), "导".encode("utf-8"))
+        self.assertEqual(feed(raw[2:3]), b"")
+        self.assertEqual(feed(raw[3:]), "航".encode("utf-8"))
+
+    def test_vt_sequences_ascii_transparent(self):
+        # 热键/方向键等纯 ASCII VT 序列在 GBK 转码后必须逐字节不变
+        feed = pcm._new_input_transcoder(936)
+        raw = b"\x1b[2;2~" + "中文".encode("gbk") + b"\x1b[C\r"
+        self.assertEqual(
+            feed(raw),
+            b"\x1b[2;2~" + "中文".encode("utf-8") + b"\x1b[C\r")
+
+    def test_utf8_passthrough_and_split(self):
+        feed = pcm._new_input_transcoder(65001)
+        raw = "中文".encode("utf-8")  # e4 b8 ad e6 96 87
+        self.assertEqual(feed(raw[:2]), b"")
+        self.assertEqual(feed(raw[2:]), "中文".encode("utf-8"))
+
+    def test_unknown_cp_fallback_utf8(self):
+        feed = pcm._new_input_transcoder(99999)
+        self.assertEqual(feed("A".encode("utf-8")), b"A")
+
+
+class PtyClipboardPasteTests(unittest.TestCase):
+    """Shift+Insert 本地粘贴：序列常量与文本规范化。"""
+
+    def test_paste_seq_matches_conhost_emission(self):
+        # conhost VT 输入下 Shift+Insert 上报的正是 xterm 的 CSI 2;2~
+        self.assertEqual(pcm._PASTE_KEY_SEQ,
+                         pcm._parse_key_spec("shift+insert"))
+        # 普通 Insert 不能被当成粘贴
+        self.assertNotEqual(pcm._PASTE_KEY_SEQ, b"\x1b[2~")
+
+    def test_normalize_newlines_and_utf8(self):
+        self.assertEqual(pcm._normalize_paste_text("a\r\nb\nc\rd"),
+                         b"a\rb\rc\rd")
+        self.assertEqual(pcm._normalize_paste_text("导航"),
+                         "导航".encode("utf-8"))
+        self.assertEqual(pcm._normalize_paste_text(""), b"")
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows only")
+    def test_clipboard_roundtrip(self):
+        import subprocess
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Set-Clipboard -Value '剪贴板中文Abc'"],
+                check=True, capture_output=True, timeout=20)
+        except Exception as exc:
+            self.skipTest("Set-Clipboard unavailable: %r" % exc)
+        self.assertEqual(pcm._read_clipboard_text_win(), "剪贴板中文Abc")
 
 
 class LocalLogBufferTests(unittest.TestCase):
