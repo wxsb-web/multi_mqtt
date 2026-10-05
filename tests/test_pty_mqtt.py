@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.request
 import urllib.error
 
@@ -1543,6 +1544,78 @@ class TerminalWriterTests(unittest.TestCase):
             self.assertIn("writer", res["error"])
         finally:
             pcm._OUT_WRITER = saved
+
+
+class SelectionAutoUnstickTests(unittest.TestCase):
+    """QuickEdit 保留（左键选择/右键粘贴）；长冻结由合成 ESC 自动解除，
+    并有泄漏兜底过滤。"""
+
+    def setUp(self):
+        pcm._ESC_GUARD["until"] = 0.0
+
+    def test_esc_guard_drops_single_esc_once(self):
+        pcm._arm_esc_guard()
+        self.assertEqual(pcm._filter_injected_esc(b"\x1b"), b"")
+        # 只丢弃一次：后续 ESC 放行
+        self.assertEqual(pcm._filter_injected_esc(b"\x1b"), b"\x1b")
+
+    def test_esc_guard_passes_other_bytes_and_chunks(self):
+        pcm._arm_esc_guard()
+        self.assertEqual(pcm._filter_injected_esc(b"\x1b[A"), b"\x1b[A")
+        self.assertEqual(pcm._filter_injected_esc(b"a"), b"a")
+
+    def test_esc_guard_expires(self):
+        pcm._arm_esc_guard(window=0.05)
+        time.sleep(0.08)
+        self.assertEqual(pcm._filter_injected_esc(b"\x1b"), b"\x1b")
+
+    def test_cancel_only_when_console_is_foreground(self):
+        import ctypes
+        k = ctypes.windll.kernel32
+        u = ctypes.windll.user32
+        with mock.patch.object(k, "GetConsoleWindow", return_value=111), \
+                mock.patch.object(u, "GetForegroundWindow",
+                                  return_value=222), \
+                mock.patch.object(u, "keybd_event") as kb:
+            self.assertFalse(pcm._cancel_console_selection())
+            kb.assert_not_called()  # 非前台绝不发 ESC（会打进别的程序）
+
+    def test_cancel_sends_esc_down_up_and_arms_guard(self):
+        import ctypes
+        k = ctypes.windll.kernel32
+        u = ctypes.windll.user32
+        with mock.patch.object(k, "GetConsoleWindow", return_value=333), \
+                mock.patch.object(u, "GetForegroundWindow",
+                                  return_value=333), \
+                mock.patch.object(u, "keybd_event") as kb:
+            self.assertTrue(pcm._cancel_console_selection())
+        self.assertEqual(kb.call_args_list, [
+            mock.call(0x1B, 0, 0, 0),        # ESC down
+            mock.call(0x1B, 0, 0x0002, 0),   # KEYEVENTF_KEYUP
+        ])
+        self.assertGreater(pcm._ESC_GUARD["until"], 0.0)
+
+    def test_cancel_non_win32(self):
+        with mock.patch.object(pcm.sys, "platform", "linux"):
+            self.assertFalse(pcm._cancel_console_selection())
+
+    def test_enable_vt_does_not_touch_input_mode(self):
+        # 回归：QuickEdit 必须保留——_enable_output_vt 只许操作输出句柄
+        import ctypes
+        k = ctypes.windll.kernel32
+        with mock.patch.object(k, "SetConsoleOutputCP") as cp, \
+                mock.patch.object(k, "GetStdHandle",
+                                  return_value=777) as geth, \
+                mock.patch.object(k, "GetConsoleMode",
+                                  return_value=True), \
+                mock.patch.object(k, "SetConsoleMode",
+                                  return_value=True) as setm:
+            self.assertTrue(pcm._enable_output_vt())
+        cp.assert_called_once_with(65001)
+        self.assertEqual(geth.call_args_list, [mock.call(-11)])  # 无 -10
+        # 读到的模式值为 0（c_uint32 初值），只补 VT 位
+        self.assertEqual(setm.call_args_list,
+                         [mock.call(777, 0x0004)])
 
 
 class LogRingSubscribeTests(unittest.TestCase):

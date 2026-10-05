@@ -162,8 +162,9 @@ alias_detach = tuple(dict.fromkeys(
 def _enable_output_vt() -> bool:
     """让本地终端能渲染远端 ANSI 输出。POSIX 原生支持；Windows 打开 VT 处理 + UTF-8。
 
-    同时在输入句柄上清除 ENABLE_QUICK_EDIT_MODE：QuickEdit 下鼠标误触进入
-    文本选择会冻结该控制台的全部输出写入（py-spy 实证的"窗口假死"）。
+    刻意不动 QuickEdit：左键选择 / 右键粘贴是日常功能，选择时输出暂停也
+    是应有语义；长时间忘记退出选择模式的冻结由写线程卡滞检测 + 合成 ESC
+    自动解除（见 _cancel_console_selection），而非禁用选择。
     """
     if sys.platform != "win32":
         return True
@@ -171,11 +172,6 @@ def _enable_output_vt() -> bool:
         import ctypes
         k = ctypes.windll.kernel32
         k.SetConsoleOutputCP(65001)
-        # 输入句柄：先清 QuickEdit（0x0040），不等 raw console 建立
-        hi = k.GetStdHandle(-10)  # STD_INPUT_HANDLE
-        imode = ctypes.c_uint32()
-        if k.GetConsoleMode(hi, ctypes.byref(imode)):
-            k.SetConsoleMode(hi, imode.value & ~0x0040)
         h = k.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
         mode = ctypes.c_uint32()
         if not k.GetConsoleMode(h, ctypes.byref(mode)):
@@ -238,7 +234,6 @@ class _WinRawConsole:
     老系统 / 失败时退回 msvcrt.getwch + 按键翻译。"""
 
     ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
-    ENABLE_QUICK_EDIT_MODE = 0x0040
 
     def __init__(self):
         import ctypes
@@ -255,11 +250,6 @@ class _WinRawConsole:
             self.old_mode = mode.value
             if self.k.SetConsoleMode(self.h, self.ENABLE_VIRTUAL_TERMINAL_INPUT):
                 self.use_vt = True
-            else:
-                # VT 输入不可用（老系统）：退回普通行输入也必须清掉
-                # QuickEdit——鼠标误触进入选择模式会冻结全部控制台输出。
-                self.k.SetConsoleMode(
-                    self.h, mode.value & ~self.ENABLE_QUICK_EDIT_MODE)
         self.k.SetConsoleOutputCP(65001)
         # 只改输出 CP，不动输入 CP：见 _new_input_transcoder 的说明。
         try:
@@ -1302,6 +1292,52 @@ def reset_out_writer() -> dict:
     return {"ok": True, "stall_seconds": round(stall, 2)}
 
 
+# ---- QuickEdit 选择模式冻结：自动解除（保留左键选择/右键粘贴） ----
+
+# 写线程卡滞超过该秒数且 pty 窗口在前台：合成 ESC 解除 conhost 标记模式
+_SELECTION_STALL_AUTO_UNSTICK = 25.0
+
+# 合成 ESC 的泄漏兜底：标记模式在注入前一刻恰被解除时，ESC 可能进入应用输入。
+# 注入后极短时间窗内丢弃恰好读出的单个 ESC 字节（真实按键同窗口同键的概率可忽略）。
+_ESC_GUARD = {"until": 0.0}
+
+
+def _arm_esc_guard(window: float = 1.0) -> None:
+    _ESC_GUARD["until"] = time.monotonic() + window
+
+
+def _filter_injected_esc(data: bytes) -> bytes:
+    if data == b"\x1b" and _ESC_GUARD["until"] and \
+            time.monotonic() < _ESC_GUARD["until"]:
+        _ESC_GUARD["until"] = 0.0
+        return b""
+    return data
+
+
+def _cancel_console_selection() -> bool:
+    """合成一次 ESC 解除 conhost 标记（选择）模式，解除输出冻结。
+
+    QuickEdit 左键拖选时 conhost 冻结该控制台输出，标记模式下 ESC 由 conhost
+    自行消费、不进入应用，被冻住的 WriteFile 随即完成、积压一次性刷出。
+    仅当本控制台窗口处于前台才发送——否则 ESC 会打进用户正在操作的其他程序。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        u = ctypes.windll.user32
+        if u.GetForegroundWindow() != k.GetConsoleWindow():
+            return False
+        # keybd_event（等价 SendInput 的键盘路径）：ESC 0x1B，down + up
+        u.keybd_event(0x1B, 0, 0, 0)
+        u.keybd_event(0x1B, 0, 0x0002, 0)  # KEYEVENTF_KEYUP
+        _arm_esc_guard()
+        return True
+    except Exception:
+        return False
+
+
 # ============================ AI 桥：外部进程复用本常驻 PTY ============================
 
 # CSI / SGR / OSC / 单字符转义，用于把 AI 收回的终端字节还原成纯文本
@@ -1816,6 +1852,9 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                     break
                 if not data:
                     break
+                data = _filter_injected_esc(data)
+                if not data:
+                    continue
                 keyq.put(data)
         finally:
             stop_ev.set()
@@ -2015,6 +2054,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     # 主线程：远端输出原样渲染；任何退出路径都走 _hard_exit 立即收场
     held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
     last_stall_warn = [0.0]  # 卡滞告警节流（每 30s 一条）
+    auto_unstick_done = [False]  # 本轮冻结是否已自动解除（解冻后重新武装）
     try:
         while not stop_ev.is_set():
             try:
@@ -2036,6 +2076,17 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                         "[pty][WARN] 终端写卡滞 %.0fs：若窗口处于选择/"
                         "标记模式请按 ESC 解除，或命令栏执行 redraw "
                         "切换写线程\n" % _stall)
+                # 长时间冻结（通常是选了文本忘记退出标记模式）：前台时
+                # 合成 ESC 自动解除，鼠标左键选择/右键粘贴照常保留
+                if _stall >= _SELECTION_STALL_AUTO_UNSTICK \
+                        and not auto_unstick_done[0]:
+                    if _cancel_console_selection():
+                        auto_unstick_done[0] = True
+                        _emit_local(
+                            "[pty] 窗口选择模式冻结输出超过 %.0f 秒，"
+                            "已自动解除\n" % _SELECTION_STALL_AUTO_UNSTICK)
+                if auto_unstick_done[0] and _stall == 0.0:
+                    auto_unstick_done[0] = False  # 解冻恢复，允许处理下次冻结
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,
