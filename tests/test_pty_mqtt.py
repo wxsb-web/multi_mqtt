@@ -814,6 +814,24 @@ class PtyMagicBarTests(unittest.TestCase):
         self.assertIn("cap-line-149", "\n".join(lines))
         self.assertNotIn("cap-line-000", "\n".join(lines))
 
+    def test_redraw_publishes_redraw_frame(self):
+        tr, _, ctx = self._ctx()
+        n0 = len(tr.published)
+        do_detach, lines = pcm._run_magic("redraw", ctx)
+        self.assertFalse(do_detach)
+        self.assertTrue(any("重绘" in x for x in lines))
+        # configure(redraw=True) 只发 set 控制帧，不向 shell 写命令
+        self.assertTrue(any(
+            pub[1].get("set", {}).get("redraw") is True
+            for pub in tr.published[n0:]))
+
+    def test_redraw_aliases(self):
+        for word in ("redraw", "refresh", "rd"):
+            _, _, ctx = self._ctx()
+            do_detach, lines = pcm._run_magic(word, ctx)
+            self.assertFalse(do_detach, word)
+            self.assertTrue(lines, word)
+
 
 # ============================ 2. 模板静态检查（全平台） ============================
 
@@ -1431,6 +1449,101 @@ class TerminalWriterTests(unittest.TestCase):
         finally:
             server_http.RPCRequestHandler.log_sink = old
 
+    @staticmethod
+    def _blocked_writer(max_bytes=1 << 20):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _BlockingStream:
+            def write(self, data):
+                entered.set()
+                release.wait(5)  # 模拟控制台读取方冻结
+                return len(data)
+
+            def flush(self):
+                pass
+
+        w = pcm._TerminalWriter(_BlockingStream(), max_bytes=max_bytes,
+                                name="tw-stall")
+        return w, entered, release
+
+    def test_stall_seconds_tracks_blocked_flush(self):
+        w, entered, release = self._blocked_writer()
+        try:
+            w.write(b"hello")
+            self.assertTrue(entered.wait(2), "写线程未开始写")
+            time.sleep(0.15)
+            self.assertGreaterEqual(w.stall_seconds(), 0.1)
+        finally:
+            release.set()
+            w.close(timeout=2)
+        # 积压排空后不再算 stall
+        self.assertEqual(w.stall_seconds(), 0.0)
+
+    def test_abandon_pending_drains_queue_and_thread_exits(self):
+        w, entered, release = self._blocked_writer()
+        try:
+            w.write(b"first-block")
+            self.assertTrue(entered.wait(2))
+            for _ in range(5):
+                w.write(b"queued" * 4)  # 排在阻塞块之后
+            w.abandon_pending()
+            release.set()
+            self.assertTrue(w._thread.join(2) is None
+                            and not w._thread.is_alive(),
+                            "abandon 后写线程应在解除阻塞时退出")
+            # 剩余积压全部丢弃且记账归零（不是 dropped 计数路径）
+            self.assertEqual(w._queued_bytes, 0)
+        finally:
+            release.set()
+            w.close(timeout=2)
+
+    def test_writer_diag_reports_live_state(self):
+        stream = io.BytesIO()
+        w = pcm._TerminalWriter(stream, name="tw-diag")
+        saved = pcm._OUT_WRITER
+        pcm._OUT_WRITER = w
+        try:
+            d = pcm.writer_diag()
+            self.assertIn("out", d)
+            self.assertIn("err", d)
+            self.assertEqual(d["out"]["queued_bytes"], 0)
+            self.assertEqual(d["out"]["stall_seconds"], 0.0)
+            self.assertIn("abandon", d["out"])
+        finally:
+            pcm._OUT_WRITER = saved
+            w.close(timeout=2)
+
+    def test_reset_out_writer_swaps_instance(self):
+        stream = io.BytesIO()
+        old_w = pcm._TerminalWriter(stream, name="tw-reset-old")
+        saved = pcm._OUT_WRITER
+        pcm._OUT_WRITER = old_w
+        new_w = None
+        try:
+            res = pcm.reset_out_writer()
+            self.assertTrue(res["ok"])
+            new_w = pcm._OUT_WRITER
+            self.assertIsNot(new_w, old_w)
+            self.assertTrue(old_w._abandon)
+            self.assertTrue(old_w._thread.join(2) is None
+                            and not old_w._thread.is_alive(),
+                            "旧 writer 应排空退出")
+        finally:
+            pcm._OUT_WRITER = saved
+            if new_w is not None:
+                new_w.close(timeout=2)
+
+    def test_reset_out_writer_without_session(self):
+        saved = pcm._OUT_WRITER
+        pcm._OUT_WRITER = None
+        try:
+            res = pcm.reset_out_writer()
+            self.assertFalse(res["ok"])
+            self.assertIn("writer", res["error"])
+        finally:
+            pcm._OUT_WRITER = saved
+
 
 class LogRingSubscribeTests(unittest.TestCase):
     """_LogRing.subscribe：快照 + 增量不重不漏、退订即停、坏监听不反噬。"""
@@ -1569,11 +1682,16 @@ class _FakeWebSocket:
         self.closed = False
         self._stop = threading.Event()
         self._send_gate = None  # 可选：第一次 lines 发送前阻塞（测积压丢行）
+        self._send_blocked = None  # 已进入 lines 阻塞的通知事件
 
     def block_first_lines_until_released(self):
+        """返回 (放行闸门, 已阻塞事件)：调用方等 blocked 即可确认 writer
+        已堵在第一次 lines 发送上，无需靠固定 sleep 猜时序。"""
         ev = threading.Event()
+        blocked = threading.Event()
         self._send_gate = ev
-        return ev
+        self._send_blocked = blocked
+        return ev, blocked
 
     def release_stop(self):
         self._stop.set()
@@ -1586,6 +1704,8 @@ class _FakeWebSocket:
             except ValueError:
                 return
             if msg.get("type") == "lines":
+                if self._send_blocked is not None:
+                    self._send_blocked.set()
                 self._send_gate.wait(5)
 
     def receive(self):
@@ -1648,14 +1768,17 @@ class LogHubTests(unittest.TestCase):
         ring = pcm._LogRing(max_chars=10 ** 9, max_lines=10 ** 9)
         hub = pcm.LogHub(ring)
         ws = _FakeWebSocket()
-        gate = ws.block_first_lines_until_released()
+        gate, blocked = ws.block_first_lines_until_released()
         t = threading.Thread(target=hub.serve, args=(ws, None), daemon=True)
         t.start()
-        time.sleep(0.2)  # snapshot 已发出，writer 正堵在第一条 lines 上
+        # 先只喂 1 条：writer 第一次合批必然只抽到这 1 条就堵在 send 上，
+        # 与线程调度快慢完全无关（旧写法靠 sleep 抢这个窗口，高负载必 flaky）
+        ring.write("seed-0\n")
+        self.assertTrue(blocked.wait(3), "writer 未堵在第一次 lines 发送")
+        # writer 已堵：再灌 1100 条，队列容量 1000，恰好丢 100 旧行
         for i in range(pcm._LOG_WS_QUEUE + 100):
             ring.write("burst-%04d\n" % i)
-        time.sleep(0.3)
-        gate.set()  # 放行：首帧应带积压丢弃提示
+        gate.set()  # 放行：恢复后首帧应带积压丢弃提示
         deadline = time.time() + 3
         while time.time() < deadline:
             frames = self._frames(ws)

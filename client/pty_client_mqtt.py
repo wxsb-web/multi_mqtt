@@ -148,6 +148,8 @@ alias_rpc_host     = ('host', 'rpc_host')
 alias_command      = ('command', 'cmd')
 # 本地命令栏查看诊断日志（只读，不碰会话参数）
 alias_log          = ('log', 'logs')
+# 整屏重绘 / 写线程卡滞自愈（不会把命令发给远端 shell，只发控制帧）
+alias_redraw       = ('redraw', 'refresh', 'rd')
 
 # 魔术栏的"脱离"：语义等同退出，exit/quit 直接复用 client_mqtt 的别名表，
 # PTY 语境再补 detach 系列（顺序无所谓，匹配一律用 in）。
@@ -158,13 +160,22 @@ alias_detach = tuple(dict.fromkeys(
 # ============================ 本地终端：输出 ANSI 支持 ============================
 
 def _enable_output_vt() -> bool:
-    """让本地终端能渲染远端 ANSI 输出。POSIX 原生支持；Windows 打开 VT 处理 + UTF-8。"""
+    """让本地终端能渲染远端 ANSI 输出。POSIX 原生支持；Windows 打开 VT 处理 + UTF-8。
+
+    同时在输入句柄上清除 ENABLE_QUICK_EDIT_MODE：QuickEdit 下鼠标误触进入
+    文本选择会冻结该控制台的全部输出写入（py-spy 实证的"窗口假死"）。
+    """
     if sys.platform != "win32":
         return True
     try:
         import ctypes
         k = ctypes.windll.kernel32
         k.SetConsoleOutputCP(65001)
+        # 输入句柄：先清 QuickEdit（0x0040），不等 raw console 建立
+        hi = k.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        imode = ctypes.c_uint32()
+        if k.GetConsoleMode(hi, ctypes.byref(imode)):
+            k.SetConsoleMode(hi, imode.value & ~0x0040)
         h = k.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
         mode = ctypes.c_uint32()
         if not k.GetConsoleMode(h, ctypes.byref(mode)):
@@ -227,6 +238,7 @@ class _WinRawConsole:
     老系统 / 失败时退回 msvcrt.getwch + 按键翻译。"""
 
     ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+    ENABLE_QUICK_EDIT_MODE = 0x0040
 
     def __init__(self):
         import ctypes
@@ -243,6 +255,11 @@ class _WinRawConsole:
             self.old_mode = mode.value
             if self.k.SetConsoleMode(self.h, self.ENABLE_VIRTUAL_TERMINAL_INPUT):
                 self.use_vt = True
+            else:
+                # VT 输入不可用（老系统）：退回普通行输入也必须清掉
+                # QuickEdit——鼠标误触进入选择模式会冻结全部控制台输出。
+                self.k.SetConsoleMode(
+                    self.h, mode.value & ~self.ENABLE_QUICK_EDIT_MODE)
         self.k.SetConsoleOutputCP(65001)
         # 只改输出 CP，不动输入 CP：见 _new_input_transcoder 的说明。
         try:
@@ -426,6 +443,11 @@ class _TerminalWriter:
         self._lock = threading.Lock()
         self.dropped = 0
         self._closed = False
+        # 最近一次 flush 成功的时间：写线程卡在原生 WriteFile 上时它停止前进，
+        # 是"窗口冻结"最直接的可观测信号。
+        self._last_flush_ts = time.monotonic()
+        # 自愈标记：置位后当前块写完即丢弃全部积压并退出，由新 writer 接管
+        self._abandon = False
         self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
         self._thread.start()
 
@@ -456,19 +478,56 @@ class _TerminalWriter:
         self._q.put(self._SENTINEL)
         self._thread.join(timeout)
 
+    def stall_seconds(self) -> float:
+        """有积压未写出时，距上次成功 flush 的秒数；无积压返回 0。"""
+        with self._lock:
+            pending = self._queued_bytes
+        if pending <= 0:
+            return 0.0
+        return max(0.0, time.monotonic() - self._last_flush_ts)
+
+    def abandon_pending(self) -> None:
+        """自愈：当前块写完（或原生阻塞解除）后丢弃全部剩余积压并退出。
+
+        卡在 WriteFile 上的线程任何代码都无法中止；但解除后它只需写完
+        当前一个块就能在这里下线，后续输出交给新 writer，避免旧流解冻后
+        与新流重复拼接。
+        """
+        self._abandon = True
+        # 线程可能空闲阻塞在 get()：放哨兵唤醒它直接退出；
+        # 正卡在 write 上时，哨兵在队尾，会被 _drain_remaining 吞掉。
+        self._q.put(self._SENTINEL)
+
     def _loop(self) -> None:
         while True:
             item = self._q.get()
             if item is self._SENTINEL:
                 return
-            try:
-                self._stream.write(item)
-                self._stream.flush()
-            except Exception:
-                # 写线程不能死：死了队列只涨不刷。终端出错后输出静默丢弃。
-                pass
+            if not self._abandon:
+                try:
+                    self._stream.write(item)
+                    self._stream.flush()
+                    self._last_flush_ts = time.monotonic()
+                except Exception:
+                    # 写线程不能死：死了队列只涨不刷。终端出错后输出静默丢弃。
+                    pass
             with self._lock:
                 self._queued_bytes -= len(item)
+            if self._abandon:
+                self._drain_remaining()
+                return
+
+    def _drain_remaining(self) -> None:
+        """丢弃队列里所有未处理数据块（记账），遇到哨兵也不复活。"""
+        while True:
+            try:
+                it = self._q.get_nowait()
+            except queue.Empty:
+                return
+            if it is self._SENTINEL:
+                continue
+            with self._lock:
+                self._queued_bytes -= len(it)
 
 
 def _terminal_cleanup(sync: bool = False):
@@ -1203,6 +1262,46 @@ def _info(msg):
     _emit_local("[%s] %s\n" % (stime(), msg))
 
 
+# ---- 写线程诊断与自愈（AI 经 RPC 可直接调用） ----
+
+def _writer_state(w):
+    if w is None:
+        return None
+    return {
+        "queued_bytes": w._queued_bytes,
+        "queue_items": w._q.qsize(),
+        "dropped": w.dropped,
+        "stall_seconds": round(w.stall_seconds(), 2),
+        "abandon": w._abandon,
+    }
+
+
+def writer_diag() -> dict:
+    """返回 stdout/stderr 两个写线程的真实状态。
+
+    RPC 持久命名空间是启动时快照，直接查 ``_OUT_WRITER`` 会得到 None
+    （它在快照之后的 run_session 里创建）；本函数运行时动态读模块全局，
+    一条 RPC 即可看清卡滞现场：``r=writer_diag()``。
+    """
+    return {"out": _writer_state(_OUT_WRITER), "err": _writer_state(_ERR_WRITER)}
+
+
+def reset_out_writer() -> dict:
+    """stdout 写线程卡死时自愈：旧 writer 写完当前块即丢弃积压退出，
+    新建 writer 接管后续输出。调用方随后应发 redraw 让远端整屏重绘。"""
+    global _OUT_WRITER
+    old = _OUT_WRITER
+    if old is None:
+        return {"ok": False, "error": "无 stdout writer（会话未建立？）"}
+    stall = old.stall_seconds()
+    old.abandon_pending()
+    term_out = _bin_stdout()
+    if term_out is None:
+        return {"ok": False, "error": "终端输出流不可用"}
+    _OUT_WRITER = _TerminalWriter(term_out, name="pty-out")
+    return {"ok": True, "stall_seconds": round(stall, 2)}
+
+
 # ============================ AI 桥：外部进程复用本常驻 PTY ============================
 
 # CSI / SGR / OSC / 单字符转义，用于把 AI 收回的终端字节还原成纯文本
@@ -1268,6 +1367,9 @@ class AIBridge:
             "brokers_online": online,
             "brokers_total": total,
             "brokers": hosts,
+            # 终端写线程卡滞秒数（窗口冻结的直接信号）；>2 建议 redraw
+            "writer_stall": round(_OUT_WRITER.stall_seconds(), 2)
+            if _OUT_WRITER is not None else 0.0,
         }
 
     def send(self, data) -> dict:
@@ -1449,6 +1551,8 @@ def _magic_help_lines():
     lines.append("  %s [n]   查看最近本地日志（不写终端，默认 20 行，上限 100；"
                  "更多走 HTTP RPC r=get_log(n)）"
                  % _alias_usage(alias_log))
+    lines.append("  %s   写线程卡顿时切换写线程，并通知远端整屏重绘"
+                 % _alias_usage(alias_redraw))
     for canon, aliases, _remote, _bounds, desc in _PTY_MAGIC_SPECS:
         lines.append("  %s <秒>   %s"
                      % (_alias_usage((canon,) + aliases[1:]), desc))
@@ -1486,6 +1590,9 @@ def _run_magic(line, ctx):
             "ttl        = %s 秒" % live.get("ttl"),
             "dead       = %s 秒（0=不检测）" % live.get("dead_timeout"),
             "丢弃影子帧 = %d" % getattr(pty, "foreign_frames", 0),
+            "写线程卡滞 = %s 秒（>2 可执行 redraw）"
+            % (round(_OUT_WRITER.stall_seconds(), 1)
+               if _OUT_WRITER is not None else 0.0),
             "结束原因   = %s" % getattr(pty, "end_reason", None),
         ]
         return False, lines
@@ -1505,6 +1612,22 @@ def _run_magic(line, ctx):
                   "更多走 HTTP RPC：r=get_log(n)）："
                   % (len(body) if text else 0, len(_LOCAL_LOG)))
         return False, [header] + body
+    if cmd in alias_redraw:
+        lines = []
+        # 写线程真卡滞（>2s）时先切换 writer，避免解冻后旧流与重绘流拼接
+        if _OUT_WRITER is not None and _OUT_WRITER.stall_seconds() > 2.0:
+            res = reset_out_writer()
+            if res.get("ok"):
+                lines.append("检测到终端写卡滞 %.1fs，已切换写线程"
+                             % res["stall_seconds"])
+            else:
+                lines.append("切换写线程失败: %s" % res.get("error"))
+        try:
+            pty.configure(redraw=True)  # killpg(SIGWINCH)：tmux/vim 整屏重绘
+            lines.append("已通知远端整屏重绘")
+        except RemoteError as exc:
+            return False, ["redraw 失败: %s" % exc]
+        return False, lines
     for canon, aliases, remote_key, (lo, hi), _desc in _PTY_MAGIC_SPECS:
         if cmd not in aliases:
             continue
@@ -1891,6 +2014,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
 
     # 主线程：远端输出原样渲染；任何退出路径都走 _hard_exit 立即收场
     held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
+    last_stall_warn = [0.0]  # 卡滞告警节流（每 30s 一条）
     try:
         while not stop_ev.is_set():
             try:
@@ -1902,6 +2026,16 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                 _out_write(bytes(held))
                 held.clear()
             if chunk is None:
+                # 写线程卡滞：屏幕虽冻结但日志 ring 照写，浏览器日志台 / AI
+                # 经 r=writer_diag() 可见，并给出处置路径
+                _stall = (_OUT_WRITER.stall_seconds()
+                          if _OUT_WRITER is not None else 0.0)
+                if _stall > 10 and (time.monotonic() - last_stall_warn[0]) > 30:
+                    last_stall_warn[0] = time.monotonic()
+                    _emit_local(
+                        "[pty][WARN] 终端写卡滞 %.0fs：若窗口处于选择/"
+                        "标记模式请按 ESC 解除，或命令栏执行 redraw "
+                        "切换写线程\n" % _stall)
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,
