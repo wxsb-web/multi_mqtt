@@ -161,21 +161,33 @@ class MqttTransport(Transport):
             net.set_on_message(chained)
             net._cmq_stream_installed = True
         self.node._subscribe_once(topic)
-        self._stream_handlers.setdefault(topic, []).append(handler)
+        # 需要 per-broker 到达统计的处理器可声明 handler(data, broker)；
+        # 订阅时用签名嗅探记录参数个数，分发时按声明调用（兼容单参处理器）。
+        try:
+            import inspect as _inspect
+            _n = len(_inspect.signature(handler).parameters)
+        except (TypeError, ValueError):
+            _n = 1
+        self._stream_handlers.setdefault(topic, []).append((handler, _n >= 2))
 
     def stream_unsubscribe(self, topic, handler):
         lst = self._stream_handlers.get(topic)
-        if lst and handler in lst:
-            lst.remove(handler)
+        if lst:
+            for _i, (_h, _) in enumerate(lst):
+                if _h is handler:
+                    lst.pop(_i)
+                    break
 
     def _dispatch_stream(self, topic, data, broker):
-        # "stream" 帧：周期汇报；"pty" 帧：PTY 下行输出。两类共用分发链。
+        # "stream" 帧：周期汇报；"pty" 帧：PTY 下行输出；"s5" 帧：SOCKS5
+        # 下行输出。三类共用分发链，按 topic 分发到各自会话的处理器。
         if not isinstance(data, dict) or \
-                ("stream" not in data and "pty" not in data):
+                ("stream" not in data and "pty" not in data
+                 and "s5" not in data):
             return
-        for h in list(self._stream_handlers.get(topic, [])):
+        for h, with_broker in list(self._stream_handlers.get(topic, [])):
             try:
-                h(data)
+                h(data, broker) if with_broker else h(data)
             except Exception:
                 logger.exception("stream handler error topic=%s", topic)
 
