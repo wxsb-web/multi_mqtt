@@ -435,6 +435,18 @@ def _cmq_socks5_start():
                 except Exception:
                     pass
 
+        def _wake_writer(_c):
+            # 读侧结束（目标拒连/EOF）后唤醒 writer：否则只读长连接
+            # （WebSocket/SSE，客户端永不发 close）的 writer 会永久阻塞在
+            # wq.get()，_conns 条目也永不摘除——每条此类连接泄漏一个线程
+            # + 一个字典条目。writer 会先排空 wq 残余数据再 SHUT_WR 退出。
+            if _c.get("w_done"):
+                return
+            try:
+                _c["wq"].put_nowait(None)
+            except Exception:
+                pass
+
         def _gc(_cid, _c):
             # 读/写两侧都结束后才真正关 socket 并摘除连接：
             # 半关语义（客户端 close → 只对目标 SHUT_WR，目标响应继续回传）
@@ -524,6 +536,9 @@ def _cmq_socks5_start():
                     _cache_put(_c, _fr1)
                     _pub(_fr1)
                 _c["r_done"] = True
+                # sock 根本没建出来：必须唤醒 writer，否则它阻塞在 wq.get()
+                # 上永不退出，_conns 条目也永不摘除（线程+条目双泄漏）。
+                _wake_writer(_c)
                 _gc(_cid, _c)
                 return
             _c["sock"] = _s
@@ -558,6 +573,9 @@ def _cmq_socks5_start():
                     _pub(_fr)  # closed 控制帧全 broker
                 except Exception:
                     pass
+                # 客户端若是只读不写的长连接（WS/SSE）可能永不发 close，
+                # 不唤醒 writer 它就一直挂在 wq.get() 上直到会话结束。
+                _wake_writer(_c)
             _gc(_cid, _c)
 
         def _deliver(_cid, _fr):
