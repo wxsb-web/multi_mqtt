@@ -2210,10 +2210,11 @@ def main(argv=None) -> int:
         private_key=args.key, allow_no_pub=args.allow)
     online, total, hosts = _broker_status(transport)
     _info("MQTT 就绪：在线 broker %d/%d，建连耗时 %.1f 秒"
-          % (online, total, time.monotonic() - t_conn))
-    if hosts:
-        _info("在线节点：" + ", ".join(hosts))
-    elif total:
+          % (online, total, time.monotonic() - t_conn)+ ", ".join(hosts))
+    # if hosts:
+        # _info("在线节点：" + ", ".join(hosts))
+    # el
+    if not hosts and total:
         _emit_local("[WARN] 当前没有任何 broker 在线，握手大概率超时\n")
         
     if args.port:
