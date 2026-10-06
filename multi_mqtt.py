@@ -867,10 +867,11 @@ class MultiMQTTManager:
         # ---- [网络恢复看门狗] ----
         # 背景：手机进入 Doze（尤其华为等 ROM 的 light-idle）后全部 socket 被
         # 切断，paho 指数退避很快顶到 max_reconnect_delay（默认 3600s）；网络
-        # 恢复后旧网络线程仍在最长 1 小时的 sleep 中，且 Doze 冻结期会把睡眠
-        # 整体顺延，导致所有 broker 红灯数小时。看门狗周期性裸 TCP 探测，一旦
-        # 网络可达而 paho 仍掉线，就干净地重建该 client（旧线程的 sleep 无法
-        # 被外部唤醒，只能 terminate 后重建）。
+        # 恢复后旧网络线程仍在最长 1 小时的 sleep 中，导致所有 broker 红灯数
+        # 小时。看门狗只在【全部节点都掉线】时介入：周期裸 TCP 探测，网络一
+        # 恢复就重建所有卡在长退避睡眠里的 client。只要还有任一节点在线，单个
+        # 坏节点（TCP 通但 MQTT 不可用）一律不碰，交还 paho 常规退避，避免对
+        # 坏节点产生周期性重连与日志刷屏。
         self.recovery_enabled = recovery_enabled
         self.recovery_interval = recovery_interval
         self.recovery_probe_timeout = recovery_probe_timeout
@@ -1118,66 +1119,95 @@ class MultiMQTTManager:
         return True
 
     def _recovery_loop(self):
-        """网络恢复看门狗主循环。
+        """网络恢复看门狗主循环（仅在“全集群掉线”时介入）。
 
-        周期性扫描掉线 client：先用裸 TCP 探测确认网络与对端确实可达，再重建
-        卡在 paho 长退避睡眠里的 client。探测失败说明网络仍断，什么都不做
-        （此时重建只会产生新的失败并推高退避）。
+        核心策略（真机结论）：
+        - 集群里**只要还有任意一个 broker 在线**，个别掉线节点（典型：TCP
+          能连但 MQTT 服务不可用的坏节点）一律交给 paho 自身的指数退避
+          （封顶 max_reconnect_delay），看门狗**绝不**强制重建——否则会对
+          这种坏节点产生周期性重连与日志刷屏，也没有任何收益。
+        - 只有**全部节点都掉线**（整机断网 / Doze 冻结后 socket 全断）时，
+          才判定为全局网络事件：裸 TCP 并行探活，一旦有 broker 可达即认为
+          网络恢复，一次性重建所有“可达但仍掉线”的 client，绕开它们陷在
+          paho 长退避睡眠里的旧网络线程。一个都不可达则安静等待下一轮。
         """
         ev = self._stop_event
-        # 启动宽限期：让首轮正常连接完成，避免把"还没连上"误判成"卡死"
+        # 启动宽限期：让首轮正常连接完成，避免把"还没连上"误判成"全灭"
         if ev.wait(self.recovery_start_grace):
             return
         while not ev.is_set():
             try:
                 with self.lock:
                     snapshot = dict(self.clients)
-                dead_hosts = []
-                for host, client in snapshot.items():
-                    try:
-                        if not client.is_connected():
+                if snapshot:
+                    online, dead_hosts = 0, []
+                    for host, client in snapshot.items():
+                        try:
+                            if client.is_connected():
+                                online += 1
+                            else:
+                                dead_hosts.append(host)
+                        except Exception:
                             dead_hosts.append(host)
-                    except Exception:
-                        dead_hosts.append(host)
-                if dead_hosts:
-                    host_port = self._host_port_map()
-                    now = time.time()
-                    due = [
-                        h for h in dead_hosts
-                        if now - self._recovery_last_force.get(h, 0.0) >= self.recovery_force_gap
-                    ]
-                    if due:
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=min(8, len(due))
-                        ) as pool:
-                            reachable = dict(zip(
-                                due,
-                                pool.map(
-                                    lambda h: self._probe_reachable(h, host_port.get(h, 1883)),
-                                    due,
-                                ),
-                            ))
-                        for host, ok in reachable.items():
-                            if not ok or ev.is_set():
-                                continue
-                            # 重建前再次确认仍未连接（paho 可能恰好在此刻自愈了）
-                            with self.lock:
-                                current = self.clients.get(host)
-                            still_dead = True
-                            try:
-                                still_dead = current is None or not current.is_connected()
-                            except Exception:
-                                pass
-                            if not still_dead:
-                                continue
-                            self._recovery_last_force[host] = time.time()
-                            try:
-                                self._recover_client(host)
-                            except Exception:
-                                logger.exception("恢复重建 client 失败 [%s]", host)
+                    if online == 0 and dead_hosts:
+                        self._global_recovery_scan(dead_hosts)
             except Exception:
                 logger.exception("网络恢复看门狗一轮扫描异常")
             ev.wait(self.recovery_interval)
+
+    def _global_recovery_scan(self, dead_hosts):
+        """全集群掉线时的快速恢复扫描。
+
+        只在所有节点都不在线时调用：TCP 探活确认网络是否回来，回来就一次性
+        重建所有可达节点；网络仍断则完全静默（不重建、不刷日志）。
+        """
+        ev = self._stop_event
+        now = time.time()
+        due = [
+            h for h in dead_hosts
+            if now - self._recovery_last_force.get(h, 0.0) >= self.recovery_force_gap
+        ]
+        if not due:
+            return
+        host_port = self._host_port_map()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(due))
+        ) as pool:
+            reachable = dict(zip(
+                due,
+                pool.map(
+                    lambda h: self._probe_reachable(h, host_port.get(h, 1883)),
+                    due,
+                ),
+            ))
+        good = [h for h, ok in reachable.items() if ok]
+        if not good:
+            # 全部 broker 都不可达 = 网络仍未恢复，安静等待，绝不重建
+            return
+        built = 0
+        for host in good:
+            if ev.is_set():
+                break
+            # 重建前再次确认仍未连接（paho 可能恰好在此刻自愈了）
+            with self.lock:
+                current = self.clients.get(host)
+            try:
+                if current is not None and current.is_connected():
+                    continue
+            except Exception:
+                pass
+            self._recovery_last_force[host] = time.time()
+            try:
+                if self._recover_client(host):
+                    built += 1
+            except Exception:
+                logger.exception("恢复重建 client 失败 [%s]", host)
+        if built:
+            logger.warning(
+                "🌐 [全局恢复] 检测到全部 %d 个 broker 掉线后网络恢复，"
+                "已快速重建 %d 个可达节点（其余单点掉线仍走 paho 常规退避）",
+                len(dead_hosts), built,
+            )
 
 
     def wait_connected(self, min_count=1, timeout=10.0, poll_interval=0.05):
