@@ -37,6 +37,8 @@ class MQTTServer:
         brokers=BROKER_LIST,
         request_topic=REQUEST_TOPIC,
         reply_topic=DEFAULT_REPLY_TOPIC,
+        keepalive=None,
+        max_reconnect_delay=None,
     ):
         # 实例化网络层管理器（enable_crypto 默认为 False）
         self.request_topic = request_topic
@@ -44,11 +46,17 @@ class MQTTServer:
 
         # 公钥解析统一由 MultiMQTTManager 内部完成（含 OpenSSH -> PEM 转换）。
         # 这里只把原始输入透传进去，不再重复解析，避免结果不一致。
+        net_kwargs = {}
+        if keepalive is not None:
+            net_kwargs["keepalive"] = keepalive
+        if max_reconnect_delay is not None:
+            net_kwargs["max_reconnect_delay"] = max_reconnect_delay
         self.mqtt_net = MultiMQTTManager(
             brokers=brokers,
             log_messages=False,  # 每个 broker 不打印原始消息
             server_public_key_bytes=server_public_key_bytes,
             enable_stats=True,
+            **net_kwargs,
         )
         
         self.mqtt_net.set_on_message(self.handle_message)
@@ -255,6 +263,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="mqtt http rpc")
     parser.add_argument("--port", "-port", "-p", type=int, default=1177)
     parser.add_argument("--host", "-host", default="0.0.0.0")
+    parser.add_argument("--request_topic", "--topic", "-t", default=REQUEST_TOPIC) # 这里不使用 alias_request_topic 是不想引入client依赖
 
     _PUB = b"ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBER9c5vu215n+5gv1YjGdm78Nf99wpfqw1fIT8nXib2FLUglq4NBMe7hLp2VOkqv9z00m5Wn+uUADH4zyXLiWzI="
     # _PUB = b''
@@ -265,7 +274,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.pub = _PUB if args.pub is None else " ".join(args.pub).encode("utf-8")
 
-    gms = MQTTServer(globals=globals(),server_public_key_bytes=args.pub,)# 为什么放到 ghs后面定义 dir找不到变量？
+    gms = MQTTServer(
+        globals=globals(),
+        server_public_key_bytes=args.pub,
+        request_topic=args.request_topic,
+    )# 为什么放到 ghs后面定义 dir找不到变量？
     gms.mqtt_net.is_windows_cmd=(sys.platform=="win32")
     import server_http
     ghs = server_http.start_rpc_server(
