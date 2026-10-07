@@ -15,8 +15,9 @@
      - 连续多次失败连接不得堆积线程/条目；
      - stop 帧触发会话结束并广播 end。
 
-运行：
-    cd multi_mqtt && python -m unittest tests.test_socks5_mqtt -v
+运行（本目录不带 __init__.py，默认 discover -s tests 不会扫到）：
+    python -m unittest discover -s tests/socks5 -v
+    python tests/socks5/test_socks5_mqtt.py
 """
 import json
 import os
@@ -26,7 +27,8 @@ import threading
 import time
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
 
 from rpc_executor import PythonExecutor  # noqa: E402
 from client import socks5_client_mqtt as scm  # noqa: E402
