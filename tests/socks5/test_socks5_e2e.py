@@ -613,8 +613,7 @@ class ClientSessionFixTests(unittest.TestCase):
         a, b = socket.socketpair()
         self.addCleanup(lambda: (a.close(), b.close()))
         conn.local_sock = a
-        conn.local_read_done.set()  # 模拟本地读线程已退出
-        conn.reader_done.set()
+        conn.reader_done.set()      # 模拟本地读线程已退出
         wt = threading.Thread(target=self.srv._local_writer,
                               args=(cid, a), daemon=True)
         wt.start()
@@ -672,8 +671,7 @@ class ClientSessionFixTests(unittest.TestCase):
 
         # 收尾走 clean EOF
         conn.reassembly.add(m + 1, {"seq": m + 1, "closed": True})
-        conn.local_read_done.set()
-        conn.reader_done.set()
+        conn.reader_done.set()      # 模拟本地读线程已退出
         self.assertTrue(wt.join(timeout=5.0) is None and not wt.is_alive())
         self.assertEqual(_recv_n(b, 8, timeout=3.0), b"")
         self.assertTrue(_wait_thread_gone("s5-fin-%d" % cid, timeout=3.0),
@@ -925,7 +923,7 @@ class Round3FixTests(ClientSessionFixTests):
         time.sleep(0.1)
         self.assertEqual(len(tr.published), n_pub)
         # 循环线程全部退出
-        for nm in ("s5-sweep", "s5-pb", "s5-bulk"):
+        for nm in ("s5-sweep", "s5-pb", "s5-bulk", "s5-rsnd"):
             self.assertTrue(_wait_thread_gone(nm, timeout=3.0),
                             "%s 线程未退出" % nm)
         # 幂等：tearDown 还会再 close 一次
@@ -1011,6 +1009,151 @@ class Round3FixTests(ClientSessionFixTests):
         sess.close()
         self.assertTrue(_wait_thread_gone("s5-fin-%d" % cid, timeout=2.0),
                         "abort 后 fin 线程仍挂着 fd")
+
+    # ---- T21：NACK 补发绝不在 paho 回调线程里被 bulk 反压 ----
+
+    def test_t21_nack_resend_never_blocks_callback_thread(self):
+        sess = self.sess
+        cid = sess.open_connection("127.0.0.1", 8)
+        conn = self._conn(cid)
+        # 三笔大帧"已发缓存"（NACK 补发的数据源）
+        for s in (5, 6, 7):
+            conn.ucache[s] = {"s5": sess.sid, "cid": cid, "seq": s,
+                              "d": "X" * 3000}
+        gate = threading.Event()
+        calls = []
+        orig_enq = sess._bulk_enqueue
+
+        def block_enq(fr, _calls=calls):
+            _calls.append(fr.get("seq"))
+            gate.wait(5.0)
+
+        sess._bulk_enqueue = block_enq
+        try:
+            def cb(seqs):
+                sess._on_frame({"s5": sess.sid, "cid": cid, "nack": seqs},
+                               broker="fakebroker")
+
+            # 补发在 worker 里被 gate 钉死：回调线程必须秒回
+            t1 = threading.Thread(target=cb, args=([5],), daemon=True)
+            t1.start()
+            self.assertTrue(t1.join(1.0) is None and not t1.is_alive(),
+                            "NACK 补发把回调线程阻塞在 bulk 队列上")
+            self.assertTrue(_wait_for(
+                lambda: calls == [5] and sess._resend_q.empty(), 2.0),
+                "补发未进入专用 worker: %r" % calls)
+
+            # worker 钉死期间再多两轮 NACK：回调同样立即返回，待办排队
+            t2 = threading.Thread(target=cb, args=([6, 7],), daemon=True)
+            t2.start()
+            self.assertTrue(t2.join(1.0) is None and not t2.is_alive())
+            self.assertEqual(sess._resend_q.qsize(), 1)  # 单 worker 串行
+
+            gate.set()
+            self.assertTrue(_wait_for(lambda: calls == [5, 6, 7], 3.0),
+                            "worker 未串行补完全部待办: %r" % calls)
+        finally:
+            gate.set()
+            sess._bulk_enqueue = orig_enq
+
+    # ---- T22：drop 先弹条目、应用后关闭：fin 不得白等 120s ----
+
+    def test_t22_reader_done_after_pop_closes_fin_promptly(self):
+        sess = self.sess
+        cid = sess.open_connection("127.0.0.1", 9)
+        conn = self._conn(cid)
+        a, b = socket.socketpair()
+        self.addCleanup(lambda: (a.close(), b.close()))
+        conn.local_sock = a
+        # 真实读线程：立刻阻塞在 recv（应用拖着写端）
+        rt = threading.Thread(target=self.srv._local_reader,
+                              args=(cid, a), daemon=True)
+        rt.start()
+        wt = threading.Thread(target=self.srv._local_writer,
+                              args=(cid, a), daemon=True)
+        wt.start()
+        try:
+            conn.reassembly.add(0, {"seq": 0, "opened": {"ok": True}})
+            conn.reassembly.add(1, {"seq": 1, "closed": True})
+            # writer clean EOF：立即弹条目回收会话，fin 开始等 reader
+            self.assertTrue(wt.join(timeout=3.0) is None and not wt.is_alive())
+            self.assertIsNone(self._conn(cid), "clean EOF 未立即回收会话条目")
+            self.assertFalse(conn.reader_done.is_set(),
+                             "reader 尚未退出，信号不应提前置位")
+
+            # 应用此刻才关闭（最常见的慢半拍时序）：旧代码 reader finally
+            # 查字典为 None，reader_done 永不置位，fin 白等 120s
+            b.close()
+            self.assertTrue(_wait_for(conn.reader_done.is_set, 2.0),
+                            "条目弹出后 reader 退出信号丢失")
+            self.assertTrue(rt.join(timeout=2.0) is None and not rt.is_alive(),
+                            "读线程未退出")
+            self.assertTrue(_wait_thread_gone("s5-fin-%d" % cid, timeout=2.0),
+                            "fin 未在 reader 退出后立即关 fd（退化为 120s）")
+        finally:
+            b.close()
+
+    # ---- T23：abort 用 shutdown 叫醒仍阻塞在 recv 的 reader ----
+
+    def test_t23_abort_shutdown_unblocks_reader(self):
+        sess = self.sess
+        cid = sess.open_connection("127.0.0.1", 10)
+        conn = self._conn(cid)
+        a, b = socket.socketpair()
+        self.addCleanup(lambda: (a.close(), b.close()))
+        conn.local_sock = a
+        rt = threading.Thread(target=self.srv._local_reader,
+                              args=(cid, a), daemon=True)
+        rt.start()
+        wt = threading.Thread(target=self.srv._local_writer,
+                              args=(cid, a), daemon=True)
+        wt.start()
+        conn.reassembly.add(0, {"seq": 0, "opened": {"ok": True}})
+        conn.reassembly.add(1, {"seq": 1, "closed": True})
+        self.assertTrue(wt.join(timeout=3.0) is None and not wt.is_alive())
+        self.assertTrue(any(t.name == "s5-fin-%d" % cid and t.is_alive()
+                            for t in threading.enumerate()))
+        # 应用始终不关闭：会话 abort。Windows 上 close() 叫不醒别线程的
+        # 阻塞 recv，fin 必须先 shutdown(SHUT_RDWR)，fd 与线程才能全退
+        sess.close()
+        self.assertTrue(rt.join(timeout=2.0) is None and not rt.is_alive(),
+                        "abort 后读线程仍阻塞在 recv（fd 泄漏）")
+        self.assertTrue(_wait_thread_gone("s5-fin-%d" % cid, timeout=2.0))
+
+    # ---- T24：bulk 建连任何阶段失败都保留现有连接 ----
+
+    def test_t24_bnet_build_failure_keeps_existing(self):
+        sess = self.sess
+        self.assertTrue(_wait_for(lambda: sess._bnet is not None, 3.0))
+        old = sess._bnet
+        saved_cls = scm.MultiMQTTManager
+        try:
+            # 阶段 1：构造即抛——现有 _bnet 原样不动
+            def boom(*a, **k):
+                raise RuntimeError("construct boom")
+
+            scm.MultiMQTTManager = boom
+            sess._ensure_bnet([scm._PB_SEED[0]])
+            self.assertIs(sess._bnet, old, "建连失败误摘了现有连接")
+            self.assertFalse(old.stop_ev.is_set(), "现有连接被误停")
+            self.assertTrue(any("建立失败" in m for m in self.logs))
+
+            # 阶段 2：start() 抛——半成品必须被 stop，现有连接仍保留
+            class FailStart(FakeClientMgr):
+                def start(self):
+                    raise RuntimeError("start boom")
+
+            scm.MultiMQTTManager = FailStart
+            before = len(FakeClientMgr.constructed)
+            sess._ensure_bnet([scm._PB_SEED[1]])
+            self.assertIs(sess._bnet, old)
+            self.assertFalse(old.stop_ev.is_set())
+            dead = FakeClientMgr.constructed[-1]
+            self.assertTrue(dead.stop_ev.is_set(),
+                            "start 失败的半成品管理器未被 stop")
+            self.assertEqual(len(FakeClientMgr.constructed), before + 1)
+        finally:
+            scm.MultiMQTTManager = saved_cls
 
 
 if __name__ == "__main__":
