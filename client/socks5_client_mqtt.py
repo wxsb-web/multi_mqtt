@@ -144,10 +144,16 @@ _PACE_START = 0.08        # 会话起跑节奏（≈200KB/s）：宁可慢，不
 _PACE_MAX = 0.5           # 最严节奏上限（2 帧/s≈32KB/s，仅惩罚期短暂进入）
 _WQ_MAX = 256             # per-conn 写队列帧数上限（≈256×16KiB=4MiB 背压红线）
 _INGRESS_MAX = 128        # per-cid 重组暂存帧数上限（防 closed 连接迟到帧堆积）
-# NACK 补发待办队列上限：元素只是 ucache 里既有帧的引用，不拷贝载荷；
-# 超量（NACK 风暴/补发长期被 bulk 队列反压）直接拒收新待办并留痕，补发
+# NACK 补发待办队列硬上限：元素只是 ucache 里既有帧的引用，不拷贝载荷；
+# 满量（NACK 风暴/补发长期被 bulk 队列反压）直接拒收新待办并留痕，补发
 # 由服务端下一轮 NACK（指数退避）重新驱动，不在回调线程堆积内存。
 _RESEND_Q_MAX = 512
+# NACK 大帧补发去重表的淘汰线：超过此条目数才做一轮清扫（避免每帧扫表），
+# 清扫只删超过 TTL 的键。去重窗口才 2s，30s 前的键绝无再用价值；cid 已
+# 死的键也随年龄一起走，防止 HTTP 短连接海量轮换下表只增不删。
+_RT_LAST_MAX = 4096
+_RT_LAST_TTL = 30.0
+_RT_LAST_PRUNE_INTV = 10.0
 
 
 def _info(msg):
@@ -650,12 +656,34 @@ def _cmq_socks5_start():
                           # 时必须等它，绝不能直接退出（见 _writer）。
                           "sock_ev": _th.Event()}
                     _conns[_cid] = _c
-                _th.Thread(target=_conn_main,
-                           args=(_cid, _c, str(_op.get("host")),
-                                 int(_op.get("port"))),
-                           name="s5-conn-%s" % _cid, daemon=True).start()
-                _th.Thread(target=_writer, args=(_cid, _c),
-                           name="s5-wr-%s" % _cid, daemon=True).start()
+                _t1 = _th.Thread(target=_conn_main,
+                                 args=(_cid, _c, str(_op.get("host")),
+                                       int(_op.get("port"))),
+                                 name="s5-conn-%s" % _cid, daemon=True)
+                _t2 = _th.Thread(target=_writer, args=(_cid, _c),
+                                 name="s5-wr-%s" % _cid, daemon=True)
+                try:
+                    _t1.start()
+                    _t2.start()
+                except (RuntimeError, OSError):
+                    # 系统线程/资源耗尽：_c 已入 _conns，但一个或两个 worker
+                    # 没起来（sock_ev 永不 set、writer 永不消费 wq），不兜
+                    # 会挂到会话结束才被清。按建连失败回 opened+closed；
+                    # conn_main 若已起，closed 标志会让它建连后立即退出并
+                    # 由 _gc 关 sock（opened 重复 seq=0 客户端按副本去重）。
+                    try:
+                        with _c["seq_lock"]:
+                            if _c["out_seq"] == 0:
+                                _fr0 = {"cid": _cid, "seq": 0, "opened": {
+                                    "ok": False,
+                                    "error": "server cannot start worker "
+                                             "thread"}}
+                                _cache_put(_c, _fr0)
+                                _pub(_fr0)
+                                _c["out_seq"] = 1
+                    except Exception:
+                        pass
+                    _close_conn(_cid, "thread_start_failed")
                 return
             with _lock:
                 _c = _conns.get(_cid)
@@ -1202,8 +1230,9 @@ class RemoteSocks5:
         # 单线程消费——补发的大帧要进 _bulk_q（满则按 0.5s 粒度反压，
         # 64 格最坏挡数十秒），在回调线程同步等会卡死该 broker 的整条
         # 下行 FIFO（其它 cid/hb/NACK 全部头阻塞）。
-        self._resend_q = queue.Queue()
+        self._resend_q = queue.Queue(maxsize=_RESEND_Q_MAX)
         self._rt_last = {}                        # NACK 大帧补发去重 (cid,seq)->t
+        self._rt_last_prune = 0.0               # 上次清扫去重表时刻
         self.pace_intv = _PACE_START              # 当前大帧节奏（闭环热调）
         # hb 延迟地板：最近 _HB_FLOOR_WIN 秒内全 broker 样本的最小值。
         # 单调 min 会被一次 NTP 步进/GC stop-the-world/OS 调度抖动钉出的
@@ -1219,11 +1248,15 @@ class RemoteSocks5:
 
     @property
     def hb_floor(self):
-        """最近 _HB_FLOOR_WIN 秒 hb 延迟（ms）的滚动最小值；无样本返回 None。"""
+        """最近 _HB_FLOOR_WIN 秒 hb 延迟（ms）的滚动最小值；窗口内无样本
+        返回 None。deque 的物理淘汰只发生在收到新 hb 时（_track_broker），
+        长断网期间没有新 hb、旧样本会滞留；读取处再按当前 monotonic 过滤
+        一遍，保证"无近期 hb → 地板消失"，不依赖新样本驱动淘汰。"""
+        now = time.monotonic()
         with self._hb_lock:
-            if not self._hb_floor_samples:
-                return None
-            return min(d for _, d in self._hb_floor_samples)
+            live = [d for t, d in self._hb_floor_samples
+                    if now - t <= _HB_FLOOR_WIN]
+            return min(live) if live else None
 
     # ---- 握手 ----
 
@@ -1336,6 +1369,12 @@ class RemoteSocks5:
         服务端按 per-cid seq 重组，乱序只进 pending 不会错放（大帧走 bulk、
         小帧走主连接本就是两条路，到达顺序从来不保证）。
         """
+        # extra 只允许业务键（open/d/close）：s5/cid/seq/owner 是打号与
+        # 身份字段，必须由本函数统一生成，被 extra 覆盖会拼出非法序号/身份
+        # 的帧且静默成功——编程错误，在占号之前直接抛出，不吞序号。
+        bad = [k for k in ("s5", "cid", "seq", "owner") if k in extra]
+        if bad:
+            raise ValueError("_send 的 extra 不得携带保留帧字段 %r" % bad)
         with conn.seq_lock:
             frame = {"s5": self.sid, "cid": conn.cid, "seq": conn.out_seq}
             conn.out_seq += 1
@@ -1391,6 +1430,15 @@ class RemoteSocks5:
                                 % (conn.cid, type(e).__name__, e))
                 except Exception:
                     pass
+            # 低频清扫补发去重表：只在超量后每 10s 扫一次，删 30s 前的键
+            now = time.monotonic()
+            if (len(self._rt_last) > _RT_LAST_MAX
+                    and now - self._rt_last_prune > _RT_LAST_PRUNE_INTV):
+                self._rt_last_prune = now
+                stale = [k for k, t in self._rt_last.items()
+                         if now - t > _RT_LAST_TTL]
+                for k in stale:
+                    self._rt_last.pop(k, None)
 
     def _resend_uplink(self, conn: _ClientConn, seqs) -> None:
         """服务端回 NACK：从上行重传缓存原样补发（seq 不变，服务端去重）。
@@ -1506,12 +1554,13 @@ class RemoteSocks5:
             self._track_broker(broker, data, is_new=False)
             if isinstance(nk, (list, tuple)) and nk:
                 try:
-                    if self._resend_q.qsize() >= _RESEND_Q_MAX:
-                        self.on_log("[cid=%d] NACK 补发待办已满 %d，"
-                                    "丢弃本轮 %d 个待办（等下轮 NACK）"
-                                    % (cid, _RESEND_Q_MAX, len(nk)))
-                    else:
-                        self._resend_q.put_nowait((conn, list(nk)))
+                    # 有界队列 put_nowait：多 broker 回调并发下也是严格硬
+                    # 上限（无 qsize 检查与入队之间的竞态窗口）。
+                    self._resend_q.put_nowait((conn, list(nk)))
+                except queue.Full:
+                    self.on_log("[cid=%d] NACK 补发待办已满 %d，"
+                                "丢弃本轮 %d 个待办（等下轮 NACK）"
+                                % (cid, _RESEND_Q_MAX, len(nk)))
                 except Exception:
                     pass
             return
@@ -1532,6 +1581,12 @@ class RemoteSocks5:
         系统级每 broker 连接质量（在线率/掉线/重连）用内置的
         ``transport.node.mqtt_net.stats.get_report(probe=False)``（别动它，
         probe=True 会发起主动探测产生额外流量）。
+
+        注意：这是**无锁非一致快照，仅供诊断参考**——conns 列表先在锁内
+        拷出，但各 conn 的 reassembly.next/pending/bytes 在交付线程并发
+        推进下逐字段读取，同一 cid 的 down_delivered_next 与 down_waiting
+        可能瞬时对不齐（如 next=5 而 waiting 里还看得到 4），不保证也不
+        需要事务一致性，不要据此刻画正确性判断。
         """
         with self._lock:
             conns = list(self._conns.values())
@@ -2157,6 +2212,19 @@ class _Socks5Server:
         except Exception as exc:
             self.on_log("[s5] 本地连接处理异常: %s: %s"
                         % (type(exc).__name__, exc))
+            # 泵送阶段的非预期异常：reader 自身已对已知错误收尾，这里是最后
+            # 一道保险（防止未来新增逃逸路径让 conn/writer/fd 静默泄漏）。
+            # fin 已接管 socket（clean EOF）时不抢关：reader_done 已置位，
+            # fin 线程会自己立刻 close。
+            if entered_pump and cid is not None:
+                try:
+                    with self.session._lock:
+                        cc = self.session._conns.get(cid)
+                    if cc is not None and not cc.fin_close_pending:
+                        self.session.drop_connection(
+                            cid, reason="handle_fatal")
+                except Exception:
+                    pass
         finally:
             if not entered_pump:
                 if cid is not None:
@@ -2190,6 +2258,15 @@ class _Socks5Server:
                     # 的，收尾归它们，这里只退出
                     return
             sess.drop_connection(cid, reason="local_error")
+        except Exception:
+            # 网络三异常以外的非预期错误（库内部 RuntimeError/MemoryError
+            # 等）：正常路径不会走到。不兜住的话异常只冒泡到 _handle 记一行
+            # 日志，而 entered_pump 后 _handle 不关 csock、writer 永远阻塞
+            # 在 wq.get()——fd、conn 条目、writer 线程全部静默泄漏。
+            try:
+                sess.drop_connection(cid, reason="reader_fatal")
+            except Exception:
+                pass
         finally:
             # 读线程退出 = 应用端已关闭（FIN/RST 已到），fin 可安全 close
             # fd。必须无条件置位：clean EOF 时 drop_connection 已先于应用

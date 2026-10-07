@@ -424,6 +424,51 @@ class ServerTemplateFixTests(unittest.TestCase):
             gate.set()
             tgt.shutdown()
 
+    def test_t26_thread_start_failure_leaves_no_dangling_conn(self):
+        # P2：系统线程耗尽（Thread.start 抛 RuntimeError）时，_c 已入
+        # _conns 但 worker 没起来。必须回 opened(ok=False)+closed 并摘条目，
+        # 不能挂到会话结束；之后到达的数据帧应被静默忽略。
+        self._start()
+        cid = 11
+        orig_thread = threading.Thread
+
+        class FailThread(orig_thread):
+            def start(self):
+                if self.name and self.name.startswith(
+                        ("s5-conn-", "s5-wr-")):
+                    raise RuntimeError("can't start new thread")
+                return orig_thread.start(self)
+
+        # open 经 _inq 由 s5-in 线程异步处理：补丁必须保持到失败回包落地
+        threading.Thread = FailThread
+        try:
+            self._open_cid(cid, 1)
+            self.assertTrue(_wait_for(lambda: any(
+                d.get("seq") == 0 and isinstance(d.get("opened"), dict)
+                and d["opened"].get("ok") is False
+                for d in self._cid_broadcast(cid)), 3.0),
+                "start 失败未回 opened(ok=False)")
+        finally:
+            threading.Thread = orig_thread
+
+        bc = self._cid_broadcast(cid)
+        self.assertTrue(any(d.get("closed") for d in bc),
+                        "start 失败未回 closed 收尾帧: %r" % bc)
+        # 没有任何 worker 线程残留
+        time.sleep(0.2)
+        leftover = [t.name for t in threading.enumerate()
+                    if t.name in ("s5-conn-%d" % cid, "s5-wr-%d" % cid)
+                    and t.is_alive()]
+        self.assertFalse(leftover, "start 失败后仍有 worker 线程: %r"
+                         % leftover)
+        # 条目已摘：后续数据帧不得触发任何回包（计数不再增长）
+        n0 = len(bc)
+        self.net.deliver(self.in_t, {
+            "s5": self.sid, "cid": cid, "seq": 1, "d": "X"})
+        time.sleep(0.2)
+        self.assertEqual(len(self._cid_broadcast(cid)), n0,
+                         "已摘除条目仍在产生回包")
+
 
 # ===================== 第二轮：客户端侧 fakes =====================
 
@@ -1154,6 +1199,118 @@ class Round3FixTests(ClientSessionFixTests):
             self.assertEqual(len(FakeClientMgr.constructed), before + 1)
         finally:
             scm.MultiMQTTManager = saved_cls
+
+    # ---- T25：reader 抛非网络异常必须回收 conn/writer/fd ----
+
+    def test_t25_reader_unexpected_exception_reclaims_everything(self):
+        sess = self.sess
+        cid = sess.open_connection("127.0.0.1", 11)
+        conn = self._conn(cid)
+        a, b = socket.socketpair()
+        self.addCleanup(lambda: (a.close(), b.close()))
+        conn.local_sock = a
+        wt = threading.Thread(target=self.srv._local_writer,
+                              args=(cid, a), daemon=True)
+        wt.start()
+        conn.reassembly.add(0, {"seq": 0, "opened": {"ok": True}})
+        orig_send = sess.send_data
+        sess.send_data = lambda _cid, _data: (_ for _ in ()).throw(
+            RuntimeError("kaboom"))
+        rt = threading.Thread(target=self.srv._local_reader,
+                              args=(cid, a), daemon=True)
+        rt.start()
+        try:
+            b.sendall(b"Z")  # 唤醒 recv → send_data 抛 RuntimeError
+            self.assertTrue(_wait_for(lambda: self._conn(cid) is None, 3.0),
+                            "reader 非预期异常后 conn 条目未摘除（泄漏）")
+            self.assertTrue(wt.join(3.0) is None and not wt.is_alive(),
+                            "writer 未被收尾，永久挂在 wq.get()")
+            self.assertTrue(rt.join(3.0) is None and not rt.is_alive(),
+                            "reader 线程未退出")
+            self.assertTrue(any("reader_fatal" in m for m in self.logs),
+                            self.logs[-3:])
+            self.assertEqual(a.fileno(), -1, "csock 未关闭（fd 泄漏）")
+        finally:
+            sess.send_data = orig_send
+
+    # ---- T27：_rt_last 超量后按年龄清扫，不长生 ----
+
+    def test_t27_rt_last_pruned_by_age_after_threshold(self):
+        sess = self.sess
+        cid = sess.open_connection("127.0.0.1", 12)
+        conn = self._conn(cid)
+        old_t = time.monotonic() - 60.0
+        for i in range(scm._RT_LAST_MAX + 4):
+            sess._rt_last[(100000 + i, 0)] = old_t
+        conn.ucache[3] = {"s5": sess.sid, "cid": cid, "seq": 3,
+                          "d": "Q" * 3000}
+        sess._on_frame({"s5": sess.sid, "cid": cid, "nack": [3]},
+                       broker="fakebroker")
+        # worker 处理这轮补发后触发清扫：4100 个 60s 老键全删，新键保留
+        self.assertTrue(_wait_for(
+            lambda: len(sess._rt_last) == 1, 3.0),
+            "去重表未按年龄清扫: %d" % len(sess._rt_last))
+        self.assertIn((cid, 3), sess._rt_last)
+
+    # ---- T28：NACK 待办队列是严格硬上限 ----
+
+    def test_t28_resend_q_strict_hard_cap(self):
+        sess = self.sess
+        cid = sess.open_connection("127.0.0.1", 13)
+        conn = self._conn(cid)
+        gate = threading.Event()
+        orig = sess._resend_uplink
+        sess._resend_uplink = lambda c, s: gate.wait(5.0)
+        try:
+            # 先投一个让 worker 取走并阻塞，队列腾空后直接灌满到硬上限
+            sess._resend_q.put_nowait((conn, [1]))
+            self.assertTrue(
+                _wait_for(lambda: sess._resend_q.qsize() == 0, 2.0))
+            for _ in range(scm._RESEND_Q_MAX):
+                sess._resend_q.put_nowait((conn, [1]))
+            self.assertEqual(sess._resend_q.qsize(), scm._RESEND_Q_MAX)
+            before = len(self.logs)
+            sess._on_frame({"s5": sess.sid, "cid": cid, "nack": [9]},
+                           broker="fakebroker")
+            self.assertEqual(sess._resend_q.qsize(), scm._RESEND_Q_MAX,
+                             "待办越过硬上限（put_nowait/Full 未生效）")
+            self.assertTrue(any("补发待办已满" in m
+                                for m in self.logs[before:]),
+                            self.logs[before:])
+        finally:
+            gate.set()
+            sess._resend_uplink = orig
+
+    # ---- T29：_send 拒绝保留帧字段，占号前失败 ----
+
+    def test_t29_send_rejects_reserved_frame_keys(self):
+        sess = self.sess
+        cid = sess.open_connection("127.0.0.1", 14)
+        conn = self._conn(cid)
+        n0 = conn.out_seq
+        with self.assertRaises(ValueError):
+            sess._send(conn, {"seq": 999, "d": "x"})
+        with self.assertRaises(ValueError):
+            sess._send(conn, {"s5": "evil"})
+        with self.assertRaises(ValueError):
+            sess._send(conn, {"owner": "evil"})
+        self.assertEqual(conn.out_seq, n0, "拒绝非法字段时不得占用序号")
+        # 合法业务键不受影响
+        sess._send(conn, {"d": "ok"})
+        self.assertEqual(conn.out_seq, n0 + 1)
+
+    # ---- T30：hb_floor 无新 hb 时也按窗口过滤滞留旧样本 ----
+
+    def test_t30_hb_floor_self_filters_without_new_sample(self):
+        sess = self.sess
+        sess._hb_floor_samples.append((time.monotonic() - 61.0, 1))
+        sess._hb_floor_samples.append((time.monotonic() - 5.0, 50))
+        # 不调用 _track_broker（模拟长断网无新 hb）：属性自身过滤
+        self.assertEqual(sess.hb_floor, 50)
+        # 全部老化 → None（_pace_control 据此跳过，不被旧地板误限速）
+        sess._hb_floor_samples.clear()
+        sess._hb_floor_samples.append((time.monotonic() - 200.0, 1))
+        self.assertIsNone(sess.hb_floor)
 
 
 if __name__ == "__main__":
