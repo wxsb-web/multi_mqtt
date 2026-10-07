@@ -71,6 +71,7 @@ qos0 没有 broker 层重传：双向各自缓存最近 256 帧，缺口先 NACK
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import logging
 import os
@@ -125,6 +126,10 @@ alias_rpc_port        = ('rpc_port', 'rpc')
 alias_rpc_host        = ('rpc_host', 'rpc_ip')
 
 _GAP_DEFAULT = 15.0       # per-cid seq 缺口硬熔断秒数（先经 NACK 多轮重传）
+_HB_FLOOR_WIN = 60.0      # hb 延迟地板的滚动窗口秒数（单调 min 会被一次
+                          # NTP/GC/调度抖动永久钉死，pace 余生误判惩罚中）
+_FIN_CLOSE_GRACE = 120.0  # 远端 clean EOF 后等本地应用读完缓冲再 close socket
+                          # 的上限（Windows 防 RST）；会话条目不再被它拖住
 _NACK_FIRST = 0.8         # 缺口出现后多久发首轮重传请求
 _NACK_INTV = 1.2          # 后续重传请求轮询间隔（硬熔断前约 4 轮）
 _CACHE_MAX = 256          # per-conn 重传缓存帧数（≈256×16KiB=4MiB）
@@ -503,6 +508,11 @@ def _cmq_socks5_start():
             _c["closed"] = True
             _c["r_done"] = True
             _c["w_done"] = True
+            # connect 可能仍在进行：释放正等 sock_ev 的 writer，避免它白等
+            try:
+                _c["sock_ev"].set()
+            except Exception:
+                pass
             try:
                 _c["wq"].put_nowait(None)
             except Exception:
@@ -534,7 +544,15 @@ def _cmq_socks5_start():
                         break
                     _s = _c.get("sock")
                     if _s is None:
-                        break
+                        # sock 未就绪：connect 还在进行（慢目标可达 _ctimeout
+                        # 秒）。正常客户端会等 opened 才发数据，但上行 NACK
+                        # 补发/乱序重放可能让数据帧早于建连完成到达此处。
+                        # 直接 break 会让 writer 死亡、之后所有上行字节被
+                        # wq 静默吞掉（连接表面正常，单向断流，极难排查）。
+                        _c["sock_ev"].wait(_ctimeout + 5.0)
+                        _s = _c.get("sock")
+                        if _s is None:
+                            break  # 建连失败：失败路径已 r_done+投 None
                     _s.sendall(_item)
             except Exception:
                 _close_conn(_cid, "write_error")
@@ -569,10 +587,13 @@ def _cmq_socks5_start():
                 _c["r_done"] = True
                 # sock 根本没建出来：必须唤醒 writer，否则它阻塞在 wq.get()
                 # 上永不退出，_conns 条目也永不摘除（线程+条目双泄漏）。
+                _c["sock_ev"].set()
                 _wake_writer(_c)
                 _gc(_cid, _c)
                 return
             _c["sock"] = _s
+            # sock 先落字典再 set：writer 醒来时保证 _c["sock"] 可见。
+            _c["sock_ev"].set()
             with _c["seq_lock"]:
                 _fr0 = {"cid": _cid, "seq": 0, "opened": {"ok": True}}
                 _cache_put(_c, _fr0)
@@ -619,7 +640,11 @@ def _cmq_socks5_start():
                     _c = {"sock": None, "wq": _qe.Queue(_WQ_MAX),
                           "closed": False, "r_done": False, "w_done": False,
                           "seq_lock": _th.Lock(), "out_seq": 0,
-                          "rcache": {}}
+                          "rcache": {},
+                          # connect 结果事件：成功时先放 sock 再 set，失败
+                          # 路径 r_done+唤醒后 set。writer 在 sock 尚未就绪
+                          # 时必须等它，绝不能直接退出（见 _writer）。
+                          "sock_ev": _th.Event()}
                     _conns[_cid] = _c
                 _th.Thread(target=_conn_main,
                            args=(_cid, _c, str(_op.get("host")),
@@ -934,7 +959,8 @@ class _ConnReassembly:
     """
 
     def __init__(self, deliver, on_gap, on_nack, gap=_GAP_DEFAULT,
-                 nack_first=_NACK_FIRST, nack_intv=_NACK_INTV, name=""):
+                 nack_first=_NACK_FIRST, nack_intv=_NACK_INTV, name="",
+                 on_log=None):
         self.next = 0
         self.pending = {}
         self.deadline = None       # 硬熔断时刻
@@ -944,9 +970,12 @@ class _ConnReassembly:
         self.nack_intv = float(nack_intv)
         self.nround = 0           # NACK 轮次（间隔指数退避，封顶 3s）
         self.broken = False
+        self.dropped_full = 0     # pending 堆满被拒收的首到帧（靠 NACK 补）
         self._deliver = deliver
         self._on_gap = on_gap
         self._on_nack = on_nack
+        self._on_log = on_log or (lambda m: None)
+        self._name = str(name)
         self._lock = threading.Lock()
         # 待交付帧 FIFO：唯一写者是各 broker 回调（持 _lock 时入队），
         # 唯一读者是本连接的交付线程。无界：入队候选受 pending<_INGRESS_MAX
@@ -965,22 +994,37 @@ class _ConnReassembly:
                 return
             try:
                 self._deliver(fr)
-            except Exception:
+            except Exception as e:
                 # 单帧异常绝不能打死交付线程，否则后续字节全部滞留、顺序
-                # 与存活水位一起失真。
-                pass
+                # 与存活水位一起失真；但静默吞掉会让线上彻底黑障，必须留痕。
+                try:
+                    self._on_log("[cid=%s] 下行帧交付异常（已跳过）: %s: %s"
+                                 % (self._name, type(e).__name__, e))
+                except Exception:
+                    pass
 
     def add(self, seq: int, frame: dict) -> bool:
-        """返回 True=该 (cid,seq) 的首个副本（投递它的 broker 赢了竞速），
-        False=迟到重复副本/已熔断。供 per-broker 竞速统计用。"""
+        """返回 True=该 (cid,seq) 的首个副本且已被接收（投递它的 broker 赢了
+        竞速），False=迟到重复副本/已熔断/**pending 堆满拒收**。满队拒收不
+        能算竞速胜利：帧没进缓存、没入交付队列，要靠后续 NACK 补发，计成
+        win 会让 broker 竞速胜率与实际接收量永久对不上。"""
         with self._lock:
             if self.broken:
                 return False
             seq = int(seq)
             if seq < self.next or seq in self.pending:
                 return False  # 重复副本
-            if len(self.pending) < _INGRESS_MAX:
-                self.pending[seq] = frame
+            if len(self.pending) >= _INGRESS_MAX:
+                self.dropped_full += 1
+                try:
+                    self._on_log(
+                        "[cid=%s] 下行缺口暂存已满 %d 帧，拒收 seq=%d"
+                        "（等 NACK 补发/缺口熔断）"
+                        % (self._name, _INGRESS_MAX, seq))
+                except Exception:
+                    pass
+                return False
+            self.pending[seq] = frame
             ready = []
             while self.next in self.pending:
                 ready.append(self.pending.pop(self.next))
@@ -1062,7 +1106,8 @@ class _ClientConn:
     __slots__ = ("cid", "desc", "wq", "opened", "open_result", "reassembly",
                  "local_sock", "closed", "remote_closed", "seq_lock",
                  "out_seq", "bytes_up", "bytes_down", "created",
-                 "ucache", "local_read_done", "state_lock")
+                 "ucache", "local_read_done", "state_lock",
+                 "reader_done", "fin_close_pending")
 
     def __init__(self, cid, desc, reassembly):
         self.cid = cid
@@ -1089,6 +1134,12 @@ class _ClientConn:
         self.ucache = {}
         # 本地读线程已退出（应用已关本地连接）：writer 发 FIN 后据此安全 close
         self.local_read_done = threading.Event()
+        # reader_done：只由本地读线程自身在退出时 set（区别于 drop 强通知
+        # 用的 local_read_done）；fin 收尾线程据此判断应用是否真的读完。
+        self.reader_done = threading.Event()
+        # clean EOF 时 socket 的关闭权已移交 s5-fin 收尾线程，drop_connection
+        # 不得再直接 close（Windows 下会把接收缓冲里应用未读的数据打成 RST）
+        self.fin_close_pending = False
 
 
 class RemoteSocks5:
@@ -1144,10 +1195,25 @@ class RemoteSocks5:
         self._bulk_q = queue.Queue(maxsize=64)  # 上行大帧平滑队列
         self._rt_last = {}                        # NACK 大帧补发去重 (cid,seq)->t
         self.pace_intv = _PACE_START              # 当前大帧节奏（闭环热调）
-        self.hb_floor = None                      # 全 broker 实测 hb 延迟地板（含时钟偏差）
+        # hb 延迟地板：最近 _HB_FLOOR_WIN 秒内全 broker 样本的最小值。
+        # 单调 min 会被一次 NTP 步进/GC stop-the-world/OS 调度抖动钉出的
+        # 极小值永久锁死，此后 best 恒偏大、pace 单调爬到 _PACE_MAX，会话
+        # 余生被误限速。滚动窗口让异常样本 60s 后自然淘汰（多线程回调，
+        # 用专用锁保护 deque 与 min 计算）。
+        self._hb_floor_samples = deque()
+        self._hb_lock = threading.Lock()
+        self._closing = False                     # close() 幂等/防 bnet 复活
         self._pace_ok = 0                         # 连续健康轮次（恢复要慢）
         self._last_ps = 0.0                       # 上次下发 ps 指令时刻
         self._open_mono = time.monotonic()      # 会话起点（pb 热身计时用）
+
+    @property
+    def hb_floor(self):
+        """最近 _HB_FLOOR_WIN 秒 hb 延迟（ms）的滚动最小值；无样本返回 None。"""
+        with self._hb_lock:
+            if not self._hb_floor_samples:
+                return None
+            return min(d for _, d in self._hb_floor_samples)
 
     # ---- 握手 ----
 
@@ -1337,14 +1403,18 @@ class RemoteSocks5:
                 d = int(time.time() * 1000) - int(hb)
             except (TypeError, ValueError):
                 return
+            now_mono = time.monotonic()
             st["hb_n"] += 1
             st["hb_sum"] += d
             st["hb_last_ms"] = d
-            st["hb_last_t"] = time.monotonic()
-            if self.hb_floor is None:
-                self.hb_floor = d
-            elif d < self.hb_floor:
-                self.hb_floor = d
+            st["hb_last_t"] = now_mono
+            # 滚动窗口地板：淘汰 60s 前的样本，异常极小值不会永久锁死 pacing
+            with self._hb_lock:
+                self._hb_floor_samples.append((now_mono, d))
+                while (self._hb_floor_samples
+                       and now_mono - self._hb_floor_samples[0][0]
+                       > _HB_FLOOR_WIN):
+                    self._hb_floor_samples.popleft()
             st["hb_min"] = d if st["hb_min"] is None else min(st["hb_min"], d)
             st["hb_max"] = d if st["hb_max"] is None else max(st["hb_max"], d)
             srv = data.get("srv")
@@ -1449,6 +1519,7 @@ class RemoteSocks5:
                           {"cid": c.cid, "desc": c.desc,
                            "down_delivered_next": c.reassembly.next,
                            "down_waiting": sorted(c.reassembly.pending)[:8],
+                           "down_dropped_full": c.reassembly.dropped_full,
                            "up_next_seq": c.out_seq}
                           for c in conns]},
             "note": "hb_delay_ms 含两端时钟偏差，仅跨 broker 横向比较有"
@@ -1499,6 +1570,8 @@ class RemoteSocks5:
         小帧延迟的最小值（即当前最快小帧路径；时钟偏差只取 min，天然稳）。
         最快小帧都 >3s：大帧已触发账号级惩罚，节奏放慢 1.5×；持续 <1.2s：
         逐步恢复。指令 ps 随 1 字节级控制帧全 broker 上行。"""
+        if self._end_event.is_set() or self.in_topic is None:
+            return  # 会话关闭中：不再产生任何上行帧
         now = time.monotonic()
         if now - self._last_ps < 3.0:
             return
@@ -1552,9 +1625,15 @@ class RemoteSocks5:
         """按首选名单（重）建上行大帧专用连接；变化才重建，旧连接后台关闭。"""
         want = frozenset(str(h) for h in (hosts or ()))
         with self._bnet_lock:
+            # 与 close() 互斥：会话关闭中/已关闭绝不建连，否则新建的管理器
+            # 不在 close() 的清理快照里，会带着一条真实 MQTT 连接泄漏
+            # （"_bnet 复活"竞态）。
+            if self._closing or self._end_event.is_set():
+                return
             if want == self._bhosts:
                 return
             old = self._bnet
+            nn = None
             try:
                 sub = [b for b in BROKER_LIST if b[0] in want]
                 if len(sub) != len(want):
@@ -1567,6 +1646,15 @@ class RemoteSocks5:
                     nn.wait_connected(min_count=1, timeout=4.0)
                 except Exception:
                     pass
+                # wait_connected 最长阻塞 4s，期间 close() 可能已经拿走并
+                # 停掉旧 _bnet：赋值前复查，关闭中则当场掐死新连接，绝不
+                # 写回 self._bnet 造成复活。
+                if self._closing or self._end_event.is_set():
+                    try:
+                        nn.stop()
+                    except Exception:
+                        pass
+                    return
                 self._bnet = nn
                 self._bhosts = want
                 if old is not None:
@@ -1579,9 +1667,14 @@ class RemoteSocks5:
                 self.on_log("[s5] 上行大帧专用连接就绪: %s"
                             % ", ".join(sorted(want)))
             except Exception as e:
-                self._bnet = None
-                self._bhosts = frozenset()
-                self.on_log("[s5] 上行大帧专用连接建立失败，回退主连接: %r" % e)
+                if nn is not None:
+                    try:
+                        nn.stop()
+                    except Exception:
+                        pass
+                # 旧连接没被替换成功：要么仍可用（保留），要么已随异常失效。
+                # 仅在确认异常发生在旧连接被摘走后才停它，避免误停活连接。
+                self.on_log("[s5] 上行大帧专用连接建立失败，保持现有连接: %r" % e)
 
     def _bulk_publish(self, frame: dict) -> None:
         """大帧走专用连接；未就绪/异常时回退主连接全 broker。"""
@@ -1602,6 +1695,13 @@ class RemoteSocks5:
                 return
             except queue.Full:
                 pass
+        # 会话结束导致未入队：以前静默返回，发送方以为帧已进管线，线上
+        # 定位"最后几 KB 没到"时完全无线索，必须留痕（序号可对照缓存）。
+        try:
+            self.on_log("[s5] 会话结束，上行大帧未入平滑队列而丢弃: cid=%s seq=%s"
+                        % (frame.get("cid"), frame.get("seq")))
+        except Exception:
+            pass
 
     def _bulk_send_loop(self) -> None:
         last = 0.0
@@ -1708,7 +1808,8 @@ class RemoteSocks5:
                     lambda fr, c=cid: self._deliver_by_cid(c, fr),
                     lambda c=cid: self._on_conn_gap(c),
                     lambda seqs, c=cid: self._send_nack(c, seqs),
-                    gap=self.gap_timeout, name=str(cid)))
+                    gap=self.gap_timeout, name=str(cid),
+                    on_log=self.on_log))
             self._conns[cid] = conn
         try:
             self._send(conn, {"open": {"host": str(host), "port": int(port)}})
@@ -1788,7 +1889,9 @@ class RemoteSocks5:
             conn.wq.put_nowait(None)
         except Exception:
             pass
-        if conn.local_sock is not None:
+        # clean EOF 的 socket 归 s5-fin 线程按"应用读完/grace"节奏关，这里
+        # 直接 close 会在 Windows 上把未读数据打成 RST
+        if conn.local_sock is not None and not conn.fin_close_pending:
             try:
                 conn.local_sock.close()
             except Exception:
@@ -1812,21 +1915,38 @@ class RemoteSocks5:
         return self._end_event.wait(timeout)
 
     def close(self) -> None:
-        """断开会话：通知服务端停止、退订、关掉所有本地连接；不停 transport。"""
-        if self.sid is not None and not self.ended:
+        """断开会话：通知服务端停止、退订、关掉所有本地连接；不停 transport。
+
+        顺序关键：必须**先**置结束位再做任何清理，最后才清会话身份。旧顺序
+        先干活、末尾才清 sid，而服务端不回 end（UDP 式 qos0 丢包/1.5s 超时）
+        时 _end_event 永远不置位——sweep/pb/bulk 线程与 open() 异步拉起的
+        _ensure_bnet 全程活着：会继续 publish（sid 清空后拼出垃圾帧），还
+        可能在 bnet 已 stop 之后新建并写回 _bnet（真实 MQTT 连接无人停）。
+        """
+        if self._closing:
+            return
+        self._closing = True
+        # 1. 先停本地所有循环：sweep/pb/bulk/ensure 立即不再产生帧与新连接
+        self._end_event.set()
+        # 2. best-effort 通知服务端停止（此刻 sid/topic 仍在，帧合法）；
+        #    不阻塞等待 end 回包：本地资源回收不依赖服务端确认，它收不到
+        #    stop 也有 TTL 兜底。
+        sid, in_topic, owner = self.sid, self.in_topic, self.owner
+        if sid is not None and in_topic is not None:
             try:
-                self.tr.publish(self.in_topic,
-                                {"s5": self.sid, "stop": True,
-                                 "owner": self.owner})
+                self.tr.publish(in_topic,
+                                {"s5": sid, "stop": True, "owner": owner})
             except Exception:
                 pass
-            self._end_event.wait(1.5)
+        # 3. 退订：杜绝收尾期间又有下行帧进来触发收尾/日志
         if self._handler is not None and self.out_topic is not None:
             try:
                 self.tr.stream_unsubscribe(self.out_topic, self._handler)
             except Exception:
                 pass
+        # 4. 关全部本地连接（ended=True，drop 不再补发上行 close 垃圾帧）
         self.abort_all()
+        # 5. 排空大帧队列并投哨兵停 bulk 发送线程
         try:
             while True:
                 self._bulk_q.get_nowait()
@@ -1836,16 +1956,22 @@ class RemoteSocks5:
             self._bulk_q.put_nowait(None)
         except Exception:
             pass
-        if self._bnet is not None:
-            _bn = self._bnet
+        # 6. 停 bulk 管理器：持 _bnet_lock 停，与 _ensure_bnet 互斥，杜绝
+        #    "已 stop 又被异步线程重建"的复活泄漏
+        with self._bnet_lock:
+            bn = self._bnet
             self._bnet = None
             self._bhosts = frozenset()
+        if bn is not None:
             try:
-                _bn.stop()
+                bn.stop()
             except Exception:
                 pass
+        # 7. 最后清会话身份：任何漏网路径也拼不出带本会话 sid 的帧
         self.sid = None
         self.owner = None
+        self.in_topic = None
+        self.out_topic = None
 
 
 # ============================ 本地 SOCKS5 监听服务 ============================
@@ -2000,11 +2126,12 @@ class _Socks5Server:
                     return
             sess.drop_connection(cid, reason="local_error")
         finally:
-            # 读线程退出 = 应用端已关闭（FIN/RST 已到），writer 可安全回收
+            # 读线程退出 = 应用端已关闭（FIN/RST 已到），writer/fin 可安全回收
             with sess._lock:
                 conn = sess._conns.get(cid)
             if conn is not None:
                 conn.local_read_done.set()
+                conn.reader_done.set()
 
     def _local_writer(self, cid: int, csock: socket.socket) -> None:
         """下行帧 -> 本地 socket。收到 None（远端 closed 或本地收尾）即结束；
@@ -2036,20 +2163,39 @@ class _Socks5Server:
             # 远端半关：只 shutdown 写方向给应用发 FIN，绝不能直接 close()——
             # Windows 下 socket 接收缓冲里还有应用未读完的数据时，close()
             # 会直接发 RST，把已完整送达的下载/响应在应用侧打成连接重置。
-            # 等读线程（应用关闭后）退出再 close，fd 由 drop_connection 回收。
             try:
                 csock.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
-            conn.local_read_done.wait(120.0)
-        try:
-            csock.close()
-        except Exception:
-            pass
-        if clean:
+            # socket 最终 close 权移交专职 fin 线程：它等本地读线程退出
+            # （应用读完）或 grace 上限；会话被 abort 时 0.5s 内兜底关 fd。
+            # 会话侧资源（_conns 条目/重组/缓存/统计）则**立即**回收，
+            # writer 线程不再为一个只读长连接白挂 120s。
+            conn.fin_close_pending = True
+
+            def _fin_close(_c=conn, _s=csock):
+                deadline = time.monotonic() + _FIN_CLOSE_GRACE
+                while not sess.ended:
+                    remain = deadline - time.monotonic()
+                    if remain <= 0:
+                        break
+                    if _c.reader_done.wait(min(0.5, remain)):
+                        break
+                try:
+                    _s.close()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_fin_close,
+                             name="s5-fin-%d" % cid, daemon=True).start()
             sess.drop_connection(cid, reason="remote_closed")
-        elif not already_closed:
-            sess.drop_connection(cid, reason="local_error")
+        else:
+            try:
+                csock.close()
+            except Exception:
+                pass
+            if not already_closed:
+                sess.drop_connection(cid, reason="local_error")
 
 
 # ============================ CLI ============================
