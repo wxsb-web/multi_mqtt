@@ -924,10 +924,17 @@ class _ConnReassembly:
     与 PTY 的 _PtyReorderBuffer 唯一但关键的区别：缺口**绝不跳号**——
     TCP 流丢一段就是损坏。缺口后先经 NACK 请求服务端从 per-conn 重传缓存
     补发（多轮），硬超时仍补不齐才熔断该连接。
+
+    交付串行化：add 被每个 broker 各自的 paho 网络线程并发调用，在锁内只能
+    保证"放行集合按 seq 连续"，锁外若直接回调 deliver，两个线程可能把
+    seq=6 先于 seq=5 写进本地 socket——TCP 字节序静默错乱（长度合法、内容
+    错位），比缺口熔断危险得多。故每条连接配一个专职交付线程：add 锁内
+    drain 后只把帧 FIFO 入队，单线程严格按放行顺序 deliver（PTY 侧也要求
+    同样的顺序语义）。
     """
 
     def __init__(self, deliver, on_gap, on_nack, gap=_GAP_DEFAULT,
-                 nack_first=_NACK_FIRST, nack_intv=_NACK_INTV):
+                 nack_first=_NACK_FIRST, nack_intv=_NACK_INTV, name=""):
         self.next = 0
         self.pending = {}
         self.deadline = None       # 硬熔断时刻
@@ -941,11 +948,31 @@ class _ConnReassembly:
         self._on_gap = on_gap
         self._on_nack = on_nack
         self._lock = threading.Lock()
+        # 待交付帧 FIFO：唯一写者是各 broker 回调（持 _lock 时入队），
+        # 唯一读者是本连接的交付线程。无界：入队候选受 pending<_INGRESS_MAX
+        # 约束，且 deliver 路径全部非阻塞（put_nowait/event.set），唯一的
+        # 背压出口（wq 满）会立即 drop_connection→close→哨兵停线程。
+        self._dq = queue.Queue()
+        self._closing = False
+        t = threading.Thread(target=self._deliver_loop,
+                             name="s5-deliver-%s" % name, daemon=True)
+        t.start()
+
+    def _deliver_loop(self):
+        while True:
+            fr = self._dq.get()
+            if fr is None:
+                return
+            try:
+                self._deliver(fr)
+            except Exception:
+                # 单帧异常绝不能打死交付线程，否则后续字节全部滞留、顺序
+                # 与存活水位一起失真。
+                pass
 
     def add(self, seq: int, frame: dict) -> bool:
         """返回 True=该 (cid,seq) 的首个副本（投递它的 broker 赢了竞速），
         False=迟到重复副本/已熔断。供 per-broker 竞速统计用。"""
-        ready = []
         with self._lock:
             if self.broken:
                 return False
@@ -954,6 +981,7 @@ class _ConnReassembly:
                 return False  # 重复副本
             if len(self.pending) < _INGRESS_MAX:
                 self.pending[seq] = frame
+            ready = []
             while self.next in self.pending:
                 ready.append(self.pending.pop(self.next))
                 self.next += 1
@@ -966,9 +994,22 @@ class _ConnReassembly:
                 self.deadline = None
                 self.ndeadline = None
                 self.nround = 0
-        for fr in ready:
-            self._deliver(fr)
+            # 入队必须仍在锁内：FIFO 只保证单次 put 原子，两个并发 add
+            # 若在锁外各自 put，seq=6 仍可能先于 seq=5 入队。drain 与
+            # enqueue 同临界区，队列顺序就与 next 推进严格一致。Queue 无界，
+            # put 立即返回，不增加锁持有时间。
+            if not self._closing:
+                for fr in ready:
+                    self._dq.put(fr)
         return True
+
+    def deliver_now(self, frame: dict) -> None:
+        """无 seq 兼容帧也走交付 FIFO：否则它在 broker 回调线程直接交付，
+        会与交付线程上的 seq 数据帧并发写本地 socket，绕过保序。"""
+        with self._lock:
+            if self._closing:
+                return
+            self._dq.put(frame)
 
     def check(self) -> None:
         """由会话清扫线程周期调用：到点发 NACK；硬超时才熔断。"""
@@ -1005,8 +1046,14 @@ class _ConnReassembly:
 
     def close(self) -> None:
         with self._lock:
+            if self._closing:
+                return
+            self._closing = True
             self.broken = True
             self.pending.clear()
+            # 哨兵入队：已在 FIFO 里的放行帧先交付（连接已从 _conns 摘除，
+            # _deliver_by_cid 会丢弃），随后交付线程退出，不残留线程。
+            self._dq.put(None)
 
 
 class _ClientConn:
@@ -1202,10 +1249,14 @@ class RemoteSocks5:
     def _send(self, conn: _ClientConn, extra: dict) -> None:
         """上行帧唯一出口：per-cid 打号 + 盖 owner 后发出。
 
-        打号与 publish 在同一把 per-conn 锁内原子完成（与 PTY 的 _publish_input
-        同因）：否则读线程/收尾线程并发时序号与投递顺序不一致，服务端重组
-        会把晚到的低 seq 当真丢帧，NACK/超时后误断连接。帧副本进 per-conn
-        重传缓存，服务端上行缺口回 NACK 时原样补发（qos0 无 broker 重传）。
+        打号与入重传缓存在同一把 per-conn 锁内原子完成：序号必须连续无竞，
+        否则服务端重组把晚到低 seq 当真缺帧、NACK/超时误断连接。**实际
+        发送必须在锁外**：大帧走 _bulk_enqueue（队列满时按 0.5s 粒度反压，
+        64 格最坏要挡数十秒），主连接 publish 在 paho 内部队列紧张时也会
+        短暂阻塞；持着 seq_lock 阻塞会把同连接的 close 帧（eof_connection/
+        drop_connection）一起堵在锁外，半关延迟数十秒。锁外乱序到达无害——
+        服务端按 per-cid seq 重组，乱序只进 pending 不会错放（大帧走 bulk、
+        小帧走主连接本就是两条路，到达顺序从来不保证）。
         """
         with conn.seq_lock:
             frame = {"s5": self.sid, "cid": conn.cid, "seq": conn.out_seq}
@@ -1218,10 +1269,11 @@ class RemoteSocks5:
                 for _k in sorted(conn.ucache)[:64]:
                     conn.ucache.pop(_k, None)
             _d = frame.get("d")
-            if isinstance(_d, str) and len(_d) > 2048:
-                self._bulk_enqueue(frame)    # 大帧：平滑队列→专用连接
-            else:
-                self.tr.publish(self.in_topic, frame)
+            big = isinstance(_d, str) and len(_d) > 2048
+        if big:
+            self._bulk_enqueue(frame)    # 大帧：平滑队列→专用连接
+        else:
+            self.tr.publish(self.in_topic, frame)
 
     def _send_nack(self, cid: int, seqs) -> None:
         """上行缺口重传请求（控制帧，无 seq，走全 broker）。"""
@@ -1347,7 +1399,9 @@ class RemoteSocks5:
             self._track_broker(broker, data, is_new=is_new)
         else:
             self._track_broker(broker, data)
-            self._deliver(conn, data)  # 无 seq 宽松放行（兼容）
+            # 无 seq 宽松放行（兼容）：仍走该连接的交付 FIFO，不允许在
+            # broker 回调线程直接写本地 socket 而绕过保序。
+            conn.reassembly.deliver_now(data)
 
     def net_report(self) -> dict:
         """网络分析快照（JSON 可序列化）。全部来自被动观察，无额外请求：
@@ -1425,8 +1479,15 @@ class RemoteSocks5:
                 conn.remote_closed = True
             try:
                 conn.wq.put_nowait(None)
-            except Exception:
-                pass
+            except queue.Full:
+                # close 语义绝不能丢：wq 堆满（writer 正被慢本地端 sendall
+                # 背压）时 None 投不进去，writer 排空后会永久阻塞在 get()，
+                # 连 fd/线程/条目一起泄漏。强收尾：close(local_sock) 会
+                # 打断 writer 的 sendall 使其退出（与服务端 _close_conn 对称）。
+                self.on_log("[cid=%d] 本地写队列满，closed 信号无法入队，"
+                            "强制收尾 %s" % (conn.cid, conn.desc))
+                self.drop_connection(conn.cid,
+                                     reason="close_signal_dropped")
 
     def _on_conn_gap(self, cid: int) -> None:
         self.on_log("[cid=%d] 下行 seq 缺口超过 %.1fs（NACK 多轮补发仍失败），"
@@ -1647,13 +1708,16 @@ class RemoteSocks5:
                     lambda fr, c=cid: self._deliver_by_cid(c, fr),
                     lambda c=cid: self._on_conn_gap(c),
                     lambda seqs, c=cid: self._send_nack(c, seqs),
-                    gap=self.gap_timeout))
+                    gap=self.gap_timeout, name=str(cid)))
             self._conns[cid] = conn
         try:
             self._send(conn, {"open": {"host": str(host), "port": int(port)}})
         except Exception:
             with self._lock:
                 self._conns.pop(cid, None)
+            # 发送已移到 seq_lock 外：失败回滚时必须停掉交付线程，否则它
+            # 永久阻塞在空 FIFO 上（daemon 不挡退出，但每条失败连接漏一个）。
+            conn.reassembly.close()
             raise
         return cid
 
