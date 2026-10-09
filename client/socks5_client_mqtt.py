@@ -125,20 +125,20 @@ alias_gap_timeout     = ('gap_timeout', 'gap')
 alias_rpc_port        = ('rpc_port', 'rpc')
 alias_rpc_host        = ('rpc_host', 'rpc_ip')
 
-_GAP_DEFAULT = 15.0       # per-cid seq 缺口硬熔断秒数（先经 NACK 多轮重传）
-_HB_FLOOR_WIN = 60.0      # hb 延迟地板的滚动窗口秒数（单调 min 会被一次
-                          # NTP/GC/调度抖动永久钉死，pace 余生误判惩罚中）
-_FIN_CLOSE_GRACE = 120.0  # 远端 clean EOF 后等本地应用读完缓冲再 close socket
-                          # 的上限（Windows 防 RST）；会话条目不再被它拖住
-_NACK_FIRST = 0.8         # 缺口出现后多久发首轮重传请求
-_NACK_INTV = 1.2          # 后续重传请求轮询间隔（硬熔断前约 4 轮）
-_CACHE_MAX = 256          # per-conn 重传缓存帧数（≈256×16KiB=4MiB）
-_PB_MAX = 3               # 大帧下行首选 broker 数（控制帧仍全 broker）
+_PB_SEED = ("demo.tbmq.io", "broker-cn.emqx.io", "broker.emqx.io")
 # 会话建立即下发的静态种子名单：竞速统计热身（约 45-60s）完成前，大帧若
 # 回退主节点会变成全 13 broker 扇出——热身下载本身就能触发账号级惩罚。
 # 选历史胜率/隔离性最好的三个，热身完成后由累计胜率名单接管。
-_PB_SEED = ("demo.tbmq.io", "broker-cn.emqx.io", "broker.emqx.io")
+_PB_MAX = 3               # 大帧下行首选 broker 数（控制帧仍全 broker）
 _PB_INTV = 5.0            # 首选 broker 名单刷新/下发间隔秒
+
+_GAP_DEFAULT = 15.0       # per-cid seq 缺口硬熔断秒数（先经 NACK 多轮重传）
+_HB_FLOOR_WIN = 60.0      # hb 延迟地板的滚动窗口秒数（单调 min 会被一次 NTP/GC/调度抖动永久钉死，pace 余生误判惩罚中）
+_FIN_CLOSE_GRACE = 120.0  # 远端 clean EOF 后等本地应用读完缓冲再 close socket 的上限（Windows 防 RST）；会话条目不再被它拖住
+_NACK_FIRST = 0.8         # 缺口出现后多久发首轮重传请求
+_NACK_INTV = 1.2          # 后续重传请求轮询间隔（硬熔断前约 4 轮）
+_CACHE_MAX = 256          # per-conn 重传缓存帧数（≈256×16KiB=4MiB）
+
 _BULK_INTV = 0.04         # 大帧全局平滑节奏下限（秒/帧 ≈25 帧/s≈400KB/s）
 _PACE_START = 0.08        # 会话起跑节奏（≈200KB/s）：宁可慢，不触发惩罚
 _PACE_MAX = 0.5           # 最严节奏上限（2 帧/s≈32KB/s，仅惩罚期短暂进入）

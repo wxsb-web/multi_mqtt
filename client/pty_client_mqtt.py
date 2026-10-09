@@ -2284,7 +2284,8 @@ def main(argv=None) -> int:
         private_key=args.key, allow_no_pub=args.allow)
     online, total, hosts = _broker_status(transport)
     _info("MQTT 就绪：在线 broker %d/%d，建连耗时 %.1f 秒"
-          % (online, total, time.monotonic() - t_conn)+ ", ".join(hosts))
+      % (online, total, time.monotonic() - t_conn)
+      + ("；在线节点：" + ", ".join(hosts) if hosts else ""))
     # if hosts:
         # _info("在线节点：" + ", ".join(hosts))
     # el
