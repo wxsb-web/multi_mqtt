@@ -1399,26 +1399,20 @@ class MultiMQTTManager:
             next_ping_at = next_print_at = float('inf')
 
         # 通用周期任务（如上层注册的 global_topic_list_tick），与 Ping/报告同级调度；
-        # 间隔与 PING_INTERVAL 相同时对到 ping 同一节拍，一次唤醒同时处理两者，
-        # 避免两套时间线交错导致唤醒时刻分散
+        # 首跳立即（保证 startup 报告不被 ping 节拍推迟），执行后若间隔与
+        # PING_INTERVAL 相同则并入 ping 序列，后续一次唤醒同时处理两者
         if self._periodic_fn is not None:
-            if self.enable_stats and self._periodic_interval == self.stats.PING_INTERVAL:
-                next_periodic_at = next_ping_at
-            else:
-                next_periodic_at = time.time()  # 首次不要等，由任务自行决定首跳行为
+            next_periodic_at = time.time()
         else:
             next_periodic_at = float('inf')
 
         while not self._stop_event.is_set():
             now = time.time()
 
-            # 兼容分发线程启动后才注册的周期任务（next_periodic_at 仍为 inf）；
-            # 与 ping 同间隔时同样对齐到 ping 节拍
+            # 兼容分发线程启动后才注册的周期任务（next_periodic_at 仍为 inf）：
+            # 首跳立即，避免对齐到已推进的 ping 节拍导致 startup 报告延迟
             if self._periodic_fn is not None and next_periodic_at == float('inf'):
-                if self.enable_stats and self._periodic_interval == self.stats.PING_INTERVAL:
-                    next_periodic_at = next_ping_at
-                else:
-                    next_periodic_at = now
+                next_periodic_at = now
 
             # 周期任务参与等待时长计算；无任务且无 stats 时保持原始 None
             # （queue.get 无限阻塞等消息），注册任务由唤醒哨兵打断，无轮询开销
@@ -1476,7 +1470,10 @@ class MultiMQTTManager:
                         self._periodic_fn(now)
                     except Exception:
                         logger.exception("周期任务执行失败: %s", getattr(self._periodic_fn, "__name__", self._periodic_fn))
-                    next_periodic_at = now + self._periodic_interval
+                    if self.enable_stats and self._periodic_interval == self.stats.PING_INTERVAL:
+                        next_periodic_at = next_ping_at   # 并入 ping 序列，唤醒合并不分叉
+                    else:
+                        next_periodic_at = now + self._periodic_interval
 
     def subscribe(self, topic: str, **ka):
         """订阅 topic；qos 等额外参数经 **ka 原样透传给 paho-mqtt Client.subscribe。"""

