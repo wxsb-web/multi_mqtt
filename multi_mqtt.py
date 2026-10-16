@@ -50,6 +50,11 @@ else:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("MultiMQTT")
 
+# 周期任务唤醒哨兵：set_periodic_task 注册首个任务时投递到消息队列，
+# 打断可能长阻塞在 queue.get 的分发线程；消费端识别后跳过分发
+PERIODIC_WAKEUP_TOPIC = "__periodic_wakeup__"
+PERIODIC_WAKEUP_SENTINEL = (PERIODIC_WAKEUP_TOPIC, None, None)
+
 # =========================================================================
 # 预设公共 MQTT Broker 列表
 # -------------------------------------------------------------------------
@@ -913,10 +918,45 @@ class MultiMQTTManager:
         self._msg_queue = queue.Queue(maxsize=self.MSG_QUEUE_MAXSIZE)
         self._dispatch_thread = None
         self.is_windows_cmd=False
+        # 通用周期任务槽：由 _dispatch_loop 与 Stats Ping/报告打印同级调度，
+        # 业务逻辑由上层经 set_periodic_task 注册，核心代码不做业务硬编码
+        self._periodic_fn = None
+        self._periodic_interval = 60.0
 
     def set_on_message(self, callback):
         """设置上层回调，签名: fn(topic, data_dict, rx_broker)"""
         self.message_callback = callback
+
+    def set_periodic_task(self, fn, interval=60.0):
+        """注册/清除周期任务 fn(now)，在 _dispatch_loop 中每隔 interval 秒执行一次。
+
+        与 stats 的周期 Ping/连接质量报告同级别、同线程调度，不额外创建线程；
+        fn=None 清除任务。业务异常由 _dispatch_loop 捕获记录，不影响消息分发。
+        注册首个任务时向消息队列投递唤醒哨兵，打断可能阻塞在 queue.get 的
+        分发线程（无 stats 时可被 PING_INTERVAL=600s 长阻塞），使其立即感知
+        新任务，无需轮询。
+        """
+        with self.lock:
+            first_register = fn is not None and self._periodic_fn is None
+            self._periodic_fn = fn
+            self._periodic_interval = max(0.1, float(interval))
+        if first_register:
+            try:
+                self._msg_queue.put_nowait(PERIODIC_WAKEUP_SENTINEL)
+            except Exception:
+                pass   # 哨兵投递失败无害：分发线程按 next_periodic_at 兜底检测
+
+    def get_connection_snapshot(self):
+        """返回 {host: 是否在线} 快照，供上层做断线/重连检测。"""
+        with self.lock:
+            clients_snapshot = list(self.clients.items())
+        state = {}
+        for host, c in clients_snapshot:
+            try:
+                state[host] = bool(c.is_connected())
+            except Exception:
+                state[host] = False
+        return state
 
     def _log_msg_error(self, host, exc):
         now = time.time()
@@ -973,8 +1013,8 @@ class MultiMQTTManager:
             old_thread = self._dispatch_thread
             if old_thread is not None and old_thread.is_alive():
                 logger.error(
-                    "上一次的分发线程尚未退出（可能有 message_callback 阻塞），"
-                    "拒绝启动新的分发线程以免双线程抢队列。请稍后重试或排查阻塞回调。"
+                    "分发线程已在运行（并发 start() 或上一次线程未退出、可能有回调阻塞），"
+                    "拒绝启动新线程以免双线程抢队列。"
                 )
                 return
             self._stop_event.clear()
@@ -987,10 +1027,13 @@ class MultiMQTTManager:
                     break
             if drained:
                 logger.debug("start() 排空了 %d 条残留消息（含可能的旧毒药丸）", drained)
-        self._dispatch_thread = threading.Thread(
-            target=self._dispatch_loop, daemon=True, name="MQTTMsgDispatch"
-        )
-        self._dispatch_thread.start()
+            # 创建/赋值/启动必须全部在锁内完成：若在锁外赋值，两个线程并发
+            # start() 都会看到 _dispatch_thread 为 None 而各自启动一个分发线程，
+            # 双线程抢同一消息队列（threading.Thread.start() 耗时微秒级，持锁无碍）
+            self._dispatch_thread = threading.Thread(
+                target=self._dispatch_loop, daemon=True, name="MQTTMsgDispatch"
+            )
+            self._dispatch_thread.start()
         self._started_at = time.time()
         for broker_entry in self.brokers:
             host, port, client = self._build_client(broker_entry)
@@ -1029,7 +1072,10 @@ class MultiMQTTManager:
         if unpacked is None:
             return None, None, None
         host, port, username, password = unpacked
-        client_id = f"multi_client_{int(time.time()*1000)}_{uuid.uuid4().hex[:4]}"
+        # MQTT 3.1.1 规范要求服务端支持 1-23 字节 ClientId，超长会被
+        # Mosquitto 严格模式/HiveMQ 等拒绝；压缩后最长 19 字符：
+        # mc(2) + 毫秒%1e10 的十六进制(<=9) + uuid4 随机 8 位
+        client_id = f"mc{int(time.time()*1000) % 10**10:x}{uuid.uuid4().hex[:8]}"
         client = mqtt_client.Client(CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt_client.MQTTv311)
         client.user_data_set(host)
         if username is not None:
@@ -1352,42 +1398,70 @@ class MultiMQTTManager:
         else:
             next_ping_at = next_print_at = float('inf')
 
+        # 通用周期任务（如上层注册的 global_topic_list_tick），与 Ping/报告同级调度；
+        # 间隔与 PING_INTERVAL 相同时对到 ping 同一节拍，一次唤醒同时处理两者，
+        # 避免两套时间线交错导致唤醒时刻分散
+        if self._periodic_fn is not None:
+            if self.enable_stats and self._periodic_interval == self.stats.PING_INTERVAL:
+                next_periodic_at = next_ping_at
+            else:
+                next_periodic_at = time.time()  # 首次不要等，由任务自行决定首跳行为
+        else:
+            next_periodic_at = float('inf')
+
         while not self._stop_event.is_set():
             now = time.time()
-            
+
+            # 兼容分发线程启动后才注册的周期任务（next_periodic_at 仍为 inf）；
+            # 与 ping 同间隔时同样对齐到 ping 节拍
+            if self._periodic_fn is not None and next_periodic_at == float('inf'):
+                if self.enable_stats and self._periodic_interval == self.stats.PING_INTERVAL:
+                    next_periodic_at = next_ping_at
+                else:
+                    next_periodic_at = now
+
+            # 周期任务参与等待时长计算；无任务且无 stats 时保持原始 None
+            # （queue.get 无限阻塞等消息），注册任务由唤醒哨兵打断，无轮询开销
+            wait_list = []
             if self.enable_stats:
-                wait_time = min(next_ping_at - now, next_print_at - now)
-                wait_time = max(0.1, wait_time)  # 兜底防负数
-            else:
-                wait_time = None 
+                wait_list.append(next_ping_at - now)
+                wait_list.append(next_print_at - now)
+            if next_periodic_at != float('inf'):
+                wait_list.append(next_periodic_at - now)
+            wait_time = max(0.1, min(wait_list)) if wait_list else None
 
             try:
                 item = self._msg_queue.get(timeout=wait_time)
-                
+
                 if item is None:
                     return
-                    
+
                 topic, data, host = item
+                if topic == PERIODIC_WAKEUP_TOPIC:
+                    continue   # 唤醒哨兵：仅打断阻塞，不分发
                 try:
                     if self.message_callback:
                         self.message_callback(topic, data, host)
                 except Exception:
                     logger.exception("消息分发回调执行失败 [%s] topic=%s", host, topic)
-                    
+
             except queue.Empty:
                 pass
 
             if self._stop_event.is_set():
                 return
 
+            # 执行段统一时间基准：ping 与周期任务用同一 now 推进，
+            # 间隔相同时严格保持同拍不漂移
+            now = time.time()
+
             if self.enable_stats:
-                now = time.time()
                 if now >= next_ping_at:
                     # [说明] 周期 Ping 走异步模式（wait_timeout=0），不等 ACK，
                     # 保持分发线程不被探测阻塞。需要实时数据时由 get_report(probe=True) 单独走同步探测。
                     self.stats._send_pings()
                     next_ping_at = now + ping_interval
-                
+
                 if now >= next_print_at:
                     try:
                         logger.info("📡 [连接质量统计报告]" + self.stats.get_report(probe=False,is_windows_cmd=self.is_windows_cmd))
@@ -1395,16 +1469,26 @@ class MultiMQTTManager:
                         logger.exception("生成连接质量统计报告失败")
                     next_print_at = now + print_interval
 
-    def subscribe(self, topic: str):
+            # 通用周期任务：单任务槽，重复注册覆盖；异常兜底不拖垮分发线程
+            if self._periodic_fn is not None:
+                if now >= next_periodic_at:
+                    try:
+                        self._periodic_fn(now)
+                    except Exception:
+                        logger.exception("周期任务执行失败: %s", getattr(self._periodic_fn, "__name__", self._periodic_fn))
+                    next_periodic_at = now + self._periodic_interval
+
+    def subscribe(self, topic: str, **ka):
+        """订阅 topic；qos 等额外参数经 **ka 原样透传给 paho-mqtt Client.subscribe。"""
         with self.lock:
             self.subscribed_topics.add(topic)
             clients_snapshot = list(self.clients.items())
         for host, c in clients_snapshot:
             if c.is_connected():
-                c.subscribe(topic)
+                c.subscribe(topic, **ka)
 
-    def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None):
-        """广播传输消息"""
+    def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None, **ka):
+        """广播传输消息；qos/retain 等额外参数经 **ka 原样透传给 paho-mqtt Client.publish。"""
         out_payload = payload_dict.copy()
         if client_private_key_bytes:
             try:
@@ -1437,7 +1521,7 @@ class MultiMQTTManager:
             clients_snapshot = list(self.clients.items())
         for host, c in clients_snapshot:
             if c.is_connected():
-                c.publish(topic, payload_str, qos=0)
+                c.publish(topic, payload_str, **ka)
 
     def stop(self):
         self._stop_event.set()

@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-from multi_mqtt import BROKER_LIST, MultiMQTTManager, stime, utc_ms, _describe_public_key
+from multi_mqtt import BROKER_LIST, ConnectionQualityStats, MultiMQTTManager, stime, utc_ms, _describe_public_key
 import time,logging,sys
 from rpc_executor import PythonExecutor, format_result
 
 logger = logging.getLogger("Server")
 REQUEST_TOPIC = "sys/device/request"
 DEFAULT_REPLY_TOPIC = "sys/device/response"
+
+# --- [global_topic_list 监听 topic 定期报告] 默认配置 ---
+# 命名说明：stats.get_report 是网络连接质量报告；本组是"监听 topic 列表"报告，
+# 定期发布到 global_topic_list，供新订阅者经 Retain 消息发现服务端监听 topic
+DEFAULT_GLOBAL_TOPIC_LIST = "global_topic_list"          # 报告发布到的 topic
+DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL = 3600.0              # 发布间隔：空闲期每小时一次
+DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD = 86400.0       # 距上次下发指令超过 24 小时视为空闲（可配置）
+DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL = ConnectionQualityStats.PING_INTERVAL  # 默认复用连接质量 ping 间隔（600s），与 ping 同节拍统一时间驱动避免交错唤醒；可配置为更小值如 15 便于测试
+# 发布参数（经 **ka 一路透传到 paho-mqtt）：QoS1+Retain，
+# broker 会连同 QoS 一起保存保留消息，新订阅者上线即收到最新 topic 列表
+DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
 
 
 def _is_verify_enabled(mqtt_net):
@@ -39,6 +50,13 @@ class MQTTServer:
         reply_topic=DEFAULT_REPLY_TOPIC,
         keepalive=None,
         max_reconnect_delay=None,
+        enable_global_topic_list=True,
+        global_topic_list=DEFAULT_GLOBAL_TOPIC_LIST,
+        global_topic_list_interval=DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL,
+        global_topic_list_idle_threshold=DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD,
+        global_topic_list_check_interval=DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL,
+        global_topic_list_publish_kwargs=None,
+        global_topic_list_payload_fn=None,
     ):
         # 实例化网络层管理器（enable_crypto 默认为 False）
         self.request_topic = request_topic
@@ -61,6 +79,23 @@ class MQTTServer:
         
         self.mqtt_net.set_on_message(self.handle_message)
         self.executor = PythonExecutor(globals=globals)
+
+        # --- [global_topic_list 定期报告] 状态（tick 由 _dispatch_loop 周期驱动，不另开线程） ---
+        self.enable_global_topic_list = enable_global_topic_list
+        self.global_topic_list = global_topic_list
+        self.global_topic_list_interval = float(global_topic_list_interval)
+        # 距上次下发指令超过该秒数视为空闲（默认 24 小时，可配置），恢复每小时发布
+        self.global_topic_list_idle_threshold = float(global_topic_list_idle_threshold)
+        self.global_topic_list_check_interval = float(global_topic_list_check_interval)
+        # 发布参数缺省 QoS1+Retain，经 **ka 一路透传到 paho-mqtt
+        self.global_topic_list_publish_kwargs = (
+            dict(global_topic_list_publish_kwargs) if global_topic_list_publish_kwargs
+            else dict(DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS)
+        )
+        # 自定义报告函数: fn(server) -> dict；None 则用默认的监听 topic 列表
+        self.global_topic_list_payload_fn = global_topic_list_payload_fn
+        self._last_gtl_publish_ts = 0.0           # 上次发布报告的时间，0=尚未发布过
+        self.last_command_ts = 0.0                # 最近一次收到控制指令的时间，0=从未收到
 
         verify_enabled, reason = _is_verify_enabled(self.mqtt_net)
         if verify_enabled:
@@ -92,6 +127,11 @@ class MQTTServer:
             req_id = data.get("req_id")
             reply_topic = data.get("reply_topic") or self.reply_topic
             code = data.get("code", data.get("payload"))
+
+            if code is not None:
+                # 收到下发指令：刷新指令时间戳（距上次指令超过 command_idle_threshold
+                # 视为空闲，报告线程据此恢复每小时上报）
+                self.last_command_ts = time.time()
 
             verify_enabled, _ = _is_verify_enabled(self.mqtt_net)
 
@@ -172,6 +212,81 @@ class MQTTServer:
                 rx_broker,
             )
 
+    # ------------------------------------------------------------------
+    # global_topic_list 定期报告（可配置，见 __init__ / start(config)）
+    # 与 stats.get_report 网络质量报告不同，本功能发布"服务端监听 topic 列表"。
+    # tick 经 mqtt_net.set_periodic_task 并入 _dispatch_loop，与 Ping/统计报告
+    # 同级别调度，不额外创建线程。
+    # 触发条件（全部经 _last_gtl_publish_ts 去重，同 tick 多次调用不会连发）：
+    #   距上次收到控制指令超过 global_topic_list_idle_threshold 秒（默认 24
+    #   小时，可配置）且距上次发布超过 global_topic_list_interval 秒（默认 1
+    #   小时）且有在线 broker -> 把监听 topic 列表发布到 global_topic_list，
+    #   发布参数默认 qos=1 + retain=True（经 **ka 透传 paho-mqtt）；
+    #   broker 连同 QoS 一起保存保留消息，新订阅者上线即可收到最新列表；
+    #   断网恢复后同样因"距上次发布已超 interval"自然续上，无需专门分支。
+    #   global_topic_list_payload_fn 可自定义报告内容: fn(server) -> dict。
+    # ------------------------------------------------------------------
+    def _build_global_topic_list_payload(self, reason: str) -> dict:
+        """默认报告内容：当前监听的全部 topic。"""
+        return {
+            "type": "global_topic_list",
+            "reason": reason,
+            "listen_topics": sorted(getattr(self.mqtt_net, "subscribed_topics", set()) or set()),
+            "request_topic": self.request_topic,
+            "reply_topic": self.reply_topic,
+            "server_time": utc_ms(),
+            "server_time_str": stime(),
+        }
+
+    def _publish_global_topic_list(self, reason: str):
+        """发布监听 topic 报告；qos/retain 经 **ka 一路透传到 paho-mqtt。"""
+        if self.global_topic_list_payload_fn is not None:
+            payload = self.global_topic_list_payload_fn(self)
+            if not isinstance(payload, dict):
+                logger.warning("global_topic_list_payload_fn 返回非 dict(%s)，忽略本次发布", type(payload))
+                return
+        else:
+            payload = self._build_global_topic_list_payload(reason)
+        self.mqtt_net.publish_broadcast(self.global_topic_list, payload, **self.global_topic_list_publish_kwargs)
+        self._last_gtl_publish_ts = time.time()
+        logger.info(
+            "📨 [%s] 已发布监听 topic 报告 -> %s (reason=%s, publish=%s, topics=%s)",
+            stime(), self.global_topic_list, reason,
+            self.global_topic_list_publish_kwargs, payload.get("listen_topics"),
+        )
+
+    def global_topic_list_tick(self, now=None):
+        """周期 tick：由 _dispatch_loop 驱动（也可手动调用）。
+
+        判定：距上次收到控制指令超过 idle_threshold（默认 24 小时）且距上次
+        发布超过 interval 且有在线 broker -> 发布；发布即刷新时间戳，
+        天然防抖，断网恢复后因距上次发布已超 interval 自然续上。
+        """
+        if now is None:
+            now = time.time()
+
+        online_count = sum(
+            1 for online in self.mqtt_net.get_connection_snapshot().values() if online
+        )
+        if (
+            online_count
+            and (now - self.last_command_ts) >= self.global_topic_list_idle_threshold
+            and (now - self._last_gtl_publish_ts) >= self.global_topic_list_interval
+        ):
+            reason = "startup" if self._last_gtl_publish_ts == 0.0 else "idle_no_command"
+            self._publish_global_topic_list(reason)
+
+    def _register_global_topic_list_tick(self):
+        """把 tick 注册进 _dispatch_loop 周期任务槽（与 stats Ping/报告同级，不另开线程）。"""
+        if not self.enable_global_topic_list:
+            return
+        self.mqtt_net.set_periodic_task(
+            self.global_topic_list_tick, interval=self.global_topic_list_check_interval
+        )
+
+    def _unregister_global_topic_list_tick(self):
+        self.mqtt_net.set_periodic_task(None, interval=1.0)
+
     def start(self, block=True):
         """
         启动 MQTT 服务端。
@@ -210,6 +325,8 @@ class MQTTServer:
         )
 
         logger.info("[连接质量统计报告]%s", self.mqtt_net.stats.get_report(is_windows_cmd=(sys.platform=="win32")))
+
+        self._register_global_topic_list_tick()
         if not block:
             return self
         
@@ -219,6 +336,7 @@ class MQTTServer:
         except KeyboardInterrupt:
             logger.info("收到 KeyboardInterrupt，正在停止 MQTT 服务端...")
         finally:
+            self._unregister_global_topic_list_tick()
             try:
                 self.mqtt_net.stop()
             except Exception:
@@ -241,12 +359,28 @@ def start(config,globals=None):
     request_topic = str(config.get("mqtt_request_topic") or REQUEST_TOPIC)
     reply_topic = str(config.get("mqtt_reply_topic") or DEFAULT_REPLY_TOPIC)
 
+    # 监听 topic 定期报告配置（均可缺省）
+    report_publish_kwargs = config.get("mqtt_global_topic_list_publish_kwargs")
+
     # 直接把原始值交给 MultiMQTTManager，由它统一走 get_standard_public_pem_bytes
     server = MQTTServer(
         server_public_key_bytes=config.get("mqtt_pub_key"),
         request_topic=request_topic,
         reply_topic=reply_topic,
         globals=globals,
+        enable_global_topic_list=bool(config.get("mqtt_enable_global_topic_list", True)),
+        global_topic_list=str(config.get("mqtt_global_topic_list") or DEFAULT_GLOBAL_TOPIC_LIST),
+        global_topic_list_interval=float(
+            config.get("mqtt_global_topic_list_interval") or DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL
+        ),
+        global_topic_list_idle_threshold=float(
+            config.get("mqtt_global_topic_list_idle_threshold") or DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD
+        ),
+        global_topic_list_check_interval=float(
+            config.get("mqtt_global_topic_list_check_interval") or DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL
+        ),
+        global_topic_list_publish_kwargs=report_publish_kwargs,
+        global_topic_list_payload_fn=config.get("mqtt_global_topic_list_payload_fn"),
     )
 
     # logger.info(
