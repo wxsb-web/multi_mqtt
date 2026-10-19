@@ -1,12 +1,32 @@
 #!/usr/bin/env python3
-from multi_mqtt import BROKER_LIST, ConnectionQualityStats,MultiMQTTManager,_describe_public_key
+import copy
+import json
+import logging
+import os
+import tempfile
+import threading
+import time
+import sys
+from pathlib import Path
+
+from ecdsa import VerifyingKey
+from multi_mqtt import (
+    BROKER_LIST,
+    ConnectionQualityStats,
+    MultiMQTTManager,
+    _describe_public_key,
+    get_standard_public_pem_bytes,
+)
 from rpc_executor import utc_ms,stime
-import time,logging,sys
 from rpc_executor import PythonExecutor, format_result
 
 logger = logging.getLogger("Server")
 REQUEST_TOPIC = "sys/device/request"
 DEFAULT_REPLY_TOPIC = "sys/device/response"
+DEFAULT_PUB_KEY='ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOf+GndQauvHHEICc3HTrEeV9bv5S/FTiI64tnMAUPCAaofEbRDmXa8d5R54k8tYOPjt+zdnZJaoSMmJ2pnp4ys='
+RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
+_RPC_CONFIG_LOCK = threading.RLock()
+_ACTIVE_SERVER = None
 
 # --- [global_topic_list 监听 topic 定期报告] 默认配置 ---
 # 命名说明：stats.get_report 是网络连接质量报告；本组是"监听 topic 列表"报告，
@@ -18,6 +38,191 @@ DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL = ConnectionQualityStats.PING_INTERVAL 
 # 发布参数（经 **ka 一路透传到 paho-mqtt）：QoS1+Retain，
 # broker 会连同 QoS 一起保存保留消息，新订阅者上线即收到最新 topic 列表
 DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
+
+
+def _default_rpc_config():
+    return {
+        "broker_list": copy.deepcopy(BROKER_LIST),
+        "request_topic": REQUEST_TOPIC,
+        "pub_key": DEFAULT_PUB_KEY,
+    }
+
+
+def _normalize_rpc_config(config):
+    if not isinstance(config, dict):
+        raise TypeError("RPC 配置必须是 JSON object")
+    unknown = set(config) - {"broker_list","request_topic", "pub_key"}
+    if unknown:
+        raise ValueError("不支持的 RPC 配置项: " + ", ".join(sorted(unknown)))
+
+    result = _default_rpc_config()
+    result.update(config)
+
+    brokers = result["broker_list"]
+    if not isinstance(brokers, list) or not brokers:
+        raise ValueError("broker_list 必须是非空列表")
+    normalized_brokers = []
+    for index, entry in enumerate(brokers):
+        if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+            raise ValueError(f"broker_list[{index}] 必须包含 host、port 和可选认证信息")
+        host, port = entry[:2]
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError(f"broker_list[{index}] 的 host 必须是非空字符串")
+        if isinstance(port, bool) or not isinstance(port, (int, str)):
+            raise ValueError(f"broker_list[{index}] 的 port 必须是整数")
+        if isinstance(port, str) and not port.isdecimal():
+            raise ValueError(f"broker_list[{index}] 的 port 必须是整数")
+        try:
+            port = int(port)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"broker_list[{index}] 的 port 必须是整数") from error
+        if not 1 <= port <= 65535:
+            raise ValueError(f"broker_list[{index}] 的 port 超出有效范围")
+        broker = [host.strip(), port]
+        if len(entry) == 3:
+            auth = entry[2]
+            if not (
+                isinstance(auth, str)
+                or isinstance(auth, (list, tuple)) and len(auth) >= 2
+            ):
+                raise ValueError(f"broker_list[{index}] 的认证信息格式无效")
+            broker.append(list(auth) if isinstance(auth, tuple) else auth)
+        normalized_brokers.append(tuple(broker))
+    result["broker_list"] = normalized_brokers
+
+    topic = result["request_topic"]
+    if not isinstance(topic, str) or not topic.strip():
+        raise ValueError("request_topic 必须是非空字符串")
+    result["request_topic"] = topic.strip()
+
+    pub_key = result["pub_key"]
+    if isinstance(pub_key, bytes):
+        try:
+            pub_key = pub_key.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("pub_key 必须是 UTF-8 公钥字符串") from error
+    if pub_key is not None and not isinstance(pub_key, str):
+        raise ValueError("pub_key 必须是字符串或 null")
+    if pub_key:
+        try:
+            normalized_key = get_standard_public_pem_bytes(pub_key)
+            VerifyingKey.from_pem(normalized_key)
+        except Exception as error:
+            raise ValueError(f"pub_key 无法解析: {error}") from error
+    result["pub_key"] = pub_key or None
+    return result
+
+
+def _json_rpc_config(config):
+    return {
+        "broker_list": [
+            [entry[0], entry[1], list(entry[2]) if isinstance(entry[2], tuple) else entry[2]]
+            if len(entry) == 3 else [entry[0], entry[1]]
+            for entry in config["broker_list"]
+        ],
+        "request_topic": config["request_topic"],
+        "pub_key": config["pub_key"],
+    }
+
+
+def load_rpc_config(path=None):
+    """读取 rpc.json；未显式设置的项使用内置默认值。"""
+    config_path = Path(path) if path is not None else RPC_CONFIG_PATH
+    with _RPC_CONFIG_LOCK:
+        try:
+            with config_path.open("r", encoding="utf-8") as config_file:
+                stored = json.load(config_file)
+        except FileNotFoundError:
+            stored = {}
+        except json.JSONDecodeError as error:
+            raise ValueError(f"RPC 配置文件 JSON 格式错误: {config_path}: {error}") from error
+        if not isinstance(stored, dict):
+            raise ValueError(f"RPC 配置文件必须包含 JSON object: {config_path}")
+        return _normalize_rpc_config(stored)
+
+
+def _write_rpc_config_updates(updates, path=None):
+    """只持久化用户显式修改的项，避免把内置 broker 凭据复制进配置文件。"""
+    config_path = Path(path) if path is not None else RPC_CONFIG_PATH
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with _RPC_CONFIG_LOCK:
+        try:
+            with config_path.open("r", encoding="utf-8") as config_file:
+                stored = json.load(config_file)
+        except FileNotFoundError:
+            stored = {}
+        except json.JSONDecodeError as error:
+            raise ValueError(f"RPC 配置文件 JSON 格式错误: {config_path}: {error}") from error
+        if not isinstance(stored, dict):
+            raise ValueError(f"RPC 配置文件必须包含 JSON object: {config_path}")
+        normalized = _normalize_rpc_config({**load_rpc_config(config_path), **updates})
+        serialized = _json_rpc_config(normalized)
+        stored.update({key: serialized[key] for key in updates})
+        fd, temp_path = tempfile.mkstemp(prefix=".rpc.", suffix=".json", dir=config_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as config_file:
+                json.dump(stored, config_file, ensure_ascii=False, indent=2)
+                config_file.write("\n")
+                config_file.flush()
+                os.fsync(config_file.fileno())
+            os.replace(temp_path, config_path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+
+def rpc_config(**updates):
+    """持久化并立即应用设置，例如 rpc_config(request_topic='sys/new/request')。"""
+    global _ACTIVE_SERVER
+    if not updates:
+        return rpc_config_get()
+    with _RPC_CONFIG_LOCK:
+        current = (
+            _ACTIVE_SERVER.get_rpc_config()
+            if _ACTIVE_SERVER is not None else load_rpc_config()
+        )
+        candidate = _normalize_rpc_config({**current, **updates})
+        previous = _normalize_rpc_config(current)
+        if _ACTIVE_SERVER is not None:
+            _ACTIVE_SERVER.apply_rpc_config(candidate)
+        try:
+            _write_rpc_config_updates(updates)
+        except Exception:
+            if _ACTIVE_SERVER is not None:
+                _ACTIVE_SERVER.apply_rpc_config(previous)
+            raise
+        return rpc_config_get()
+
+
+def rpc_config_get():
+    """返回服务当前实际生效的设置；服务未启动时返回 rpc.json 合并默认值。"""
+    with _RPC_CONFIG_LOCK:
+        if _ACTIVE_SERVER is not None:
+            return _json_rpc_config(_ACTIVE_SERVER.get_rpc_config())
+        return _json_rpc_config(load_rpc_config())
+get_config=get_rpc=get_rpc_config=rpc_get_config=rpc_config_get  
+
+def _rpc_config_with_cli_overrides(request_topic=None, pub=None, brokers=None):
+    """按命令行参数覆盖配置文件，并校验最终 MQTT 配置。"""
+    config = load_rpc_config()
+    if request_topic is not None:
+        config["request_topic"] = request_topic
+    if pub is not None:
+        config["pub_key"] = " ".join(pub) if isinstance(pub, (list, tuple)) else pub
+    if brokers is not None:
+        config["broker_list"] = []
+        for broker in brokers:
+            host, separator, port = broker.rpartition(":")
+            if not separator:
+                raise ValueError(f"broker 格式必须是 host:port: {broker!r}")
+            try:
+                config["broker_list"].append((host, int(port)))
+            except ValueError as error:
+                raise ValueError(f"broker 端口必须是整数: {broker!r}") from error
+    return _normalize_rpc_config(config)
 
 
 def _is_verify_enabled(mqtt_net):
@@ -62,6 +267,7 @@ class MQTTServer:
         # 实例化网络层管理器（enable_crypto 默认为 False）
         self.request_topic = request_topic
         self.reply_topic = reply_topic
+        self._net_options = {}
 
         # 公钥解析统一由 MultiMQTTManager 内部完成（含 OpenSSH -> PEM 转换）。
         # 这里只把原始输入透传进去，不再重复解析，避免结果不一致。
@@ -70,6 +276,13 @@ class MQTTServer:
             net_kwargs["keepalive"] = keepalive
         if max_reconnect_delay is not None:
             net_kwargs["max_reconnect_delay"] = max_reconnect_delay
+        self._net_options = dict(net_kwargs)
+        self._rpc_config = _normalize_rpc_config({
+            "broker_list": brokers,
+            "request_topic": request_topic,
+            "pub_key": server_public_key_bytes,
+        })
+        self._rpc_config_lock = threading.RLock()
         self.mqtt_net = MultiMQTTManager(
             brokers=brokers,
             log_messages=False,  # 每个 broker 不打印原始消息
@@ -106,6 +319,56 @@ class MQTTServer:
             )
         else:
             logger.debug("MQTTServer 初始化完成: 验签未启用, 原因=%s", reason)
+
+    def get_rpc_config(self):
+        with self._rpc_config_lock:
+            return copy.deepcopy(self._rpc_config)
+
+    def apply_rpc_config(self, config):
+        """更新服务设置；broker 或公钥变更时以新网络管理器平滑替换旧实例。"""
+        global _ACTIVE_SERVER
+        candidate = _normalize_rpc_config(config)
+        with self._rpc_config_lock:
+            previous = self._rpc_config
+            network_changed = (
+                candidate["broker_list"] != previous["broker_list"]
+                or candidate["pub_key"] != previous["pub_key"]
+            )
+            topic_changed = candidate["request_topic"] != previous["request_topic"]
+            if network_changed:
+                replacement = MultiMQTTManager(
+                    brokers=candidate["broker_list"],
+                    log_messages=False,
+                    server_public_key_bytes=candidate["pub_key"],
+                    enable_stats=True,
+                    **self._net_options,
+                )
+                replacement.set_on_message(self.handle_message)
+                try:
+                    replacement.start()
+                    if not replacement.clients:
+                        raise RuntimeError("新 MQTT 网络管理器未能创建任何 broker 连接")
+                    replacement.subscribe(candidate["request_topic"])
+                except Exception:
+                    replacement.stop()
+                    raise
+                previous_net = self.mqtt_net
+                self.mqtt_net = replacement
+                self.request_topic = candidate["request_topic"]
+                self._rpc_config = candidate
+                if self.enable_global_topic_list:
+                    replacement.set_periodic_task(
+                        self.global_topic_list_tick,
+                        interval=self.global_topic_list_check_interval,
+                    )
+                previous_net.stop()
+            else:
+                if topic_changed:
+                    self.mqtt_net.subscribe(candidate["request_topic"])
+                    self.mqtt_net.unsubscribe(previous["request_topic"])
+                self.request_topic = candidate["request_topic"]
+                self._rpc_config = candidate
+            _ACTIVE_SERVER = self
 
     # ------------------------------------------------------------------
     # 消息处理：运行在 MultiMQTTManager 的 "MQTTMsgDispatch" 后台线程中。
@@ -307,6 +570,8 @@ class MQTTServer:
                          "（可能是旧分发线程未退出）。")
             return None
 
+        global _ACTIVE_SERVER
+        _ACTIVE_SERVER = self
         self.mqtt_net.subscribe(self.request_topic)
         # 不写死 sleep：首个 broker 一连上就宣布就绪；迟到的 broker 会在
         # on_connect 时按 subscribed_topics 自动补订阅，不会漏消息。
@@ -344,7 +609,7 @@ class MQTTServer:
         return self
 
 
-def start(config,globals=None):
+def start(config=None,globals=None):
     """
     为了导出给 Chaquopy 调用。
     非阻塞启动，返回 server 实例；调用方应保存返回值，避免对象被回收。
@@ -355,7 +620,19 @@ def start(config,globals=None):
     if not isinstance(config, dict):
         raise TypeError("config 必须是 dict")
 
-    request_topic = str(config.get("mqtt_request_topic") or REQUEST_TOPIC)
+    rpc_settings = load_rpc_config()
+    explicit_rpc_settings = {}
+    for key in ("broker_list", "request_topic", "pub_key"):
+        if key in config:
+            explicit_rpc_settings[key] = config[key]
+    if "brokers" in config:
+        explicit_rpc_settings["broker_list"] = config["brokers"]
+    if "mqtt_request_topic" in config:
+        explicit_rpc_settings["request_topic"] = config["mqtt_request_topic"]
+    if "mqtt_pub_key" in config:
+        explicit_rpc_settings["pub_key"] = config["mqtt_pub_key"]
+    rpc_settings = _normalize_rpc_config({**rpc_settings, **explicit_rpc_settings})
+    request_topic = rpc_settings["request_topic"]
     reply_topic = str(config.get("mqtt_reply_topic") or DEFAULT_REPLY_TOPIC)
 
     # 监听 topic 定期报告配置（均可缺省）
@@ -363,7 +640,8 @@ def start(config,globals=None):
 
     # 直接把原始值交给 MultiMQTTManager，由它统一走 get_standard_public_pem_bytes
     server = MQTTServer(
-        server_public_key_bytes=config.get("mqtt_pub_key"),
+        server_public_key_bytes=rpc_settings["pub_key"],
+        brokers=rpc_settings["broker_list"],
         request_topic=request_topic,
         reply_topic=reply_topic,
         globals=globals,
@@ -396,22 +674,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="mqtt http rpc")
     parser.add_argument("--port", "-port", "-p", type=int, default=1177)
     parser.add_argument("--host", "-host", default="0.0.0.0")
-    parser.add_argument("--request_topic", "--topic", "-t", default=REQUEST_TOPIC) # 这里不使用 alias_request_topic 是不想引入client依赖
-
-    _PUB = b"ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBER9c5vu215n+5gv1YjGdm78Nf99wpfqw1fIT8nXib2FLUglq4NBMe7hLp2VOkqv9z00m5Wn+uUADH4zyXLiWzI="
-    # _PUB = b''
-
-    # nargs='*' ：--pub 放到最后，其后所有空格分隔的片段会被拼回一个参数
-    # --pub（后面什么都不给） 或 --pub ""  ->  b''
+    parser.add_argument("--request_topic", "--topic", "-t", default=None)
     parser.add_argument("--pub", "--pubkey", "-pub", nargs="*", default=None)
+    parser.add_argument("--broker", action="append", default=None,
+                        help="追加 broker，格式为 host:port")
     args = parser.parse_args()
-    args.pub = _PUB if args.pub is None else " ".join(args.pub).encode("utf-8")
+    try:
+        rpc_settings = _rpc_config_with_cli_overrides(
+            request_topic=args.request_topic,
+            pub=args.pub,
+            brokers=args.broker,
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
     gms = MQTTServer(
         globals=globals(),
-        server_public_key_bytes=args.pub,
-        request_topic=args.request_topic,
-    )# 为什么放到 ghs后面定义 dir找不到变量？
+        brokers=rpc_settings["broker_list"],
+        server_public_key_bytes=rpc_settings["pub_key"],
+        request_topic=rpc_settings["request_topic"],
+    )#
     gms.mqtt_net.is_windows_cmd=(sys.platform=="win32")
     import server_http
     ghs = server_http.start_rpc_server(
@@ -419,9 +701,6 @@ if __name__ == "__main__":
         ip=args.host,
         globals=globals(),
         locals=locals(),
-        # websocket_handler=editor.websocket,
-        # websocket_path='/ws',
-        # redirect_root='/preview_html(p)',
     )
 
     gms.start()  # 默认 block=True，CLI 下阻塞运行

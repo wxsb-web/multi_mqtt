@@ -61,7 +61,7 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
         self.assertEqual(topic, "global_topic_list")
         self.assertEqual(ka, {"qos": 1, "retain": True})
         self.assertEqual(payload["reason"], "startup")
-        self.assertEqual(payload["type"], "global_topic_list")
+        self.assertNotIn("type", payload)
         self.assertIn(s.request_topic, payload["listen_topics"])
 
     def test_recent_command_suppresses_publish(self):

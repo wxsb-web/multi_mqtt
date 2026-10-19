@@ -3,7 +3,7 @@ import sys, io, urllib.parse, threading, traceback, struct, base64, hashlib, soc
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-# import rpc_executor
+import rpc_executor
 from rpc_executor import PythonExecutor, format_result ,stime
 
 _stdout_lock = threading.Lock()

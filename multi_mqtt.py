@@ -1469,6 +1469,15 @@ class MultiMQTTManager:
             if c.is_connected():
                 c.subscribe(topic, **ka)
 
+    def unsubscribe(self, topic: str, **ka):
+        """取消订阅 topic，并阻止后续重连时自动重新订阅。"""
+        with self.lock:
+            self.subscribed_topics.discard(topic)
+            clients_snapshot = list(self.clients.items())
+        for host, c in clients_snapshot:
+            if c.is_connected():
+                c.unsubscribe(topic, **ka)
+
     def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None, **ka):
         """广播传输消息；qos/retain 等额外参数经 **ka 原样透传给 paho-mqtt Client.publish。"""
         out_payload = payload_dict.copy()

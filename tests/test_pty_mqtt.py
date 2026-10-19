@@ -1660,6 +1660,7 @@ class SelectionAutoUnstickTests(unittest.TestCase):
         time.sleep(0.08)
         self.assertEqual(pcm._filter_injected_esc(b"\x1b"), b"\x1b")
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows console API only")
     def test_cancel_only_when_console_is_foreground(self):
         import ctypes
         k = ctypes.windll.kernel32
@@ -1671,6 +1672,7 @@ class SelectionAutoUnstickTests(unittest.TestCase):
             self.assertFalse(pcm._cancel_console_selection())
             kb.assert_not_called()  # 非前台绝不发 ESC（会打进别的程序）
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows console API only")
     def test_cancel_sends_esc_down_up_and_arms_guard(self):
         import ctypes
         k = ctypes.windll.kernel32
@@ -1690,6 +1692,7 @@ class SelectionAutoUnstickTests(unittest.TestCase):
         with mock.patch.object(pcm.sys, "platform", "linux"):
             self.assertFalse(pcm._cancel_console_selection())
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows console API only")
     def test_enable_vt_does_not_touch_input_mode(self):
         # 回归：QuickEdit 必须保留——_enable_output_vt 只许操作输出句柄
         import ctypes
