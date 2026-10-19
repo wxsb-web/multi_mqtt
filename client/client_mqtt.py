@@ -8,7 +8,8 @@ for _p in (os.path.dirname(_HERE), _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from multi_mqtt import MultiMQTTManager, get_req_id, utc_ms, get_standard_pem_bytes,get_duplicated_kargs
+from multi_mqtt import MultiMQTTManager, get_req_id, get_standard_pem_bytes,get_duplicated_kargs
+from rpc_executor import utc_ms
 
 logger = logging.getLogger(__file__)
 from server_mqtt import REQUEST_TOPIC, DEFAULT_REPLY_TOPIC as REPLY_TOPIC

@@ -20,7 +20,6 @@ class ServerHttpTests(unittest.TestCase):
             "ThreadedHTTPServer",
             "WebSocket",
             "get_bmp_bytes",
-            "pretty_format",
             "qpsu",
             "stime",
         ):

@@ -234,19 +234,38 @@ class _redirect_stdout:
         sys.stdout = self.previous
 
 
-def format_result(value):
-    if isinstance(value, str):
-        return value
+def format_result(obj, width=120):
+    if isinstance(obj, str):
+        return obj
     try:
-        import importlib
-        pretty = importlib.import_module("IPython.lib.pretty").pretty
-        return pretty(value, max_width=120)
+        from IPython.lib.pretty import pretty
+        return pretty(obj, max_width=width)
     except ImportError:
         try:
             from pprint import pformat
-            return pformat(value, width=120)
-        except ImportError:
-            return repr(value)
+            return pformat(obj, width=width)
+        except Exception:
+            return repr(obj)
+
+import time
+def stime(ms=0, format='%Y-%m-%d__%H.%M.%S', ms_splitor='__.'):
+    """可读毫秒级时间戳。ms 传整数毫秒；不传则取当前 UTC 毫秒。"""
+    if not ms:
+        ms = utc_ms()
+    elif isinstance(ms, float) and ms < 1e11:
+        # 看起来是 time.time() 的秒级浮点，转成整数毫秒
+        ms = round(ms * 1000)
+    else:
+        ms = int(ms)
+    sec, milli = divmod(ms, 1000)
+    
+    if ms_splitor:ms_splitor=ms_splitor + f"{milli:03d}"
+    return time.strftime(format, time.localtime(sec)) + ms_splitor
+
+def utc_ms():
+    """Return the current UTC Unix timestamp in integer milliseconds."""
+    return time.time_ns() // 1_000_000
+            
 
 def http_import(url, save_to=''): # 定义核心导入函数
     import urllib.request, zipfile, io, sys, importlib, importlib.abc, importlib.machinery, os # 导入必要标准库

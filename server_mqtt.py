@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-from multi_mqtt import BROKER_LIST, ConnectionQualityStats, MultiMQTTManager, stime, utc_ms, _describe_public_key
+from multi_mqtt import BROKER_LIST, ConnectionQualityStats,MultiMQTTManager,_describe_public_key
+from rpc_executor import utc_ms,stime
 import time,logging,sys
 from rpc_executor import PythonExecutor, format_result
 

@@ -3,7 +3,8 @@ import sys, io, urllib.parse, threading, traceback, struct, base64, hashlib, soc
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-import rpc_executor
+# import rpc_executor
+from rpc_executor import PythonExecutor, format_result ,stime
 
 _stdout_lock = threading.Lock()
 
@@ -28,26 +29,6 @@ def get_bmp_bytes(rgb=None, size=(16, 16)):
         padding = b'\x00' * (bytes_per_row - len(row))
         pixels += row + padding
     return bmp_header + bmp_info + pixels
-
-
-def pretty_format(obj, width=120):
-    if isinstance(obj, str):
-        return obj
-    try:
-        from IPython.lib.pretty import pretty
-        return pretty(obj, max_width=width)
-    except ImportError:
-        try:
-            from pprint import pformat
-            return pformat(obj, width=width)
-        except Exception:
-            return repr(obj)
-
-
-def stime():
-    import time
-    ft = time.time()
-    return time.strftime('%Y-%m-%d__%H.%M.%S', time.localtime(ft)) + '__.' + f"{ft:.3f}".split('.')[1]
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -152,7 +133,7 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         line = (f"[RPC] {stime()[12:]}  {self.client_address[0]}:"
-                f"{self.client_address[1]} {format % args}\n")
+                f"{self.client_address[1]} {format % args}")
         sink = self.log_sink
         if sink is not None:
             try:
@@ -345,7 +326,7 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 else:
                     result_obj = f"no 'r' variable, locals keys: {list(namespace.keys())}"
 
-                result_str = pretty_format(result_obj)
+                result_str = format_result(result_obj)
                 self.send_response(response.status)
                 for key, value in response.headers.items():
                     self.send_header(key, value)
@@ -421,7 +402,7 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     # 只创建一个 PythonExecutor，请求级上下文通过 execute(globals=...) 注入。
     # 不在这里强写 __name__：执行器内部用 setdefault，模块字典自带 __name__
     # 不会被覆盖；自建空字典时由执行器补成 __rpc_exec__。
-    RPCRequestHandler.executor = rpc_executor.PythonExecutor(
+    RPCRequestHandler.executor = PythonExecutor(
         globals=persistent_ns,
         main_loop=main_loop,
     )

@@ -39,6 +39,8 @@ from collections import OrderedDict
 from paho.mqtt import client as mqtt_client
 from paho.mqtt.enums import CallbackAPIVersion
 
+from rpc_executor import stime
+
 # 组合方（如 pty_client_mqtt）需要把全部日志导去自己的环形缓冲/Web 控制台，
 # 而不是让本模块在 import 时往 root 挂一个写 stderr 的 StreamHandler（会插进
 # PTY 远端画面）。约定：import 本模块前设置环境变量 CMQ_NO_STDERR_LOG=1，
@@ -124,24 +126,6 @@ def get_duplicated_kargs(ka,*keys,default=GET_DUPLICATED_KARGS_DEFAULT,no_pop=Fa
     if len(r)==1:return r[0]
     raise ValueError('kargs matched keys len <> 1',ka,keys)
 # get_ka=get_multi_ka=getDuplicatedKargs=getKargsDuplicated=getKArgsDuplicated=get_kargs_duplicated=get_duplicated_kargs
-
-def stime(ms=0, format='%Y-%m-%d__%H.%M.%S', ms_splitor='__.'):
-    """可读毫秒级时间戳。ms 传整数毫秒；不传则取当前 UTC 毫秒。"""
-    if not ms:
-        ms = utc_ms()
-    elif isinstance(ms, float) and ms < 1e11:
-        # 看起来是 time.time() 的秒级浮点，转成整数毫秒
-        ms = round(ms * 1000)
-    else:
-        ms = int(ms)
-    sec, milli = divmod(ms, 1000)
-    
-    if ms_splitor:ms_splitor=ms_splitor + f"{milli:03d}"
-    return time.strftime(format, time.localtime(sec)) + ms_splitor
-
-def utc_ms():
-    """Return the current UTC Unix timestamp in integer milliseconds."""
-    return time.time_ns() // 1_000_000
 
 def get_req_id(ms=0):
     """ get_req_id 的返回值只精确到了毫秒，如果单片机在同一毫秒内连发两条不同状态，后一条会被 TTLCache 误杀丢弃。

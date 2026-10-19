@@ -21,8 +21,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from multi_mqtt import BROKER_LIST, ConnectionQualityStats, utc_ms
+from multi_mqtt import BROKER_LIST, ConnectionQualityStats
 from server_mqtt import DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL, MQTTServer
+from rpc_executor import utc_ms
 
 LIVE_BROKER_CANDIDATES = [                    # 按序尝试，选第一个可连上的公共 broker
     ("broker.codenow.cn", 1883),
