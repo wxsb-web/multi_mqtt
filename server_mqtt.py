@@ -126,7 +126,7 @@ class MQTTServer:
 
             req_id = data.get("req_id")
             reply_topic = data.get("reply_topic") or self.reply_topic
-            code = data.get("code", data.get("payload"))
+            code = data.get("code",None)
 
             if code is not None:
                 # 收到下发指令：刷新指令时间戳（距上次指令超过 command_idle_threshold
@@ -135,14 +135,7 @@ class MQTTServer:
 
             verify_enabled, _ = _is_verify_enabled(self.mqtt_net)
 
-            logger.info(
-                "⚡ [%s] [服务端处理请求] req_id=%s (首发节点: %s) , has_code=%s , verify=%s",
-                stime(),
-                req_id,
-                rx_broker,
-                bool(code),
-                verify_enabled,
-            )
+            logger.info(f"⚡req_id={req_id} 首发:{rx_broker}),code={bool(code)},verify={verify_enabled}"    )
 
             if code is None:
                 response_data = {
@@ -150,7 +143,7 @@ class MQTTServer:
                     "r": None,
                     "stdout": "",
                     "ok": False,
-                    "error": "missing code/payload",
+                    "error": "missing code",
                     "server_time": utc_ms(),
                     "server_from": rx_broker,
                 }
@@ -159,14 +152,14 @@ class MQTTServer:
                 return
 
             if not isinstance(code, str):
-                logger.warning("code/payload 非字符串，忽略: req_id=%s type=%s",
+                logger.warning("code 非字符串，忽略: req_id=%s type=%s",
                                req_id, type(code))
                 response_data = {
                     "req_id": req_id,
                     "r": None,
                     "stdout": "",
                     "ok": False,
-                    "error": "code/payload must be str",
+                    "error": "code must be str",
                     "server_time": utc_ms(),
                     "server_from": rx_broker,
                 }
@@ -187,30 +180,25 @@ class MQTTServer:
             ):
                 req_id = req_id.split("|", 1)[0]
 
-            ok = bool(execution.get("ok"))
-            response_data = {
+            # ok = bool(execution.get("ok"))
+            execution.update({
                 "req_id": req_id,
-                "r": format_result(execution.get("r")) if ok else None,
-                "stdout": execution.get("stdout", ""),
-                "ok": ok,
                 "server_time": server_time,
-                "server_from": rx_broker,
+                "server_from": rx_broker,})
+                # "r": format_result(execution.get("r")),
+                # "stdout": execution.get("stdout", ""),
+                # "ok": ok,
                 # "latency_send": server_time - data.get("timestamp")
                 # client/server 时间不同步，测量值不是真实延迟
-            }
-            if not ok:
-                response_data["error"] = execution.get("error", "unknown error")
+            # }
+            # if not ok:
+                # response_data["error"] = execution.get("error", "unknown error")
 
             if reply_topic:
-                self.mqtt_net.publish_broadcast(reply_topic, response_data)
+                self.mqtt_net.publish_broadcast(reply_topic,execution)
 
-        except Exception:
-            # 兜底：绝不让异常冒到 MultiMQTTManager 的分发线程
-            logger.exception(
-                "处理 MQTT 请求失败: topic=%s rx_broker=%s",
-                topic,
-                rx_broker,
-            )
+        except Exception as handle_message_error:# 兜底：绝不让异常冒到 MultiMQTTManager 的分发线程 logger.exception(自动追加完整 traceback
+            logger.exception(f"处理MQTT请求失败:topic={topic} rx_broker={rx_broker} {handle_message_error}")
 
     # ------------------------------------------------------------------
     # global_topic_list 定期报告（可配置，见 __init__ / start(config)）
@@ -235,7 +223,7 @@ class MQTTServer:
             "request_topic": self.request_topic,
             "reply_topic": self.reply_topic,
             # "server_time": utc_ms(),
-            "server_time_str": stime(),
+            "stime": stime(),
         }
 
     def _publish_global_topic_list(self, reason: str):
@@ -325,7 +313,7 @@ class MQTTServer:
 
         verify_enabled, verify_reason = _is_verify_enabled(self.mqtt_net)
         logger.info(
-            "🚀 [%s] 服务端已就绪（在线 broker %d/%d），正在监听: %s , reply_topic=%s , mqtt_pub_key=%s , 验签=%s",
+            "🚀 [%s] 服务端已就绪（在线 broker %d/%d），正在监听:%s,reply_topic=%s ,pub=%s , 验签=%s",
             stime(),
             online, len(getattr(self.mqtt_net, "clients", {}) or {}),
             self.request_topic,

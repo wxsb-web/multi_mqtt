@@ -70,7 +70,7 @@ PERIODIC_WAKEUP_SENTINEL = (PERIODIC_WAKEUP_TOPIC, None, None)
 #   ]
 # =========================================================================
 BROKER_LIST = [
-    ("mqtt.iotbhai.io", 1883),                  # RTT: 429.3 ms | 建连:  597.7 ms (个人站点？实际上不能用。当作测试也挺好)
+    # ("mqtt.iotbhai.io", 1883),                  # RTT: 429.3 ms | 建连:  597.7 ms (个人站点？实际上不能用。当作测试也挺好)
     ("broker.mqtt-dashboard.com", 1883),        # RTT: 307.1 ms | 建连:  465.6 ms (HiveMQ Dashboard，综合体验佳)
     ("mqtt.touchsocket.net", 1883),             # RTT:  29.5 ms | 建连:  293.4 ms (b 视频)
     ("broker.codenow.cn", 1883),                # RTT:  31.4 ms | 建连:  110.1 ms (CodeNow 国内公共MQTT)
@@ -83,8 +83,9 @@ BROKER_LIST = [
     ("mqtt.tyckr.io", 1883),                    # RTT: 436.0 ms | 建连:  596.2 ms (Tyckr)
     ("public-mqtt-broker.bevywise.com", 1883),  # RTT: 451.3 ms | 建连:  575.9 ms (Bevywise)
     ("demo.tbmq.io", 1883, ["demo", ""]),       # ThingsBoard TBMQ可以，下面4个全部不能用
+    ('public.runmqtt.com', 1883, ["ajbkvbp/device",'UcLNzAPGyxJbjPKF']),# mqtt.pro https://runmqtt.com/zh-Hans/public-broker
+    ("mqtt.flespi.io", 1883,[b'\xe6\x97\xa6\xa7\xf9\xf5\x84\xa2\x94\x95\xc2\xa7\x84\xc8\xe6\x96\xf9\x99\xa6\x95\xe5\xe9\x84\xa8\xa2\xd3\xa6\xe5\x89\x88\xe5\x81\xa2\xc3\xd8\x87\x85\x85\xf3\x84\xf9\x82\xf8\xf0\xd1\x82\x89\x91\x93\xe5\xd1\xd7\x95\xe8\xc2\xf7\xd7\xe7\xe6\x85\xd6\x82\x97\xf5'.decode('cp500'), ""]),#github q5  Flespi，将 YOUR_FLESPI_TOKEN 替换为注册后获取的 Token[reference:2]
     # ("public.mqtt.pro", 1883, ["ajbkvbp/demo", "OCDWjjOSlSexcWRG"]),        # MQTT.pro 公共沙箱，凭据定期轮换[reference:1]
-    # ("mqtt.flespi.io", 1883, ["stPwSVV73Eqw5LSv0iMXbc4EguS7JyuZR9lxU5uLxI5tiNM8ToTVqNpu85pFtJv9", ""]),                     # Flespi，将 YOUR_FLESPI_TOKEN 替换为注册后获取的 Token[reference:2]
     # ("io.adafruit.com", 1883, ["nagecubic","aio_"+"EiZX7901W4K4INtv13RSH6jqkEKl"]),        # Adafruit IO，需注册获取 #改成"aio_"+" 不能直接push error: GH013: Repository rule violations found for refs/heads/master.  GITHUB PUSH PROTECTION
     # ("mqtt.ably.io", 1883, ['yMJ3VQ.PxwimQ','Vw4oM1CCMxx0tm8xTIZtda72vNj3SmNkLbVPipSt5Ek']), # Ably，API Key 按 username:password 拆分填入[reference:4]
 
