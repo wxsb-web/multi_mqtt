@@ -8,6 +8,7 @@ import threading
 import time
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ecdsa import VerifyingKey
 from multi_mqtt import (
@@ -24,6 +25,7 @@ logger = logging.getLogger("Server")
 REQUEST_TOPIC = "sys/device/request"
 DEFAULT_REPLY_TOPIC = "sys/device/response"
 DEFAULT_PUB_KEY='ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOf+GndQauvHHEICc3HTrEeV9bv5S/FTiI64tnMAUPCAaofEbRDmXa8d5R54k8tYOPjt+zdnZJaoSMmJ2pnp4ys='
+DEFAULT_GLOBAL_TOPIC_URL = "https://qmm.pythonanywhere.com/"
 RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
 _RPC_CONFIG_LOCK = threading.RLock()
 _ACTIVE_SERVER = None
@@ -45,18 +47,16 @@ def _default_rpc_config():
         "broker_list": copy.deepcopy(BROKER_LIST),
         "request_topic": REQUEST_TOPIC,
         "pub_key": DEFAULT_PUB_KEY,
+        "global_topic_url": DEFAULT_GLOBAL_TOPIC_URL,
     }
 
 
 def _normalize_rpc_config(config):
     if not isinstance(config, dict):
         raise TypeError("RPC 配置必须是 JSON object")
-    unknown = set(config) - {"broker_list","request_topic", "pub_key"}
-    if unknown:
-        raise ValueError("不支持的 RPC 配置项: " + ", ".join(sorted(unknown)))
-
     result = _default_rpc_config()
-    result.update(config)
+    known_keys = set(result)
+    result.update({key: value for key, value in config.items() if key in known_keys})
 
     brokers = result["broker_list"]
     if not isinstance(brokers, list) or not brokers:
@@ -110,6 +110,14 @@ def _normalize_rpc_config(config):
         except Exception as error:
             raise ValueError(f"pub_key 无法解析: {error}") from error
     result["pub_key"] = pub_key or None
+    global_topic_url = result["global_topic_url"]
+    if not isinstance(global_topic_url, str) or not global_topic_url.strip():
+        raise ValueError("global_topic_url 必须是非空 HTTP(S) URL")
+    global_topic_url = global_topic_url.strip()
+    parsed_url = urlsplit(global_topic_url)
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+        raise ValueError("global_topic_url 必须是非空 HTTP(S) URL")
+    result["global_topic_url"] = global_topic_url
     return result
 
 
@@ -122,6 +130,7 @@ def _json_rpc_config(config):
         ],
         "request_topic": config["request_topic"],
         "pub_key": config["pub_key"],
+        "global_topic_url": config["global_topic_url"],
     }
 
 
@@ -157,7 +166,7 @@ def _write_rpc_config_updates(updates, path=None):
             raise ValueError(f"RPC 配置文件必须包含 JSON object: {config_path}")
         normalized = _normalize_rpc_config({**load_rpc_config(config_path), **updates})
         serialized = _json_rpc_config(normalized)
-        stored.update({key: serialized[key] for key in updates})
+        stored.update({key: serialized[key] for key in updates if key in serialized})
         fd, temp_path = tempfile.mkstemp(prefix=".rpc.", suffix=".json", dir=config_path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as config_file:
@@ -205,7 +214,9 @@ def rpc_config_get():
         return _json_rpc_config(load_rpc_config())
 get_config=get_rpc=get_rpc_config=rpc_get_config=rpc_config_get  
 
-def _rpc_config_with_cli_overrides(request_topic=None, pub=None, brokers=None):
+def _rpc_config_with_cli_overrides(
+    request_topic=None, pub=None, brokers=None, global_topic_url=None
+):
     """按命令行参数覆盖配置文件，并校验最终 MQTT 配置。"""
     config = load_rpc_config()
     if request_topic is not None:
@@ -222,6 +233,8 @@ def _rpc_config_with_cli_overrides(request_topic=None, pub=None, brokers=None):
                 config["broker_list"].append((host, int(port)))
             except ValueError as error:
                 raise ValueError(f"broker 端口必须是整数: {broker!r}") from error
+    if global_topic_url is not None:
+        config["global_topic_url"] = global_topic_url
     return _normalize_rpc_config(config)
 
 
@@ -263,6 +276,7 @@ class MQTTServer:
         global_topic_list_check_interval=DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL,
         global_topic_list_publish_kwargs=None,
         global_topic_list_payload_fn=None,
+        global_topic_url=DEFAULT_GLOBAL_TOPIC_URL,
     ):
         # 实例化网络层管理器（enable_crypto 默认为 False）
         self.request_topic = request_topic
@@ -281,6 +295,7 @@ class MQTTServer:
             "broker_list": brokers,
             "request_topic": request_topic,
             "pub_key": server_public_key_bytes,
+            "global_topic_url": global_topic_url,
         })
         self._rpc_config_lock = threading.RLock()
         self.mqtt_net = MultiMQTTManager(
@@ -308,6 +323,7 @@ class MQTTServer:
         )
         # 自定义报告函数: fn(server) -> dict；None 则用默认的监听 topic 列表
         self.global_topic_list_payload_fn = global_topic_list_payload_fn
+        self.global_topic_url = self._rpc_config["global_topic_url"]
         self._last_gtl_publish_ts = 0.0           # 上次发布报告的时间，0=尚未发布过
         self.last_command_ts = 0.0                # 最近一次收到控制指令的时间，0=从未收到
 
@@ -355,6 +371,7 @@ class MQTTServer:
                 previous_net = self.mqtt_net
                 self.mqtt_net = replacement
                 self.request_topic = candidate["request_topic"]
+                self.global_topic_url = candidate["global_topic_url"]
                 self._rpc_config = candidate
                 if self.enable_global_topic_list:
                     replacement.set_periodic_task(
@@ -367,6 +384,7 @@ class MQTTServer:
                     self.mqtt_net.subscribe(candidate["request_topic"])
                     self.mqtt_net.unsubscribe(previous["request_topic"])
                 self.request_topic = candidate["request_topic"]
+                self.global_topic_url = candidate["global_topic_url"]
                 self._rpc_config = candidate
             _ACTIVE_SERVER = self
 
@@ -508,7 +526,7 @@ class MQTTServer:
             body = body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "%0A")  # 换行折叠为字面量 %0A
             body_q = urllib.parse.quote(body, safe="")  # 完整百分号编码，防止引号/反斜杠破坏远端 r'''...'''
             code_path = "with%20open('topics','a')%20as%20f:" f"f.write(r'''{body_q}%0A''');r=f.tell()"  # 按远端约定拼路径，仅空格写 %20
-            url = "https://qmm.pythonanywhere.com/" + code_path  # 远端执行后把 body 追加进 topics
+            url = self.global_topic_url.rstrip("/") + "/" + code_path
             req = urllib.request.Request(url, method="GET",)
             with urllib.request.urlopen(req, timeout=9) as resp:  # 超时=9s
                 resp.read()  # 读空响应体，及时释放连接
@@ -622,7 +640,7 @@ def start(config=None,globals=None):
 
     rpc_settings = load_rpc_config()
     explicit_rpc_settings = {}
-    for key in ("broker_list", "request_topic", "pub_key"):
+    for key in ("broker_list", "request_topic", "pub_key", "global_topic_url"):
         if key in config:
             explicit_rpc_settings[key] = config[key]
     if "brokers" in config:
@@ -643,6 +661,7 @@ def start(config=None,globals=None):
         server_public_key_bytes=rpc_settings["pub_key"],
         brokers=rpc_settings["broker_list"],
         request_topic=request_topic,
+        global_topic_url=rpc_settings["global_topic_url"],
         reply_topic=reply_topic,
         globals=globals,
         enable_global_topic_list=bool(config.get("mqtt_enable_global_topic_list", True)),
@@ -678,12 +697,14 @@ if __name__ == "__main__":
     parser.add_argument("--pub", "--pubkey", "-pub", nargs="*", default=None)
     parser.add_argument("--broker", action="append", default=None,
                         help="追加 broker，格式为 host:port")
+    parser.add_argument("--global_topic_url", default=None)
     args = parser.parse_args()
     try:
         rpc_settings = _rpc_config_with_cli_overrides(
             request_topic=args.request_topic,
             pub=args.pub,
             brokers=args.broker,
+            global_topic_url=args.global_topic_url,
         )
     except ValueError as error:
         parser.error(str(error))
@@ -693,6 +714,7 @@ if __name__ == "__main__":
         brokers=rpc_settings["broker_list"],
         server_public_key_bytes=rpc_settings["pub_key"],
         request_topic=rpc_settings["request_topic"],
+        global_topic_url=rpc_settings["global_topic_url"],
     )#
     gms.mqtt_net.is_windows_cmd=(sys.platform=="win32")
     import server_http

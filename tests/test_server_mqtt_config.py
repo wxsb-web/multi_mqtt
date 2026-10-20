@@ -39,6 +39,9 @@ class FakeMQTTManager:
         self.subscribed_topics.add(topic)
         self.subscribed.append(topic)
 
+    def publish_broadcast(self, _topic, _payload, **_kwargs):
+        pass
+
     def unsubscribe(self, topic):
         self.subscribed_topics.discard(topic)
         self.unsubscribed.append(topic)
@@ -140,6 +143,46 @@ class ServerMqttConfigTests(unittest.TestCase):
         config = server_mqtt._rpc_config_with_cli_overrides(pub=[])
 
         self.assertIsNone(config["pub_key"])
+
+    def test_config_ignores_unknown_fields_and_defaults_missing_values(self):
+        self.config_path.write_text(
+            json.dumps({
+                "request_topic": "partial/request",
+                "obsolete_option": "ignored",
+            }),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+
+        self.assertEqual(config["request_topic"], "partial/request")
+        self.assertEqual(config["broker_list"], server_mqtt._default_rpc_config()["broker_list"])
+        self.assertEqual(config["pub_key"], server_mqtt.DEFAULT_PUB_KEY)
+        self.assertEqual(config["global_topic_url"], server_mqtt.DEFAULT_GLOBAL_TOPIC_URL)
+        self.assertNotIn("obsolete_option", config)
+
+    def test_global_topic_url_update_is_saved_and_used(self):
+        url = "https://reports.example.net/topics/"
+        result = server_mqtt.rpc_config(global_topic_url=url)
+
+        self.assertEqual(result["global_topic_url"], url)
+        self.assertEqual(self.server.global_topic_url, url)
+        self.assertEqual(
+            json.loads(self.config_path.read_text())["global_topic_url"],
+            url,
+        )
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
+            self.server._publish_global_topic_list("test")
+        request = urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.startswith(url + "with%20open"))
+
+    def test_invalid_global_topic_url_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "HTTP\\(S\\) URL"):
+            server_mqtt.rpc_config(global_topic_url="ftp://reports.example.net/")
+        self.assertFalse(self.config_path.exists())
 
     def test_rpc_functions_are_callable_over_http(self):
         import server_http
