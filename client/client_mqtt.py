@@ -121,12 +121,24 @@ class MQTTClientNode:
     def request(self, payload: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_TIMEOUT,
                 client_private_key_bytes=None, allow_no_server_pubkey_response: bool = None,
                 reply_topic: str = REPLY_TOPIC, gather_window: float = 0.0,
-                republish_delays=()):
+                republish_delays=(), min_broker_count: int = 0):
         none={}
         if client_private_key_bytes is None:
             client_private_key_bytes = self.client_private_key_bytes or getattr(self.mqtt_net, "client_private_key_bytes", None)
         if allow_no_server_pubkey_response is None:
             allow_no_server_pubkey_response = self.allow_no_server_pubkey_response
+        if not isinstance(min_broker_count, int):
+            raise TypeError("min_broker_count 必须是整数")
+        if min_broker_count < 0:
+            raise ValueError("min_broker_count 不能小于 0")
+        if min_broker_count:
+            online = self.mqtt_net.wait_connected(
+                min_count=min_broker_count, timeout=timeout)
+            if online < min_broker_count:
+                logger.error(
+                    "❌ [Broker 未就绪] 需要至少 %d 个在线 Broker，当前只有 %d 个",
+                    min_broker_count, online)
+                return none
         ms = utc_ms()
         req_id = get_req_id(ms)
         start_time = time.perf_counter()
@@ -148,17 +160,24 @@ class MQTTClientNode:
                     self.pending_requests.pop(req_id, None)
                 return none
         def _do_publish():
-            self.mqtt_net.publish_broadcast(
+            return self.mqtt_net.publish_broadcast(
                 request_topic, req_data,
                 client_private_key_bytes=client_private_key_bytes)
 
         try:
-            _do_publish()
+            published = _do_publish()
         except Exception as exc:
             with self.lock:
                 self.pending_requests.pop(req_id, None)
             logger.error(f"❌ [请求发送失败] {request_topic} req_id={req_id} error={exc}")
             print(f"[ERROR] 请求发送失败: {exc}")
+            return none
+        if min_broker_count and published < min_broker_count:
+            with self.lock:
+                self.pending_requests.pop(req_id, None)
+            logger.error(
+                "❌ [Broker 发送不足] 至少需要向 %d 个 Broker 成功发送，实际成功 %s 个",
+                min_broker_count, published)
             return none
         # 首包未回前的补发计划：publish_broadcast 是 QoS0 且只投递给当前已
         # 连接的 broker，启动瞬间往往只有 1 个 broker 在线，之后几秒内其余
@@ -314,7 +333,7 @@ class MQTTClientNode:
 
 def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_TIMEOUT,
         client_private_key_bytes=None, allow_no_server_pubkey_response: bool = False,
-        reply_topic: str = REPLY_TOPIC, **ka):
+        reply_topic: str = REPLY_TOPIC, min_broker_count:int=11, **ka):
     """Execute code through a lazily started shared MQTT client."""
     global _default_client
     code=get_duplicated_kargs(ka,*alias_code,default=code)
@@ -335,6 +354,7 @@ def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_
         client_private_key_bytes=client_private_key_bytes,
         allow_no_server_pubkey_response=allow_no_server_pubkey_response,
         reply_topic=reply_topic,
+        min_broker_count=min_broker_count,
     )
 
 def stop():

@@ -1479,7 +1479,7 @@ class MultiMQTTManager:
                 c.unsubscribe(topic, **ka)
 
     def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None, **ka):
-        """广播传输消息；qos/retain 等额外参数经 **ka 原样透传给 paho-mqtt Client.publish。"""
+        """广播传输消息并返回成功入队的 Broker 数；QoS 等参数透传给 paho。"""
         out_payload = payload_dict.copy()
         if client_private_key_bytes:
             try:
@@ -1510,9 +1510,13 @@ class MultiMQTTManager:
         payload_str = process_cipher(out_payload, decrypt=False, enabled=self.enable_crypto)
         with self.lock:
             clients_snapshot = list(self.clients.items())
+        published = 0
         for host, c in clients_snapshot:
             if c.is_connected():
-                c.publish(topic, payload_str, **ka)
+                info = c.publish(topic, payload_str, **ka)
+                if info.rc == mqtt_client.MQTT_ERR_SUCCESS:
+                    published += 1
+        return published
 
     def stop(self):
         self._stop_event.set()

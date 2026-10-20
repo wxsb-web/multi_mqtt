@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,6 +14,72 @@ from multi_mqtt import MultiMQTTManager, get_standard_pem_bytes
 
 
 class ClientMqttTests(unittest.TestCase):
+    def test_request_waits_for_minimum_brokers_and_checks_publish_count(self):
+        node = client_mqtt.MQTTClientNode()
+        calls = []
+
+        class _FakeNet:
+            client_private_key_bytes = None
+
+            def wait_connected(self, min_count, timeout):
+                calls.append(("wait", min_count, timeout))
+                return min_count
+
+            def publish_broadcast(self, topic, payload, **_kwargs):
+                calls.append(("publish", topic))
+                node._on_message(
+                    client_mqtt.REPLY_TOPIC,
+                    {"req_id": payload["req_id"], "ok": True},
+                    "broker-test",
+                )
+                return 5
+
+        node.mqtt_net = _FakeNet()
+        response = node.request("3", timeout=0.2, min_broker_count=5)
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(calls, [
+            ("wait", 5, 0.2),
+            ("publish", client_mqtt.REQUEST_TOPIC),
+        ])
+
+    def test_request_does_not_publish_when_minimum_brokers_are_unavailable(self):
+        node = client_mqtt.MQTTClientNode()
+        published = []
+
+        class _FakeNet:
+            client_private_key_bytes = None
+
+            def wait_connected(self, min_count, timeout):
+                return min_count - 1
+
+            def publish_broadcast(self, *_args, **_kwargs):
+                published.append(True)
+
+        node.mqtt_net = _FakeNet()
+        response = node.request("3", timeout=0.01, min_broker_count=5)
+
+        self.assertEqual(response, {})
+        self.assertEqual(published, [])
+
+    def test_request_does_not_wait_for_response_if_publish_count_is_too_low(self):
+        node = client_mqtt.MQTTClientNode()
+
+        class _FakeNet:
+            client_private_key_bytes = None
+
+            def wait_connected(self, min_count, timeout):
+                return min_count
+
+            def publish_broadcast(self, *_args, **_kwargs):
+                return 4
+
+        node.mqtt_net = _FakeNet()
+        response = node.request("3", timeout=0.01, min_broker_count=5)
+
+        self.assertEqual(response, {})
+        self.assertEqual(node.pending_requests, {})
+
     def test_fallback_input_ignores_invalid_python(self):
         answers = [
             "/workspaces/build_xime_home/git.py push https://example.com/repo -m",
@@ -222,6 +289,28 @@ class WaitConnectedTests(unittest.TestCase):
         online = mgr.wait_connected(min_count=1, timeout=0.2,
                                     poll_interval=0.02)
         self.assertEqual(online, 1)
+
+
+class PublishBroadcastTests(unittest.TestCase):
+    def test_returns_number_of_brokers_that_accepted_publish(self):
+        class _FakeClient:
+            def __init__(self, rc):
+                self.rc = rc
+
+            def is_connected(self):
+                return True
+
+            def publish(self, *_args, **_kwargs):
+                return SimpleNamespace(rc=self.rc)
+
+        mgr = MultiMQTTManager(brokers=[], enable_stats=False)
+        mgr.clients = {
+            "accepted": _FakeClient(0),
+            "rejected": _FakeClient(15),
+            "also-accepted": _FakeClient(0),
+        }
+
+        self.assertEqual(mgr.publish_broadcast("topic", {"value": 1}), 2)
 
 
 if __name__ == "__main__":
