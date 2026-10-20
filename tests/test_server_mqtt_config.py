@@ -1,5 +1,6 @@
 import ast
 import json
+import types
 import sys
 import tempfile
 import unittest
@@ -107,6 +108,46 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(stored["broker_list"], [["new-broker.example", 1884]])
         self.assertEqual(stored["pub_key"], server_mqtt.DEFAULT_PUB_KEY)
 
+    def test_broker_add_and_del_overlay_default_list(self):
+        defaults = [
+            ("broker-a.example", 1883),
+            ("broker-b.example", 1884, ["old-user", "old-pass"]),
+        ]
+        config = server_mqtt._normalize_rpc_config({
+            "broker_list": defaults,
+            "broker_list_add": [
+                ["broker-a.example", 1883, ["new-user", "new-pass"]],
+                ["broker-c.example", 1885],
+            ],
+            "broker_list_del": [["broker-b.example", 1884]],
+        })
+
+        self.assertEqual(
+            config["broker_list"],
+            [
+                ("broker-a.example", 1883, ["new-user", "new-pass"]),
+                ("broker-c.example", 1885),
+            ],
+        )
+
+    def test_rpc_broker_delta_updates_can_restore_deleted_defaults(self):
+        deleted_broker = ("old-broker.example", 1883)
+        added_broker = ("new-broker.example", 1886)
+
+        result = server_mqtt.rpc_config(
+            broker_list_add=[added_broker],
+            broker_list_del=[deleted_broker],
+        )
+        self.assertNotIn(list(deleted_broker), result["broker_list"])
+        self.assertIn(list(added_broker), result["broker_list"])
+
+        result = server_mqtt.rpc_config(broker_list_del=[])
+        self.assertIn(list(deleted_broker), result["broker_list"])
+        self.assertIn(list(added_broker), result["broker_list"])
+        self.assertEqual(self.server.mqtt_net.brokers, [
+            tuple(entry) for entry in result["broker_list"]
+        ])
+
     def test_invalid_update_does_not_change_runtime_or_file(self):
         with self.assertRaisesRegex(ValueError, "request_topic"):
             server_mqtt.rpc_config(request_topic=" ")
@@ -143,6 +184,38 @@ class ServerMqttConfigTests(unittest.TestCase):
         config = server_mqtt._rpc_config_with_cli_overrides(pub=[])
 
         self.assertIsNone(config["pub_key"])
+
+    def test_missing_topic_uses_and_persists_machine_id(self):
+        machine_id_module = types.ModuleType("U")
+        machine_id_module.get_machine_id = lambda: "TestDevice_123456"
+        with mock.patch.dict(sys.modules, {"U": machine_id_module}):
+            config = server_mqtt._rpc_config_with_cli_overrides()
+
+        self.assertEqual(config["request_topic"], "TestDevice_123456")
+        self.assertEqual(
+            json.loads(self.config_path.read_text())["request_topic"],
+            "TestDevice_123456",
+        )
+
+    def test_missing_topic_falls_back_when_machine_id_fails(self):
+        machine_id_module = types.ModuleType("U")
+        machine_id_module.get_machine_id = mock.Mock(side_effect=OSError("unavailable"))
+        with mock.patch.dict(sys.modules, {"U": machine_id_module}):
+            config = server_mqtt._rpc_config_with_cli_overrides()
+
+        self.assertEqual(config["request_topic"], server_mqtt.REQUEST_TOPIC)
+        self.assertFalse(self.config_path.exists())
+
+    def test_explicit_cli_topic_skips_machine_id_and_persists_nothing(self):
+        machine_id_module = types.ModuleType("U")
+        machine_id_module.get_machine_id = mock.Mock(side_effect=AssertionError("must not run"))
+        with mock.patch.dict(sys.modules, {"U": machine_id_module}):
+            config = server_mqtt._rpc_config_with_cli_overrides(
+                request_topic="cli/request"
+            )
+
+        self.assertEqual(config["request_topic"], "cli/request")
+        self.assertFalse(self.config_path.exists())
 
     def test_config_ignores_unknown_fields_and_defaults_missing_values(self):
         self.config_path.write_text(

@@ -25,7 +25,7 @@ logger = logging.getLogger("Server")
 REQUEST_TOPIC = "sys/device/request"
 DEFAULT_REPLY_TOPIC = "sys/device/response"
 DEFAULT_PUB_KEY='ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOf+GndQauvHHEICc3HTrEeV9bv5S/FTiI64tnMAUPCAaofEbRDmXa8d5R54k8tYOPjt+zdnZJaoSMmJ2pnp4ys='
-DEFAULT_GLOBAL_TOPIC_URL = "https://qmm.pythonanywhere.com/"
+
 RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
 _RPC_CONFIG_LOCK = threading.RLock()
 _ACTIVE_SERVER = None
@@ -40,15 +40,56 @@ DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL = ConnectionQualityStats.PING_INTERVAL 
 # 发布参数（经 **ka 一路透传到 paho-mqtt）：QoS1+Retain，
 # broker 会连同 QoS 一起保存保留消息，新订阅者上线即收到最新 topic 列表
 DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
+DEFAULT_GLOBAL_TOPIC_URL = "https://qmm.pythonanywhere.com/"
 
 
 def _default_rpc_config():
     return {
         "broker_list": copy.deepcopy(BROKER_LIST),
+        "broker_list_add": [],
+        "broker_list_del": [],
         "request_topic": REQUEST_TOPIC,
         "pub_key": DEFAULT_PUB_KEY,
         "global_topic_url": DEFAULT_GLOBAL_TOPIC_URL,
     }
+
+
+def _normalize_broker_list(brokers, name, allow_empty=False):
+    if not isinstance(brokers, list) or (not brokers and not allow_empty):
+        suffix = "列表" if allow_empty else "非空列表"
+        raise ValueError(f"{name} 必须是{suffix}")
+    normalized_brokers = []
+    for index, entry in enumerate(brokers):
+        if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+            raise ValueError(f"{name}[{index}] 必须包含 host、port 和可选认证信息")
+        host, port = entry[:2]
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError(f"{name}[{index}] 的 host 必须是非空字符串")
+        if isinstance(port, bool) or not isinstance(port, (int, str)):
+            raise ValueError(f"{name}[{index}] 的 port 必须是整数")
+        if isinstance(port, str) and not port.isdecimal():
+            raise ValueError(f"{name}[{index}] 的 port 必须是整数")
+        try:
+            port = int(port)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{name}[{index}] 的 port 必须是整数") from error
+        if not 1 <= port <= 65535:
+            raise ValueError(f"{name}[{index}] 的 port 超出有效范围")
+        broker = [host.strip(), port]
+        if len(entry) == 3:
+            auth = entry[2]
+            if not (
+                isinstance(auth, str)
+                or isinstance(auth, (list, tuple)) and len(auth) >= 2
+            ):
+                raise ValueError(f"{name}[{index}] 的认证信息格式无效")
+            broker.append(list(auth) if isinstance(auth, tuple) else auth)
+        normalized_brokers.append(tuple(broker))
+    return normalized_brokers
+
+
+def _broker_identity(broker):
+    return broker[0].casefold(), broker[1]
 
 
 def _normalize_rpc_config(config):
@@ -58,37 +99,32 @@ def _normalize_rpc_config(config):
     known_keys = set(result)
     result.update({key: value for key, value in config.items() if key in known_keys})
 
-    brokers = result["broker_list"]
-    if not isinstance(brokers, list) or not brokers:
-        raise ValueError("broker_list 必须是非空列表")
-    normalized_brokers = []
-    for index, entry in enumerate(brokers):
-        if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
-            raise ValueError(f"broker_list[{index}] 必须包含 host、port 和可选认证信息")
-        host, port = entry[:2]
-        if not isinstance(host, str) or not host.strip():
-            raise ValueError(f"broker_list[{index}] 的 host 必须是非空字符串")
-        if isinstance(port, bool) or not isinstance(port, (int, str)):
-            raise ValueError(f"broker_list[{index}] 的 port 必须是整数")
-        if isinstance(port, str) and not port.isdecimal():
-            raise ValueError(f"broker_list[{index}] 的 port 必须是整数")
-        try:
-            port = int(port)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"broker_list[{index}] 的 port 必须是整数") from error
-        if not 1 <= port <= 65535:
-            raise ValueError(f"broker_list[{index}] 的 port 超出有效范围")
-        broker = [host.strip(), port]
-        if len(entry) == 3:
-            auth = entry[2]
-            if not (
-                isinstance(auth, str)
-                or isinstance(auth, (list, tuple)) and len(auth) >= 2
-            ):
-                raise ValueError(f"broker_list[{index}] 的认证信息格式无效")
-            broker.append(list(auth) if isinstance(auth, tuple) else auth)
-        normalized_brokers.append(tuple(broker))
-    result["broker_list"] = normalized_brokers
+    broker_base = _normalize_broker_list(
+        config.get("_broker_list_base", result["broker_list"]), "broker_list"
+    )
+    brokers_add = _normalize_broker_list(
+        result["broker_list_add"], "broker_list_add", allow_empty=True
+    )
+    brokers_del = _normalize_broker_list(
+        result["broker_list_del"], "broker_list_del", allow_empty=True
+    )
+    deleted = {_broker_identity(broker) for broker in brokers_del}
+    effective_brokers = [
+        broker for broker in broker_base
+        if _broker_identity(broker) not in deleted
+    ]
+    for broker in brokers_add:
+        identity = _broker_identity(broker)
+        for index, existing in enumerate(effective_brokers):
+            if _broker_identity(existing) == identity:
+                effective_brokers[index] = broker
+                break
+        else:
+            effective_brokers.append(broker)
+    result["_broker_list_base"] = broker_base
+    result["broker_list"] = effective_brokers
+    result["broker_list_add"] = brokers_add
+    result["broker_list_del"] = brokers_del
 
     topic = result["request_topic"]
     if not isinstance(topic, str) or not topic.strip():
@@ -123,19 +159,24 @@ def _normalize_rpc_config(config):
 
 def _json_rpc_config(config):
     return {
-        "broker_list": [
-            [entry[0], entry[1], list(entry[2]) if isinstance(entry[2], tuple) else entry[2]]
-            if len(entry) == 3 else [entry[0], entry[1]]
-            for entry in config["broker_list"]
-        ],
+        "broker_list": _json_brokers(config["broker_list"]),
+        "broker_list_add": _json_brokers(config["broker_list_add"]),
+        "broker_list_del": _json_brokers(config["broker_list_del"]),
         "request_topic": config["request_topic"],
         "pub_key": config["pub_key"],
         "global_topic_url": config["global_topic_url"],
     }
 
 
-def load_rpc_config(path=None):
-    """读取 rpc.json；未显式设置的项使用内置默认值。"""
+def _json_brokers(brokers):
+    return [
+        [entry[0], entry[1], list(entry[2]) if isinstance(entry[2], tuple) else entry[2]]
+        if len(entry) == 3 else [entry[0], entry[1]]
+        for entry in brokers
+    ]
+
+
+def _read_rpc_config_document(path=None):
     config_path = Path(path) if path is not None else RPC_CONFIG_PATH
     with _RPC_CONFIG_LOCK:
         try:
@@ -147,7 +188,12 @@ def load_rpc_config(path=None):
             raise ValueError(f"RPC 配置文件 JSON 格式错误: {config_path}: {error}") from error
         if not isinstance(stored, dict):
             raise ValueError(f"RPC 配置文件必须包含 JSON object: {config_path}")
-        return _normalize_rpc_config(stored)
+        return stored
+
+
+def load_rpc_config(path=None):
+    """读取 rpc.json；未显式设置的项使用内置默认值。"""
+    return _normalize_rpc_config(_read_rpc_config_document(path))
 
 
 def _write_rpc_config_updates(updates, path=None):
@@ -164,9 +210,15 @@ def _write_rpc_config_updates(updates, path=None):
             raise ValueError(f"RPC 配置文件 JSON 格式错误: {config_path}: {error}") from error
         if not isinstance(stored, dict):
             raise ValueError(f"RPC 配置文件必须包含 JSON object: {config_path}")
-        normalized = _normalize_rpc_config({**load_rpc_config(config_path), **updates})
+        source = _read_rpc_config_document(config_path)
+        source.update(updates)
+        normalized = _normalize_rpc_config(source)
         serialized = _json_rpc_config(normalized)
-        stored.update({key: serialized[key] for key in updates if key in serialized})
+        for key in updates:
+            if key == "broker_list":
+                stored[key] = _json_brokers(normalized["_broker_list_base"])
+            elif key in serialized:
+                stored[key] = serialized[key]
         fd, temp_path = tempfile.mkstemp(prefix=".rpc.", suffix=".json", dir=config_path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as config_file:
@@ -189,10 +241,13 @@ def rpc_config(**updates):
     if not updates:
         return rpc_config_get()
     with _RPC_CONFIG_LOCK:
-        current = (
-            _ACTIVE_SERVER.get_rpc_config()
-            if _ACTIVE_SERVER is not None else load_rpc_config()
-        )
+        if _ACTIVE_SERVER is not None:
+            current = _ACTIVE_SERVER.get_rpc_config()
+        else:
+            current = _normalize_rpc_config(_read_rpc_config_document())
+        current["broker_list"] = current["_broker_list_base"]
+        if "broker_list" in updates:
+            current["_broker_list_base"] = updates["broker_list"]
         candidate = _normalize_rpc_config({**current, **updates})
         previous = _normalize_rpc_config(current)
         if _ACTIVE_SERVER is not None:
@@ -218,13 +273,35 @@ def _rpc_config_with_cli_overrides(
     request_topic=None, pub=None, brokers=None, global_topic_url=None
 ):
     """按命令行参数覆盖配置文件，并校验最终 MQTT 配置。"""
-    config = load_rpc_config()
+    stored = _read_rpc_config_document()
+    config = _normalize_rpc_config(stored)
+    config["broker_list"] = config["_broker_list_base"]
+    generated_topic = None
     if request_topic is not None:
         config["request_topic"] = request_topic
+    elif "request_topic" not in stored:
+        machine_topic = None
+        try:
+            import U
+            machine_topic = U.get_machine_id()
+            if not isinstance(machine_topic, str) or not machine_topic.strip():
+                raise ValueError("get_machine_id() 未返回有效 topic")
+            machine_topic = machine_topic.strip()
+        except Exception as error:
+            logger.warning(
+                "获取设备 request_topic 失败，回退到内置默认值 %s: %s",
+                REQUEST_TOPIC,
+                error,
+            )
+        if machine_topic is not None:
+            config["request_topic"] = machine_topic
+            generated_topic = machine_topic
     if pub is not None:
         config["pub_key"] = " ".join(pub) if isinstance(pub, (list, tuple)) else pub
     if brokers is not None:
         config["broker_list"] = []
+        config["broker_list_add"] = []
+        config["broker_list_del"] = []
         for broker in brokers:
             host, separator, port = broker.rpartition(":")
             if not separator:
@@ -233,9 +310,13 @@ def _rpc_config_with_cli_overrides(
                 config["broker_list"].append((host, int(port)))
             except ValueError as error:
                 raise ValueError(f"broker 端口必须是整数: {broker!r}") from error
+        config["_broker_list_base"] = config["broker_list"]
     if global_topic_url is not None:
         config["global_topic_url"] = global_topic_url
-    return _normalize_rpc_config(config)
+    config = _normalize_rpc_config(config)
+    if generated_topic is not None:
+        _write_rpc_config_updates({"request_topic": generated_topic})
+    return config
 
 
 def _is_verify_enabled(mqtt_net):
@@ -277,6 +358,7 @@ class MQTTServer:
         global_topic_list_publish_kwargs=None,
         global_topic_list_payload_fn=None,
         global_topic_url=DEFAULT_GLOBAL_TOPIC_URL,
+        rpc_config_source=None,
     ):
         # 实例化网络层管理器（enable_crypto 默认为 False）
         self.request_topic = request_topic
@@ -291,12 +373,16 @@ class MQTTServer:
         if max_reconnect_delay is not None:
             net_kwargs["max_reconnect_delay"] = max_reconnect_delay
         self._net_options = dict(net_kwargs)
-        self._rpc_config = _normalize_rpc_config({
-            "broker_list": brokers,
-            "request_topic": request_topic,
-            "pub_key": server_public_key_bytes,
-            "global_topic_url": global_topic_url,
-        })
+        self._rpc_config = _normalize_rpc_config(
+            rpc_config_source
+            if rpc_config_source is not None
+            else {
+                "broker_list": brokers,
+                "request_topic": request_topic,
+                "pub_key": server_public_key_bytes,
+                "global_topic_url": global_topic_url,
+            }
+        )
         self._rpc_config_lock = threading.RLock()
         self.mqtt_net = MultiMQTTManager(
             brokers=brokers,
@@ -640,7 +726,14 @@ def start(config=None,globals=None):
 
     rpc_settings = load_rpc_config()
     explicit_rpc_settings = {}
-    for key in ("broker_list", "request_topic", "pub_key", "global_topic_url"):
+    for key in (
+        "broker_list",
+        "broker_list_add",
+        "broker_list_del",
+        "request_topic",
+        "pub_key",
+        "global_topic_url",
+    ):
         if key in config:
             explicit_rpc_settings[key] = config[key]
     if "brokers" in config:
@@ -649,6 +742,8 @@ def start(config=None,globals=None):
         explicit_rpc_settings["request_topic"] = config["mqtt_request_topic"]
     if "mqtt_pub_key" in config:
         explicit_rpc_settings["pub_key"] = config["mqtt_pub_key"]
+    if "broker_list" in explicit_rpc_settings:
+        rpc_settings["_broker_list_base"] = explicit_rpc_settings["broker_list"]
     rpc_settings = _normalize_rpc_config({**rpc_settings, **explicit_rpc_settings})
     request_topic = rpc_settings["request_topic"]
     reply_topic = str(config.get("mqtt_reply_topic") or DEFAULT_REPLY_TOPIC)
@@ -662,6 +757,7 @@ def start(config=None,globals=None):
         brokers=rpc_settings["broker_list"],
         request_topic=request_topic,
         global_topic_url=rpc_settings["global_topic_url"],
+        rpc_config_source=rpc_settings,
         reply_topic=reply_topic,
         globals=globals,
         enable_global_topic_list=bool(config.get("mqtt_enable_global_topic_list", True)),
@@ -715,6 +811,7 @@ if __name__ == "__main__":
         server_public_key_bytes=rpc_settings["pub_key"],
         request_topic=rpc_settings["request_topic"],
         global_topic_url=rpc_settings["global_topic_url"],
+        rpc_config_source=rpc_settings,
     )#
     gms.mqtt_net.is_windows_cmd=(sys.platform=="win32")
     import server_http

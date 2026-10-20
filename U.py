@@ -198,6 +198,8 @@ def get_system_id():
             return v
     return ""
     
-def get_id():
-    return f"{get_manufacturer()}_{get_model()}_{get_system_id()[:6]}"
-    
+def get_machine_id():
+    mf=get_manufacturer().replace(" ", "")[:9]
+    mo=get_model().replace(" ", "")[:14]
+    return f"{mf}_{mo}_{get_system_id()[:6]}"
+get_machine_request_topic=get_machine_id
