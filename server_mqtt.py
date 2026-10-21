@@ -235,6 +235,33 @@ def _write_rpc_config_updates(updates, path=None):
             raise
 
 
+def _resolve_request_topic(request_topic=None, stored=None):
+    if request_topic is not None:
+        return request_topic
+
+    if stored is None:
+        stored = _read_rpc_config_document()
+    if "request_topic" in stored:
+        return stored["request_topic"]
+
+    try:
+        import U
+        machine_topic = U.get_machine_id()
+        if not isinstance(machine_topic, str) or not machine_topic.strip():
+            raise ValueError("get_machine_id() 未返回有效 topic")
+        machine_topic = machine_topic.strip()
+    except Exception as error:
+        logger.warning(
+            "获取设备 request_topic 失败，回退到内置默认值 %s: %s",
+            REQUEST_TOPIC,
+            error,
+        )
+        return REQUEST_TOPIC
+
+    _write_rpc_config_updates({"request_topic": machine_topic})
+    return machine_topic
+
+
 def rpc_config(**updates):
     """持久化并立即应用设置，例如 rpc_config(request_topic='sys/new/request')。"""
     global _ACTIVE_SERVER
@@ -276,26 +303,7 @@ def _rpc_config_with_cli_overrides(
     stored = _read_rpc_config_document()
     config = _normalize_rpc_config(stored)
     config["broker_list"] = config["_broker_list_base"]
-    generated_topic = None
-    if request_topic is not None:
-        config["request_topic"] = request_topic
-    elif "request_topic" not in stored:
-        machine_topic = None
-        try:
-            import U
-            machine_topic = U.get_machine_id()
-            if not isinstance(machine_topic, str) or not machine_topic.strip():
-                raise ValueError("get_machine_id() 未返回有效 topic")
-            machine_topic = machine_topic.strip()
-        except Exception as error:
-            logger.warning(
-                "获取设备 request_topic 失败，回退到内置默认值 %s: %s",
-                REQUEST_TOPIC,
-                error,
-            )
-        if machine_topic is not None:
-            config["request_topic"] = machine_topic
-            generated_topic = machine_topic
+    config["request_topic"] = _resolve_request_topic(request_topic, stored)
     if pub is not None:
         config["pub_key"] = " ".join(pub) if isinstance(pub, (list, tuple)) else pub
     if brokers is not None:
@@ -313,10 +321,7 @@ def _rpc_config_with_cli_overrides(
         config["_broker_list_base"] = config["broker_list"]
     if global_topic_url is not None:
         config["global_topic_url"] = global_topic_url
-    config = _normalize_rpc_config(config)
-    if generated_topic is not None:
-        _write_rpc_config_updates({"request_topic": generated_topic})
-    return config
+    return _normalize_rpc_config(config)
 
 
 def _is_verify_enabled(mqtt_net):
@@ -346,7 +351,7 @@ class MQTTServer:
         globals=None,
         server_public_key_bytes=None,
         brokers=BROKER_LIST,
-        request_topic=REQUEST_TOPIC,
+        request_topic=None,
         reply_topic=DEFAULT_REPLY_TOPIC,
         keepalive=None,
         max_reconnect_delay=None,
@@ -361,6 +366,11 @@ class MQTTServer:
         rpc_config_source=None,
     ):
         # 实例化网络层管理器（enable_crypto 默认为 False）
+        if request_topic is None:
+            if rpc_config_source is not None and "request_topic" in rpc_config_source:
+                request_topic = rpc_config_source["request_topic"]
+            else:
+                request_topic = _resolve_request_topic()
         self.request_topic = request_topic
         self.reply_topic = reply_topic
         self._net_options = {}
@@ -745,7 +755,8 @@ def start(config=None,globals=None):
     if "broker_list" in explicit_rpc_settings:
         rpc_settings["_broker_list_base"] = explicit_rpc_settings["broker_list"]
     rpc_settings = _normalize_rpc_config({**rpc_settings, **explicit_rpc_settings})
-    request_topic = rpc_settings["request_topic"]
+    request_topic = _resolve_request_topic(explicit_rpc_settings.get("request_topic"))
+    rpc_settings["request_topic"] = request_topic
     reply_topic = str(config.get("mqtt_reply_topic") or DEFAULT_REPLY_TOPIC)
 
     # 监听 topic 定期报告配置（均可缺省）
