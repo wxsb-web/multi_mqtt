@@ -695,8 +695,7 @@ class MQTTServer:
 
         verify_enabled, verify_reason = _is_verify_enabled(self.mqtt_net)
         logger.info(
-            "🚀 [%s] 服务端已就绪（在线 broker %d/%d），正在监听:%s,reply_topic=%s ,pub=%s , 验签=%s",
-            stime(),
+            "🚀服务端就绪（在线%d/%d），监听:%s,reply_topic=%s ,pub=%s , 验签=%s",
             online, len(getattr(self.mqtt_net, "clients", {}) or {}),
             self.request_topic,
             self.reply_topic,
