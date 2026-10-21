@@ -65,7 +65,7 @@ class PythonExecutor:
     # 公开 API
     # ------------------------------------------------------------------ #
 
-    def execute(self, code, globals=None):
+    def execute(self, code,globals=None,format_result=False):
         """执行 ``code``。
 
         ``globals`` 若提供，应是一个包含**请求级**上下文变量的映射。
@@ -95,6 +95,10 @@ class PythonExecutor:
                 try:
                     with _redirect_stdout(output):
                         result = self._execute(code)
+                    if format_result: #让 r始终是 str 对象
+                        # 参数名 format_result 遮蔽了模块级同名函数，经 sys.modules 取原函数；
+                        # 非 JSON 可序列化对象（如 sys 模块）在此统一转为字符串
+                        result = sys.modules[__name__].format_result(result)
                     return {
                         "r": result,
                         "stdout": output.getvalue(),

@@ -19,7 +19,7 @@ from multi_mqtt import (
     get_standard_public_pem_bytes,
 )
 from rpc_executor import utc_ms,stime
-from rpc_executor import PythonExecutor, format_result
+from rpc_executor import PythonExecutor#, format_result
 
 logger = logging.getLogger("Server")
 REQUEST_TOPIC = "sys/device/request"
@@ -535,7 +535,7 @@ class MQTTServer:
                     self.mqtt_net.publish_broadcast(reply_topic, response_data)
                 return
 
-            execution = self.executor.execute(code)
+            execution = self.executor.execute(code, format_result=True)
             server_time = utc_ms()
 
             # MultiMQTTManager 在收到签名消息并验签通过后，会在回调里把 req_id
