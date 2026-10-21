@@ -217,6 +217,8 @@ def _write_rpc_config_updates(updates, path=None):
         for key in updates:
             if key == "broker_list":
                 stored[key] = _json_brokers(normalized["_broker_list_base"])
+            elif key == "pub_key" and updates[key] == "":
+                stored[key] = ""
             elif key in serialized:
                 stored[key] = serialized[key]
         fd, temp_path = tempfile.mkstemp(prefix=".rpc.", suffix=".json", dir=config_path.parent)

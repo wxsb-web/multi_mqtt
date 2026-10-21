@@ -108,6 +108,16 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(stored["broker_list"], [["new-broker.example", 1884]])
         self.assertEqual(stored["pub_key"], server_mqtt.DEFAULT_PUB_KEY)
 
+    def test_empty_public_key_is_persisted_and_disables_key_after_reload(self):
+        server_mqtt._write_rpc_config_updates({"pub_key": server_mqtt.DEFAULT_PUB_KEY})
+
+        result = server_mqtt.rpc_config(pub_key="")
+
+        self.assertIsNone(result["pub_key"])
+        self.assertIsNone(self.server.get_rpc_config()["pub_key"])
+        self.assertEqual(json.loads(self.config_path.read_text())["pub_key"], "")
+        self.assertIsNone(server_mqtt._rpc_config_with_cli_overrides()["pub_key"])
+
     def test_broker_add_and_del_overlay_default_list(self):
         defaults = [
             ("broker-a.example", 1883),
