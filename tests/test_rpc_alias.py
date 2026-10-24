@@ -182,6 +182,39 @@ class AliasCrudTests(unittest.TestCase):
         res = self.ex.execute("#alias a b\n1")
         self.assertFalse(res["ok"])
 
+    # ---------------- alias 开关 ---------------- #
+
+    def test_disabled_on_instance(self):
+        ex = PythonExecutor(alias=False)
+        res = ex.execute("#alias abc\n1+1")      # 指令行退化为普通注释
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["r"], 2)
+        self.assertEqual(ex.aliases, {})          # 未注册
+        self.assertFalse(ex.execute("abc")["ok"]) # 也不做精确匹配替换
+
+    def test_per_call_disable(self):
+        ex = PythonExecutor()                     # 默认启用
+        res = ex.execute("#alias tmp\n5+5", alias=False)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["r"], 10)
+        self.assertEqual(ex.aliases, {})
+        ex.execute("#alias u\nr=8")
+        self.assertFalse(ex.execute("u", alias=False)["ok"])  # 关闭时不替换
+        self.assertEqual(ex.execute("u")["r"], 8)             # 默认仍启用
+
+    def test_per_call_enable_on_disabled_instance(self):
+        ex = PythonExecutor(alias=False)
+        res = ex.execute("#alias t\nr=3", alias=True)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["r"], 3)
+        self.assertIn("t", ex.aliases)
+        self.assertEqual(ex.execute("t", alias=True)["r"], 3)
+        self.assertFalse(ex.execute("t")["ok"])  # 实例级默认仍关闭
+
+    def test_execute_default_follows_instance(self):
+        self.assertTrue(PythonExecutor().alias)
+        self.assertFalse(PythonExecutor(alias=False).alias)
+
     def test_directive_must_be_first_nonempty_line(self):
         # 指令不在首行 → 只是普通代码里的注释，不注册任何别名
         res = self.ex.execute("x=1\n#alias y\nr=x+1")

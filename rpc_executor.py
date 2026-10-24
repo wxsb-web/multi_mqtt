@@ -63,7 +63,7 @@ class PythonExecutor:
     alias_keywords = ALIAS_KEYWORDS
     unalias_keywords = UNALIAS_KEYWORDS
 
-    def __init__(self, globals=None, main_loop=None, copy_globals=False):
+    def __init__(self, globals=None, main_loop=None, copy_globals=False, alias=True):
         # 默认零拷贝：直接持有调用方字典，外部对它的修改实时可见
         # （server_mqtt 通道依赖此行为，启动后才创建的 gms 等名字必须可见）。
         # 仅在 copy_globals=True 时浅拷贝一次，与调用方字典脱钩形成快照。
@@ -80,14 +80,16 @@ class PythonExecutor:
         self.main_loop = main_loop
         self.lock = threading.RLock()
 
-        # code alias 注册表：name -> {"code","created","updated","hits","last_used"}
+        # code alias 总开关（默认启用），execute 可按调用覆盖；
+        # 注册表：name -> {"code","created","updated","hits","last_used"}
+        self.alias = alias
         self.aliases = {}
 
     # ------------------------------------------------------------------ #
     # 公开 API
     # ------------------------------------------------------------------ #
 
-    def execute(self, code,globals=None,format_result=False):
+    def execute(self, code,globals=None,format_result=False,alias=None):
         """执行 ``code``。
 
         ``globals`` 若提供，应是一个包含**请求级**上下文变量的映射。
@@ -100,7 +102,13 @@ class PythonExecutor:
 
         code alias
         ----------
-        首行是 ``#alias`` / ``#unalias``（或 ALIAS_KEYWORDS /
+        ``alias`` 传 ``None``（默认）时沿用构造参数 ``alias``（默认
+        ``True``）。关闭时 ``#alias`` / ``#unalias`` 首行只被当作普通
+        注释、整段精确匹配的别名替换也不发生，行为与未引入 alias 前
+        完全一致，可用于在个别调用里临时绕过别名（例如确实想执行
+        名字恰好等于某别名的变量，或调试别名本身）。
+
+        启用时：首行是 ``#alias`` / ``#unalias``（或 ALIAS_KEYWORDS /
         UNALIAS_KEYWORDS 列表里的任意关键字）时，按增删查改指令处理，
         不走常规执行；define 指令注册成功后会把 body 立即执行一次，
         注册信息附在返回 dict 的 ``alias`` 键上。整段输入**精确等于**
@@ -110,16 +118,22 @@ class PythonExecutor:
         if not isinstance(code, str) or not code.strip():
             return {"r": "", "stdout": "", "ok": False, "error": "code is required"}
 
+        # alias=None 沿用实例构造时的总开关
+        if alias is None:
+            alias = self.alias
+
         # code alias 指令拦截：增删查改不进入常规执行路径。
-        directive = self._parse_alias_directive(code)
-        if directive is not None:
-            with self.lock:
-                return self._handle_alias_directive(directive, globals, format_result)
+        if alias:
+            directive = self._parse_alias_directive(code)
+            if directive is not None:
+                with self.lock:
+                    return self._handle_alias_directive(directive, globals, format_result, alias)
 
         output = io.StringIO()
         # 整段注入 / 执行 / 还原都在锁内，避免并发下互相污染。
         with self.lock:
-            code = self._expand_alias(code)
+            if alias:
+                code = self._expand_alias(code)
             saved = {}
             injected = []
             try:
@@ -192,7 +206,7 @@ class PythonExecutor:
             return {"kind": "unalias", "arg": arg, "body": body}
         return None
 
-    def _handle_alias_directive(self, directive, globals=None, format_result=False):
+    def _handle_alias_directive(self, directive, globals=None, format_result=False, alias=True):
         """按指令 kind 分发增删查改。调用方（execute）已持有 self.lock。"""
         if directive["kind"] == "unalias":
             return self._alias_unalias(directive["arg"])
@@ -209,7 +223,7 @@ class PythonExecutor:
         if len(names) > 1:
             return self._alias_error(f"指令行只允许一个别名名字，收到: {names}")
         if body:
-            return self._alias_define(names[0], body, globals, format_result)
+            return self._alias_define(names[0], body, globals, format_result, alias)
         return self._alias_show(names[0])
 
     def _expand_alias(self, code):
@@ -226,7 +240,7 @@ class PythonExecutor:
         info["last_used"] = utc_ms()
         return info["code"]
 
-    def _alias_define(self, name, body, globals=None, format_result=False):
+    def _alias_define(self, name, body, globals=None, format_result=False, alias=True):
         """注册（重名覆盖，保留 created / hits 计数）并立即执行一次 body。
 
         请求级 ``globals`` 透传给 body 的执行，因此定义时可见的上下文
@@ -254,8 +268,9 @@ class PythonExecutor:
             "last_used": old["last_used"] if old else None,
         }
         # 定义即执行：注册信息附在 alias 键上，执行结果保持普通返回结构，
-        # 两条传输通道（HTTP / MQTT）对此都无需特判。
-        execution = self.execute(body, globals=globals, format_result=format_result)
+        # 两条传输通道（HTTP / MQTT）对此都无需特判。alias 开关透传，
+        # 逐调用启用 alias 时 body 内的别名替换行为与调用方一致。
+        execution = self.execute(body, globals=globals, format_result=format_result, alias=alias)
         execution["alias"] = {
             "action": "updated" if old else "saved",
             "name": name,
