@@ -39,6 +39,19 @@ AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
     curl "http://127.0.0.1:1188/$(python -c \
 "import urllib.parse;print(urllib.parse.quote('import json;p.set_data(json.dumps(ai_bridge.run(\\\"uname -a\\\"),ensure_ascii=False))'))")"
 
+MCP 工具服务（Model Context Protocol，AI 客户端标准工具协议）
+====================================================
+pip install "mcp[cli]" 后，本进程在 --mcp-port 默认 1189 上把常驻 PTY
+持续暴露为标准 MCP 工具（新版 streamable-http，旧版 mcp 包退回 sse；
+工具与 HTTP RPC 口同源同锁，未装包只记日志、PTY 照常工作）：
+
+    claude mcp add --transport http pty http://192.168.1.3:1189/mcp
+    # 旧版 SDK：claude mcp add --transport sse pty http://192.168.1.3:1189/sse
+
+工具集：pty_run 跑命令回收 rc/输出、pty_send 喂交互键、pty_status 会话
+与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏重绘。
+--mcp-port 0 关闭。
+
 本地诊断日志与 PTY 画面彻底分离
 ====================================
 本终端窗口**只渲染远端 shell**；broker 连接/重连、每笔 [RPC] 请求、

@@ -52,6 +52,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(*_cm._cli_opts(*alias_rpc_host), dest="host",
                    default="0.0.0.0",
                    help="本地 AI 控制口绑定地址（默认 0.0.0.0）；仅本机调用建议 127.0.0.1")
+    p.add_argument(*_cm._cli_opts(*alias_mcp_port), dest="mcp_port",
+                   type=int, default=1189,
+                   help="MCP 工具服务端口（默认 1189）：pip install \"mcp[cli]\" 后 "
+                        "AI 客户端经 MCP 协议直接调用常驻 PTY（pty_run 等工具）；0=关闭")
+    p.add_argument(*_cm._cli_opts(*alias_mcp_transport), dest="mcp_transport",
+                   default="",
+                   help="MCP 传输类型：留空自动（优先 streamable-http，旧版 mcp 包 "
+                        "退回 sse），可显式 streamable-http / sse")
     # SSH 式可选位置参数：连接成功后自动敲进常驻 shell 的前置命令，如
     # ``pty_client_mqtt.py -t q -k *** "tmux at"``；REMAINDER 保证命令自身
     # 的 -x 选项（tmux attach -d）不会被本客户端解析。命令结束后会话继续，
@@ -125,7 +133,19 @@ def main(argv=None) -> int:
         lan = _lan_ip()
         _info(f"本地 AI 控制口已开启：http://{lan}:{args.port}/"
               f"根路径自动跳转 /log_html(p)")
-    
+
+    # MCP 工具服务独立于 HTTP RPC 口：不依赖 --port（工具直通进程内
+    # ai_bridge，不经 HTTP 转发）；没装 mcp 包只记日志，PTY 照常工作。
+    if getattr(args, "mcp_port", 0):
+        mcp_res = start_mcp_server(
+            port=int(args.mcp_port), host=args.host,
+            prefer=getattr(args, "mcp_transport", "") or "")
+        if mcp_res.get("ok") and not mcp_res.get("already"):
+            _info(f"MCP 工具服务已开启（{mcp_res['transport']}）："
+                  f"http://{_lan_ip()}:{mcp_res['port']}{mcp_res['path']}  "
+                  f"AI 客户端添加：claude mcp add --transport http pty "
+                  f"http://{_lan_ip()}:{mcp_res['port']}{mcp_res['path']}")
+
     try:
         return run_session(transport, args, rows, cols)
     except RemoteError as exc:

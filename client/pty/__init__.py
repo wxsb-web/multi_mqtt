@@ -4,11 +4,12 @@
 
 结构
 ====
-- ``parts/``：原单文件按顶层语句边界切出的**逐字节分片**（文件名编号即
-  拼接顺序）。分片不是独立模块，不要单独 import；直接编辑分片内容即可。
-- ``generate_single_file.py``：把 ``parts/`` 全部分片按序拼回单文件（与原
-  ``client/pty_client_mqtt.py`` 逐字节一致），默认输出
-  ``client/pty_client_mqtt_generated.py``，绝不覆盖原文件。
+- ``parts/``：单文件按顶层语句边界切出的**逐字节分片**（文件名编号即
+  拼接顺序）。分片不是独立模块，不要单独 import；**只编辑分片**，
+  改完用生成器重组合。
+- ``generate_single_file.py``：把 ``parts/`` 全部分片按序拼回单文件；
+  ``-o ../pty_client_mqtt.py -f`` 写回正式单文件（parts 是唯一编辑入口），
+  默认输出 ``client/pty_client_mqtt_generated.py`` 仅作预览/比对。
 - 本 ``__init__.py``：按序把全部分片 exec 进**同一个命名空间**——与单文件
   版语义完全一致（跨分片的模块级可变全局 ``_OUT_WRITER`` / ``_ERR_WRITER``
   / ``_LOG_MIRROR_STDERR`` 等仍是一份，不会出现跨模块拷贝漂移）。

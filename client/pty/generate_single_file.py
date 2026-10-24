@@ -2,18 +2,21 @@
 # -*- coding: utf-8 -*-
 """把本目录 parts/ 下的全部分片按序重新组合成单文件 pty_client_mqtt.py。
 
-分片原则（见 ``pty/__init__.py`` 与 ``README.md``）：每个分片是原单文件按
-顶层语句边界切出的**逐字节切片**（注释、空行原样保留），因此重组就是纯
-字节拼接——生成的文件与原 ``client/pty_client_mqtt.py`` 逐字节一致，功能
-必然不变。默认输出 ``client/pty_client_mqtt_generated.py``；原文件约定
-不动，本脚本拒绝写入原文件路径。
+parts/ 是**唯一编辑入口**：每个分片保持顶层语句边界、可独立解析，重组是
+纯字节拼接。改完分片后用 ``-o`` + ``--force`` 把结果写回正式单文件::
+
+    python client/pty/generate_single_file.py -o ../pty_client_mqtt.py -f
+
+不带参数时默认输出 ``client/pty_client_mqtt_generated.py``（对比/预览用，
+不碰正式文件）；写正式文件必须显式给 ``-o`` 且加 ``--force``。``--check``
+把拼接结果与磁盘上的 pty_client_mqtt.py 做字节 + AST 双重比对。
 
 用法
 ====
-    python client/pty/generate_single_file.py              # 生成 pty_client_mqtt_generated.py
-    python client/pty/generate_single_file.py -f           # 覆盖已存在的输出
-    python client/pty/generate_single_file.py --check      # 只与原文件比对（字节 + AST）
-    python client/pty/generate_single_file.py -o 路径       # 自定义输出位置
+    python client/pty/generate_single_file.py -o ../pty_client_mqtt.py -f
+                                                           # 重新生成正式单文件
+    python client/pty/generate_single_file.py              # 生成 _generated.py 预览
+    python client/pty/generate_single_file.py --check      # 与 pty_client_mqtt.py 比对（字节+AST）
     python client/pty/generate_single_file.py --stdout     # 拼接到标准输出
 """
 from __future__ import annotations
@@ -83,9 +86,9 @@ def main(argv: list[str] | None = None) -> int:
         return compare_with_orig(data)
 
     output = args.output.expanduser().resolve()
-    if output == ORIG.resolve():
-        print("[REFUSED] 拒绝写入原文件 %s（原文件约定不动；"
-              "请用默认输出或 -o 指到别处）" % output)
+    if output == ORIG.resolve() and not args.force:
+        print("[REFUSED] 目标是正式单文件 %s；确认把重组结果写回请加 --force"
+              % output)
         return 2
     if output.exists() and not args.force:
         print("[SKIP] 输出已存在，如确认覆盖请加 --force: %s" % output)

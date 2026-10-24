@@ -1,13 +1,13 @@
 # client/pty —— pty_client_mqtt 的多文件版本
 
-原单文件 [`../pty_client_mqtt.py`](../pty_client_mqtt.py)（约 2354 行）**保持不动**；
-本目录是它的分片编辑版 + 重组器。
+单文件 [`../pty_client_mqtt.py`](../pty_client_mqtt.py) 由本目录**生成**：
+`parts/` 分片是唯一编辑入口，改完用生成器重组写回。
 
 ## 目录结构
 
 ```
 pty/
-├── parts/                    # 原文件按顶层语句边界切出的逐字节分片（编号即顺序）
+├── parts/                    # 单文件的分片（编号即拼接顺序，唯一编辑入口）
 │   ├── 000_head.py           # 模块 docstring / 导入 / sys.path 与环境引导
 │   ├── 010_alias.py          # 统一别名表（CLI 选项 + 魔术栏 + rpc 别名共用）
 │   ├── 020_console.py        # 本地终端 raw 输入/输出、输入转码、剪贴板粘贴
@@ -20,6 +20,7 @@ pty/
 │   ├── 080_writerdiag.py     # 写线程诊断与自愈、QuickEdit 选择模式自动解除
 │   ├── 090_aibridge.py       # AI 桥：_strip_ansi、base64 严格编码、AIBridge、ai_bridge
 │   ├── 095_aicallers.py      # AI 桥调用方便捷函数（local_rpc / ai_pty_run / …）
+│   ├── 097_mcp_server.py     # MCP 服务：pty_run/pty_send/pty_status/pty_log/pty_redraw
 │   ├── 100_magic.py          # 本地命令栏（魔术命令 _run_magic / 参数规格表）
 │   ├── 105_exit.py           # _hard_exit 硬退出、_join_pre_command
 │   ├── 110_session.py        # run_session 会话主循环
@@ -34,24 +35,41 @@ pty/
 
 ```bash
 # 多文件版：包导入（等价 from client.pty_client_mqtt import ...）
-from client.pty import ai_pty_run, ai_pty_status, ai_bridge
+from client.pty import ai_pty_run, ai_pty_status, ai_bridge, start_mcp_server
 
 # 多文件版：命令行（等价 python client/pty_client_mqtt.py）
 python -m client.pty
 
-# 重组单文件（默认输出 client/pty_client_mqtt_generated.py，不碰原文件）
-python client/pty/generate_single_file.py
-python client/pty/generate_single_file.py --check     # 只比对原文件（字节+AST）
+# 改完分片后重组写回正式单文件（parts 是唯一编辑入口）
+python client/pty/generate_single_file.py -o ../pty_client_mqtt.py -f
+
+# 只比对磁盘上的单文件与分片拼接结果（字节+AST）
+python client/pty/generate_single_file.py --check
 ```
+
+## MCP 工具服务
+
+`pip install "mcp[cli]"` 后，运行中的 pty 进程在 `--mcp-port`（默认 1189）
+上把常驻 PTY 持续暴露为标准 MCP 工具（mcp 2.x 走 streamable-http，旧版退回
+sse；未装包只记一条日志，PTY 照常工作）：
+
+```bash
+claude mcp add --transport http pty http://192.168.1.3:1189/mcp
+# 旧版 SDK：claude mcp add --transport sse pty http://192.168.1.3:1189/sse
+```
+
+工具：`pty_run`（跑命令回收 rc/输出）、`pty_send`（喂交互键）、`pty_status`
+（会话/broker 状态）、`pty_log`（本地诊断日志）、`pty_redraw`（写卡滞自愈
++整屏重绘）。与 1188 HTTP RPC 口同源同锁，三路调用状态一致。
 
 ## 规则
 
-1. **只编辑 `parts/` 分片**，不要直接改 `client/pty_client_mqtt.py`
-   （原文件保持不动）也不要手改生成文件。
+1. **只编辑 `parts/` 分片**；不要手改 `client/pty_client_mqtt.py`
+   （它由生成器产出）。
 2. 分片之间**不能调整顺序**、不能留未编号文件；新增分片用等宽 3 位数字
    前缀插入编号序列（按文件名排序即拼接顺序）。
-3. 改完分片后运行 `python client/pty/generate_single_file.py` 重新生成，
-   脚本会自动与原文件做逐字节 + AST 双重比对（`--check` 只比对不写）。
+3. 改完分片后 `python client/pty/generate_single_file.py -o ../pty_client_mqtt.py -f`
+   重组写回；`--check` 可随时校验分片与单文件是否同步（字节+AST）。
 4. 分片不是独立模块，不要单独 import；包模式一律从 `client.pty` 进。
 
 ## 设计说明：为什么分片不能是互相 import 的真模块
