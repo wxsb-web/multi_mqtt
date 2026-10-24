@@ -864,6 +864,48 @@ def start(config=None,globals=None):
     return server.start(block=False)
 
 
+def main(port=1177, host="0.0.0.0", globals=None, locals=None, block=False,
+         request_topic=None, pub=None, brokers=None, global_topic_url=None):
+    """启动 MQTT + HTTP 双通道 RPC，返回 (http_server, mqtt_server)。
+
+    globals/locals 原样透传给两个通道的执行器：HTTP 侧零拷贝持有 globals
+    字典引用（启动后才赋值的名字对 RPC 实时可见），MQTT 侧 PythonExecutor
+    使用同一 globals。ipy 里调用传 globals=globals(), locals=locals() 即可
+    把 IPython 命名空间同时暴露给 HTTP/MQTT RPC；缺省暴露本模块 globals。
+    pub/brokers/request_topic/global_topic_url 与 CLI 参数同名，None 时全部
+    走 rpc.json。block=True 阻塞到 KeyboardInterrupt（脚本入口用），默认
+    False 启动即返回。
+    """
+    if globals is None:
+        globals = sys.modules[__name__].__dict__
+    rpc_settings = _rpc_config_with_cli_overrides(
+        request_topic=request_topic,
+        pub=pub,
+        brokers=brokers,
+        global_topic_url=global_topic_url,
+    )
+    gms = MQTTServer(
+        globals=globals,
+        brokers=rpc_settings["broker_list"],
+        server_public_key_bytes=rpc_settings["pub_key"],
+        request_topic=rpc_settings["request_topic"],
+        global_topic_url=rpc_settings["global_topic_url"],
+        rpc_config_source=rpc_settings,
+    )
+    gms.mqtt_net.is_windows_cmd = (sys.platform == "win32")
+    import server_http
+    ghs = server_http.start_rpc_server(
+        port=port,
+        ip=host,
+        globals=globals,
+        locals=locals,
+    )
+
+    gms.start(block=block)  # block=True 阻塞主线程直到 KeyboardInterrupt；ipy 等交互调用用默认 False
+    print(ghs, gms)
+    return ghs, gms
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -877,31 +919,14 @@ if __name__ == "__main__":
     parser.add_argument("--global_topic_url", default=None)
     args = parser.parse_args()
     try:
-        rpc_settings = _rpc_config_with_cli_overrides(
+        main(
+            port=args.port,
+            host=args.host,
             request_topic=args.request_topic,
             pub=args.pub,
             brokers=args.broker,
             global_topic_url=args.global_topic_url,
+            block=True,
         )
     except ValueError as error:
         parser.error(str(error))
-
-    gms = MQTTServer(
-        globals=globals(),
-        brokers=rpc_settings["broker_list"],
-        server_public_key_bytes=rpc_settings["pub_key"],
-        request_topic=rpc_settings["request_topic"],
-        global_topic_url=rpc_settings["global_topic_url"],
-        rpc_config_source=rpc_settings,
-    )#
-    gms.mqtt_net.is_windows_cmd=(sys.platform=="win32")
-    import server_http
-    ghs = server_http.start_rpc_server(
-        port=args.port,
-        ip=args.host,
-        globals=globals(),
-        locals=locals(),
-    )
-
-    gms.start()  # 默认 block=True，CLI 下阻塞运行
-    print(ghs, gms)

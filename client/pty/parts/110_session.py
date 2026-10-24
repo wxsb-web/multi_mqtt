@@ -331,6 +331,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
     last_stall_warn = [0.0]  # 卡滞告警节流（每 30s 一条）
     last_unstick_ts = [0.0]  # 上次尝试自动解除的时间（每 30s 重试直到成功）
+    last_writer_reset_ts = [0.0]  # 上次自动切换写线程的时间（每 60s 一次）
     try:
         while not stop_ev.is_set():
             try:
@@ -364,6 +365,15 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                         _emit_local(
                             "[pty] 窗口选择模式冻结输出超过 %.0f 秒，"
                             "已自动解除\n" % _SELECTION_STALL_AUTO_UNSTICK)
+                # 写线程活锁兜底（实证 2026-10-25）：_WindowsConsoleIO.write
+                # 对特定输出内容永不返回，线程持 GIL 空转（py-spy 三次采样
+                # 均 active），ESC/关 QuickEdit/抖动缓冲区全部无效；同一流
+                # 对象换一个新写线程立即排空恢复。卡滞超过 60s 直接切换。
+                if _stall >= 60.0 \
+                        and (time.monotonic() - last_writer_reset_ts[0]) > 60:
+                    last_writer_reset_ts[0] = time.monotonic()
+                    _emit_local("[pty] 写卡滞 %.0fs，自动切换写线程: %s\n"
+                                % (_stall, reset_out_writer()))
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,

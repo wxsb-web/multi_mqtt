@@ -94,6 +94,8 @@ def main(argv=None) -> int:
         return 2
     
     _enable_output_vt()
+    # 启动自检：本文件是否仍是 pty/parts 分片重组出来的最新版（不同步只告警）
+    check_parts_sync()
     signed = bool(str(args.key or "").strip())
     t_conn = time.monotonic()
     _info("正在并发连接 %d 个公共 MQTT broker（多路径冗余，首个连上即继续，通常不足 1 秒）..."

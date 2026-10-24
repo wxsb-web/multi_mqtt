@@ -175,6 +175,74 @@ alias_detach = tuple(dict.fromkeys(
     ('detach', 'd', 'bye', 'q', 'x') + tuple(_cm.alias_exit)))
 
 
+# ==================== 版本自检：单文件 vs pty/parts 分片是否同步 ====================
+#
+# 单文件由 generate_single_file.py 把 parts/ 全部分片按序字节拼接而成，
+# 「单文件字节 == 分片拼接」时两侧 sha256 必然相同——不需要在文件里嵌
+# 任何版本标记（嵌标记反而破坏逐字节拼接的不变量）。main() 启动时自动
+# 比对一次：分片改了没重组（或有人手改了单文件）会打 WARN 并给出重组
+# 命令；结果也可随时经 HTTP RPC 查询：
+#
+#     curl "http://127.0.0.1:1188/r=check_parts_sync()"
+#
+# 部署机上没有 parts 目录时自动跳过，纯单文件场景不告警。
+
+
+def check_parts_sync(verbose: bool = True) -> dict:
+    """比对运行中的单文件与 client/pty/parts 分片是否逐字节同步。
+
+    返回 {"ok": True/False/None(无法判定), "single", "parts",
+    "sha_single", "sha_parts"}；verbose=True 时把结论写本地日志。
+    """
+    import hashlib
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(here) == "pty":     # 包模式 client/pty/__init__.py
+        parts_dir = os.path.join(here, "parts")
+        single = os.path.join(os.path.dirname(here), "pty_client_mqtt.py")
+    else:                                    # 单文件模式（含 _generated 预览）
+        parts_dir = os.path.join(here, "pty", "parts")
+        single = os.path.abspath(__file__)
+    try:
+        names = sorted(n for n in os.listdir(parts_dir) if n.endswith(".py"))
+    except OSError:
+        names = []
+    if not names:
+        res = {"ok": None, "reason": "parts 目录不存在（纯部署场景），跳过",
+               "single": single, "parts": parts_dir}
+        if verbose:
+            _info("[pty] 版本自检：%s" % res["reason"])
+        return res
+    h = hashlib.sha256()
+    for n in names:
+        with open(os.path.join(parts_dir, n), "rb") as f:
+            h.update(f.read())
+    sha_parts = h.hexdigest()
+    try:
+        with open(single, "rb") as f:
+            sha_single = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        sha_single = None
+    if sha_single is None:
+        res = {"ok": False, "single": single, "parts": parts_dir,
+               "sha_single": None, "sha_parts": sha_parts[:12]}
+        if verbose:
+            _emit_local("[pty][WARN] 版本自检：单文件 %s 不存在"
+                        "（parts 才是真相源）\n" % single)
+        return res
+    res = {"ok": sha_single == sha_parts, "single": single, "parts": parts_dir,
+           "sha_single": sha_single[:12], "sha_parts": sha_parts[:12]}
+    if verbose and res["ok"]:
+        _info("[pty] 版本自检：与 pty/parts 分片同步（sha256=%s）" % sha_parts[:12])
+    elif verbose:
+        _emit_local("[pty][WARN] 版本自检：当前文件与 client/pty/parts 分片不一致"
+                    "（文件 %s / 分片 %s）！分片改动后请重组："
+                    "python client/pty/generate_single_file.py "
+                    "-o client/pty_client_mqtt.py -f\n"
+                    % (res["sha_single"], res["sha_parts"]))
+    return res
+
+
 # ============================ 本地终端：输出 ANSI 支持 ============================
 
 def _enable_output_vt() -> bool:
@@ -2566,6 +2634,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
     last_stall_warn = [0.0]  # 卡滞告警节流（每 30s 一条）
     last_unstick_ts = [0.0]  # 上次尝试自动解除的时间（每 30s 重试直到成功）
+    last_writer_reset_ts = [0.0]  # 上次自动切换写线程的时间（每 60s 一次）
     try:
         while not stop_ev.is_set():
             try:
@@ -2599,6 +2668,15 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                         _emit_local(
                             "[pty] 窗口选择模式冻结输出超过 %.0f 秒，"
                             "已自动解除\n" % _SELECTION_STALL_AUTO_UNSTICK)
+                # 写线程活锁兜底（实证 2026-10-25）：_WindowsConsoleIO.write
+                # 对特定输出内容永不返回，线程持 GIL 空转（py-spy 三次采样
+                # 均 active），ESC/关 QuickEdit/抖动缓冲区全部无效；同一流
+                # 对象换一个新写线程立即排空恢复。卡滞超过 60s 直接切换。
+                if _stall >= 60.0 \
+                        and (time.monotonic() - last_writer_reset_ts[0]) > 60:
+                    last_writer_reset_ts[0] = time.monotonic()
+                    _emit_local("[pty] 写卡滞 %.0fs，自动切换写线程: %s\n"
+                                % (_stall, reset_out_writer()))
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,
@@ -2725,6 +2803,8 @@ def main(argv=None) -> int:
         return 2
     
     _enable_output_vt()
+    # 启动自检：本文件是否仍是 pty/parts 分片重组出来的最新版（不同步只告警）
+    check_parts_sync()
     signed = bool(str(args.key or "").strip())
     t_conn = time.monotonic()
     _info("正在并发连接 %d 个公共 MQTT broker（多路径冗余，首个连上即继续，通常不足 1 秒）..."

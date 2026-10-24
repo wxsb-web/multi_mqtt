@@ -74,7 +74,12 @@ claude mcp add --transport http pty http://192.168.1.3:1188/mcp
 3. 改完分片后 `python client/pty/generate_single_file.py -f` 重组写回
    （默认只生成、不比对）；`--check` 可随时校验分片与单文件是否同步
    （字节+AST，不写文件）。
-4. 分片不是独立模块，不要单独 import；包模式一律从 `client.pty` 进。
+4. **启动自检**：单文件每次启动自动做 `check_parts_sync()`——单文件字节
+   本来就等于分片拼接，直接比对两侧 sha256，不一致（分片改了没重组/手改了
+   单文件）会在日志里打 WARN 并给出重组命令；运行中也可随时查：
+   `curl "http://127.0.0.1:1188/r=check_parts_sync()"`。部署机没有 parts
+   目录时自动跳过。
+5. 分片不是独立模块，不要单独 import；包模式一律从 `client.pty` 进。
 
 ## 设计说明：为什么分片不能是互相 import 的真模块
 
