@@ -15,6 +15,7 @@ mqtt_topics_dump.db-wal
 _*.sh
 _*.py
 !client/pty/__*.py
+!client/socks5/__*.py
 
 
 rpc.json

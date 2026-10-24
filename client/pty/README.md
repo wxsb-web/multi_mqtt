@@ -27,7 +27,7 @@ pty/
 │   └── 120_cli.py            # build_parser / main / __main__ 入口
 ├── __init__.py               # 按序把全部分片 exec 进同一命名空间（包模式入口）
 ├── __main__.py               # python -m client.pty 入口
-├── generate_single_file.py   # 分片 → 单文件重组器（含字节 + AST 比对）
+├── generate_single_file.py   # 分片 → 单文件重组器（默认只生成；--check 才比对）
 └── README.md
 ```
 
@@ -40,10 +40,10 @@ from client.pty import ai_pty_run, ai_pty_status, ai_bridge, start_mcp_server
 # 多文件版：命令行（等价 python client/pty_client_mqtt.py）
 python -m client.pty
 
-# 改完分片后重组写回正式单文件（parts 是唯一编辑入口）
-python client/pty/generate_single_file.py -o ../pty_client_mqtt.py -f
+# 改完分片后重组写回正式单文件（默认只生成、不比对；parts 是唯一编辑入口）
+python client/pty/generate_single_file.py -f
 
-# 只比对磁盘上的单文件与分片拼接结果（字节+AST）
+# 只比对磁盘上的单文件与分片拼接结果（字节+AST，不写文件）
 python client/pty/generate_single_file.py --check
 ```
 
@@ -71,8 +71,9 @@ claude mcp add --transport http pty http://192.168.1.3:1188/mcp
    （它由生成器产出）。
 2. 分片之间**不能调整顺序**、不能留未编号文件；新增分片用等宽 3 位数字
    前缀插入编号序列（按文件名排序即拼接顺序）。
-3. 改完分片后 `python client/pty/generate_single_file.py -o ../pty_client_mqtt.py -f`
-   重组写回；`--check` 可随时校验分片与单文件是否同步（字节+AST）。
+3. 改完分片后 `python client/pty/generate_single_file.py -f` 重组写回
+   （默认只生成、不比对）；`--check` 可随时校验分片与单文件是否同步
+   （字节+AST，不写文件）。
 4. 分片不是独立模块，不要单独 import；包模式一律从 `client.pty` 进。
 
 ## 设计说明：为什么分片不能是互相 import 的真模块

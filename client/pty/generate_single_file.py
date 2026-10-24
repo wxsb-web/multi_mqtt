@@ -3,21 +3,18 @@
 """把本目录 parts/ 下的全部分片按序重新组合成单文件 pty_client_mqtt.py。
 
 parts/ 是**唯一编辑入口**：每个分片保持顶层语句边界、可独立解析，重组是
-纯字节拼接。改完分片后用 ``-o`` + ``--force`` 把结果写回正式单文件::
+纯字节拼接。**默认只生成、不与任何现有文件比对**；需要校验分片与磁盘上
+正式单文件是否同步时显式加 ``--check``（字节 + AST，不写文件）。
 
-    python client/pty/generate_single_file.py -o ../pty_client_mqtt.py -f
-
-不带参数时默认输出 ``client/pty_client_mqtt_generated.py``（对比/预览用，
-不碰正式文件）；写正式文件必须显式给 ``-o`` 且加 ``--force``。``--check``
-把拼接结果与磁盘上的 pty_client_mqtt.py 做字节 + AST 双重比对。
+默认输出即正式单文件 ``client/pty_client_mqtt.py``：目标是它时必须加
+``--force`` 确认；其他已存在的输出同样需要 ``--force``。
 
 用法
 ====
-    python client/pty/generate_single_file.py -o ../pty_client_mqtt.py -f
-                                                           # 重新生成正式单文件
-    python client/pty/generate_single_file.py              # 生成 _generated.py 预览
-    python client/pty/generate_single_file.py --check      # 与 pty_client_mqtt.py 比对（字节+AST）
-    python client/pty/generate_single_file.py --stdout     # 拼接到标准输出
+    python client/pty/generate_single_file.py -f         # 只生成：写 ../pty_client_mqtt.py（不比对）
+    python client/pty/generate_single_file.py --check    # 只比对：与 ../pty_client_mqtt.py（字节+AST）
+    python client/pty/generate_single_file.py -o 路径 -f # 只生成：写到指定文件
+    python client/pty/generate_single_file.py --stdout   # 拼接到标准输出
 """
 from __future__ import annotations
 
@@ -30,7 +27,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PARTS_DIR = HERE / "parts"
 ORIG = HERE.parent / "pty_client_mqtt.py"
-DEFAULT_OUTPUT = HERE.parent / "pty_client_mqtt_generated.py"
+DEFAULT_OUTPUT = HERE.parent / "pty_client_mqtt.py"   # 正式单文件：默认输出
 
 
 def assemble() -> bytes:
@@ -66,14 +63,13 @@ def compare_with_orig(data: bytes) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="把 pty/parts/ 分片按序拼回单文件 pty_client_mqtt.py"
-                    "（与原文件逐字节一致）。")
+        description="把 pty/parts/ 分片按序拼回单文件（默认只生成，不比对）。")
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT,
                         help="输出路径（默认: %(default)s）")
     parser.add_argument("-f", "--force", action="store_true",
                         help="允许覆盖已存在的输出文件")
     parser.add_argument("--check", action="store_true",
-                        help="只与原 pty_client_mqtt.py 比对（字节 + AST），不写文件")
+                        help="不写文件：只与磁盘上的 pty_client_mqtt.py 比对（字节 + AST）")
     parser.add_argument("--stdout", action="store_true",
                         help="拼接到标准输出（不比对、不写文件）")
     args = parser.parse_args(argv)
@@ -96,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(data)
     print("Generated: %s (%d bytes)" % (output, len(data)))
-    return compare_with_orig(data)
+    return 0
 
 
 if __name__ == "__main__":
