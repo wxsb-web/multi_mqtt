@@ -49,18 +49,21 @@ python client/pty/generate_single_file.py --check
 
 ## MCP 工具服务
 
-`pip install "mcp[cli]"` 后，运行中的 pty 进程在 `--mcp-port`（默认 1189）
-上把常驻 PTY 持续暴露为标准 MCP 工具（mcp 2.x 走 streamable-http，旧版退回
-sse；未装包只记一条日志，PTY 照常工作）：
+`pip install "mcp[cli]"` 后，运行中的 pty 进程把常驻 PTY 持续暴露为标准 MCP
+工具：**默认复用 `--port` 的 1188 口**（路径 `/mcp`，与 RPC/浏览器日志台同口
+并存，不新开端口——给 `server_http.RPCRequestHandler` 打保留路径前置分流，
+参考 HuggingFace app.py 的中间件写法；mcp 2.x 走 streamable-http，旧版退回
+`/sse`+`/messages`；未装包只记一条日志，PTY 照常工作）：
 
 ```bash
-claude mcp add --transport http pty http://192.168.1.3:1189/mcp
-# 旧版 SDK：claude mcp add --transport sse pty http://192.168.1.3:1189/sse
+claude mcp add --transport http pty http://192.168.1.3:1188/mcp
+# 旧版 SDK：claude mcp add --transport sse pty http://192.168.1.3:1188/sse
 ```
 
 工具：`pty_run`（跑命令回收 rc/输出）、`pty_send`（喂交互键）、`pty_status`
 （会话/broker 状态）、`pty_log`（本地诊断日志）、`pty_redraw`（写卡滞自愈
-+整屏重绘）。与 1188 HTTP RPC 口同源同锁，三路调用状态一致。
++整屏重绘）。与 1188 HTTP RPC 口同源同锁，三路调用状态一致。`--no-mcp` 关闭；
+`--mcp-port N`（N>0）改为另起独立端口（`--port 0` 关闭 RPC 口时仍要 MCP 用）。
 
 ## 规则
 

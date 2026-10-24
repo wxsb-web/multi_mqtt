@@ -53,9 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
                    default="0.0.0.0",
                    help="本地 AI 控制口绑定地址（默认 0.0.0.0）；仅本机调用建议 127.0.0.1")
     p.add_argument(*_cm._cli_opts(*alias_mcp_port), dest="mcp_port",
-                   type=int, default=1189,
-                   help="MCP 工具服务端口（默认 1189）：pip install \"mcp[cli]\" 后 "
-                        "AI 客户端经 MCP 协议直接调用常驻 PTY（pty_run 等工具）；0=关闭")
+                   type=int, default=0,
+                   help="MCP 工具服务：0=自动（默认，挂在 --port 的 RPC 口 /mcp 路径，"
+                        "不新开端口）；>0=另起独立端口（--port 0 关闭 RPC 口时仍要 "
+                        "MCP 用）；需 pip install \"mcp[cli]\"，未装包仅记日志")
+    p.add_argument(*_cm._cli_opts(*alias_no_mcp), dest="no_mcp",
+                   action="store_true",
+                   help="完全关闭 MCP 工具服务（默认开启并复用 --port 的口）")
     p.add_argument(*_cm._cli_opts(*alias_mcp_transport), dest="mcp_transport",
                    default="",
                    help="MCP 传输类型：留空自动（优先 streamable-http，旧版 mcp 包 "
@@ -134,17 +138,20 @@ def main(argv=None) -> int:
         _info(f"本地 AI 控制口已开启：http://{lan}:{args.port}/"
               f"根路径自动跳转 /log_html(p)")
 
-    # MCP 工具服务独立于 HTTP RPC 口：不依赖 --port（工具直通进程内
-    # ai_bridge，不经 HTTP 转发）；没装 mcp 包只记日志，PTY 照常工作。
-    if getattr(args, "mcp_port", 0):
-        mcp_res = start_mcp_server(
-            port=int(args.mcp_port), host=args.host,
-            prefer=getattr(args, "mcp_transport", "") or "")
-        if mcp_res.get("ok") and not mcp_res.get("already"):
-            _info(f"MCP 工具服务已开启（{mcp_res['transport']}）："
-                  f"http://{_lan_ip()}:{mcp_res['port']}{mcp_res['path']}  "
-                  f"AI 客户端添加：claude mcp add --transport http pty "
-                  f"http://{_lan_ip()}:{mcp_res['port']}{mcp_res['path']}")
+    # MCP 工具服务：默认复用 --port 的 HTTP 口（路径 /mcp，与 RPC/日志台
+    # 同口并存，不新开端口）；--mcp-port>0 才另起独立端口（--port 0 时仍要
+    # MCP 的场景）；--no-mcp 全关。没装 mcp 包只记日志，PTY 照常工作。
+    if not getattr(args, "no_mcp", False):
+        _prefer = getattr(args, "mcp_transport", "") or ""
+        if int(getattr(args, "mcp_port", 0) or 0) > 0:
+            start_mcp_server(port=int(args.mcp_port), host=args.host,
+                             prefer=_prefer)
+        elif args.port:
+            _mcp = mount_mcp_on_rpc(prefer=_prefer, host=args.host)
+            if _mcp.get("ok") and not _mcp.get("already"):
+                _info(f"MCP 工具服务已挂到 RPC 口：http://{_lan_ip()}:{args.port}/mcp  "
+                      f"AI 客户端：claude mcp add --transport http pty "
+                      f"http://{_lan_ip()}:{args.port}/mcp")
 
     try:
         return run_session(transport, args, rows, cols)

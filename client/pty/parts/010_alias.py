@@ -21,9 +21,10 @@ alias_detach_key   = ('detach_key', 'detachkey')
 alias_menu_key     = ('menu_key', 'menukey', 'magic_key')
 alias_rpc_port     = ('port', 'rpc_port', 'p')
 alias_rpc_host     = ('host', 'rpc_host')
-# MCP 工具服务（pip install "mcp[cli]" 后由 start_mcp_server 常驻提供）
+# MCP 工具服务（pip install "mcp[cli]" 后默认挂在 --port 的 RPC 口上）
 alias_mcp_port     = ('mcp_port', 'mcp')
 alias_mcp_transport= ('mcp_transport', 'mcptrans')
+alias_no_mcp       = ('no_mcp', 'nomcp')
 alias_command      = ('command', 'cmd')
 # 本地命令栏查看诊断日志（只读，不碰会话参数）
 alias_log          = ('log', 'logs')

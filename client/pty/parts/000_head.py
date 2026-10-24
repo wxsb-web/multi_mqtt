@@ -41,16 +41,17 @@ AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
 
 MCP 工具服务（Model Context Protocol，AI 客户端标准工具协议）
 ====================================================
-pip install "mcp[cli]" 后，本进程在 --mcp-port 默认 1189 上把常驻 PTY
-持续暴露为标准 MCP 工具（新版 streamable-http，旧版 mcp 包退回 sse；
-工具与 HTTP RPC 口同源同锁，未装包只记日志、PTY 照常工作）：
+pip install "mcp[cli]" 后，常驻 PTY 自动以标准 MCP 工具形式持续暴露：
+默认**复用 --port 的 HTTP 口**（路径 /mcp，与 RPC/浏览器日志台同口并存，
+不新开端口；新版 SDK 走 streamable-http，旧版退回 /sse+/messages）：
 
-    claude mcp add --transport http pty http://192.168.1.3:1189/mcp
-    # 旧版 SDK：claude mcp add --transport sse pty http://192.168.1.3:1189/sse
+    claude mcp add --transport http pty http://192.168.1.3:1188/mcp
 
 工具集：pty_run 跑命令回收 rc/输出、pty_send 喂交互键、pty_status 会话
-与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏重绘。
---mcp-port 0 关闭。
+与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏重绘；
+与 HTTP RPC 口同源同锁。--no-mcp 关闭；--mcp-port>0 改为另起独立端口
+（--port 0 关闭 RPC 口时仍要 MCP 的场景）。未装 mcp 包只记日志，PTY
+照常工作。
 
 本地诊断日志与 PTY 画面彻底分离
 ====================================
