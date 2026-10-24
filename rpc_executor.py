@@ -169,9 +169,14 @@ class PythonExecutor:
         def _work():
             try:
                 with self.lock:
+                    # 先 started 再查 abandoned，调用方则先 abandoned 再查
+                    # started：双检次序保证两者判定一致——调用方判"未开始
+                    # →作废"时，worker 要么还没到这行（必见作废退出），要么
+                    # 已 set started（调用方会看到并转入超时路径），不存在
+                    # "调用方已宣布作废、job 仍晚到执行"的窗口。
+                    started.set()
                     if abandoned.is_set():
                         return          # 等锁期间调用方已超时作废本请求
-                    started.set()
                     result["v"] = job()
             except BaseException:       # job 自带兜底返回 dict，这里再保险一层
                 result["v"] = {"r": None, "stdout": "", "ok": False,
@@ -183,20 +188,31 @@ class PythonExecutor:
                 self._stuck = False
 
         threading.Thread(target=_work, name="rpc-exec", daemon=True).start()
+
+        def _result_or_internal_error(v):
+            # worker 在 started 后撞见作废标志退出时不产生结果：仍须返回
+            # 结构完整的错误 dict，绝不让 execute 返回 None 破坏通道封装
+            if isinstance(v, dict):
+                return v
+            return {"r": None, "stdout": "", "ok": False,
+                    "error": "executor internal: no result produced "
+                             "(request aborted before job started)"}
+
         if done.wait(timeout):
-            return result.get("v")
+            return _result_or_internal_error(result.get("v"))
+        # 先标作废再判断是否已开始（与 worker 的次序配对，见 _work 注释）
+        abandoned.set()
         if started.is_set():
             # 代码已在运行且超时：标记 busy，本调用立即返回超时错误
             self._stuck = True
             if done.is_set():
                 # 最后瞬间跑完：收回 busy 标记并正常取结果
                 self._stuck = False
-                return result.get("v")
+                return _result_or_internal_error(result.get("v"))
             return {"r": None, "stdout": "", "ok": False,
                     "error": f"execution timed out after {timeout}s；"
                              f"代码仍在后台运行，执行器将拒绝新请求直至其结束"}
-        # 仍在排队等锁：作废本请求，避免调用方已返回后才被执行
-        abandoned.set()
+        # 尚未开始：作废生效，worker 必然在 started 后查到作废并退出
         return {"r": None, "stdout": "", "ok": False,
                 "error": f"executor busy: 等待上一个执行释放锁超过 {timeout}s，"
                          f"本请求已作废（不会被延迟执行）"}
