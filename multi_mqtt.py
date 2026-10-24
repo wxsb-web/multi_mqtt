@@ -1382,7 +1382,27 @@ class MultiMQTTManager:
                             logger.warning(
                                 f"⚠️ [{host}] 拒绝执行: timestamp 超出重放窗口 "
                                 f"(±{self.timestamp_window:g}s), req_id={base_req_id}")
-                            return
+                            # 不静默丢弃：带拒绝标记继续投递给上层回调，
+                            # server_mqtt.handle_message 会按标准回包格式向
+                            # reply_topic 发布明确错误——客户端立即收到诊断，
+                            # 而不是死等到自身超时还摸不清状况。标记只在
+                            # 验签通过后才会打上（本分支位于验签成功之后），
+                            # 无签名攻击者伪造的标记帧到不了上层。
+                            _now_ms = int(time.time() * 1000)
+                            data["_cmq_timestamp_reject"] = {
+                                "reason": "timestamp_window",
+                                "window": self.timestamp_window,
+                                "frame_ts": data.get("timestamp"),
+                                "server_now_ms": _now_ms,
+                                "error": (
+                                    f"rejected: timestamp outside replay window "
+                                    f"(±{self.timestamp_window:g}s). frame_ts="
+                                    f"{data.get('timestamp')!r} server_now_ms={_now_ms}."
+                                    f" 若为时钟偏差请校时(NTP)或调宽/关闭 "
+                                    f"MultiMQTTManager(timestamp_window=...)；"
+                                    f"若为嗅探重放帧则属预期拒收。"
+                                ),
+                            }
             
             if self.message_callback:
                 try:

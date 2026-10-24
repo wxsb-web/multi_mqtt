@@ -512,6 +512,35 @@ class MQTTServer:
             reply_topic = data.get("reply_topic") or self.reply_topic
             code = data.get("code",None)
 
+            # 网络层重放窗口拒收（验签通过但 timestamp 超窗）：不静默丢帧。
+            # 按标准回包格式向 reply_topic 发布明确错误，客户端立即拿到
+            # 诊断（时钟偏差/重放帧），而不是死等到自身超时摸不清状况。
+            _ts_reject = data.pop("_cmq_timestamp_reject", None)
+            if _ts_reject is not None:
+                if isinstance(req_id, str) and "|" in req_id:
+                    req_id = req_id.split("|", 1)[0]
+                _err = str(_ts_reject.get("error")
+                           or "rejected: timestamp outside replay window")
+                logger.warning(
+                    "⛔ [重放窗口拒收] 已向 %s 回包错误: req_id=%s reason=%s "
+                    "window=%s frame_ts=%s server_now_ms=%s",
+                    reply_topic, req_id, _ts_reject.get("reason"),
+                    _ts_reject.get("window"), _ts_reject.get("frame_ts"),
+                    _ts_reject.get("server_now_ms"),
+                )
+                if reply_topic:
+                    self.mqtt_net.publish_broadcast(reply_topic, {
+                        "req_id": req_id,
+                        "r": None,
+                        "stdout": "",
+                        "ok": False,
+                        "error": _err,
+                        "rejected": _ts_reject.get("reason", "timestamp_window"),
+                        "server_time": utc_ms(),
+                        "server_from": rx_broker,
+                    })
+                return
+
             if code is not None:
                 # 收到下发指令：刷新指令时间戳（距上次指令超过 command_idle_threshold
                 # 视为空闲，报告线程据此恢复每小时上报）

@@ -74,30 +74,48 @@ class ReplayWindowTests(unittest.TestCase):
         got = _drained(m)
         self.assertEqual(len(got), 1, "新鲜 timestamp 的合法签名帧应被放行")
         self.assertEqual(got[0][1]["code"], "1+1")
+        self.assertNotIn("_cmq_timestamp_reject", got[0][1],
+                         "放行帧不得携带拒收标记")
 
-    def test_stale_timestamp_rejected(self):
+    def test_stale_timestamp_rejected_with_marker(self):
+        """过期 timestamp 不再静默丢弃：带 _cmq_timestamp_reject 标记继续投递，
+        由 server_mqtt.handle_message 按标准回包格式向 reply_topic 报错。"""
         m, sk = _make_manager()
         old = (time.time() - 600) * 1000   # 10 分钟前，超出默认 120s 窗口
         _deliver(m, _signed_frame(sk, "stale1", "1+1", old))
-        self.assertEqual(_drained(m), [], "过期 timestamp 的签名帧必须被拒绝（防嗅探重放）")
+        got = _drained(m)
+        self.assertEqual(len(got), 1, "拒收帧必须投递给上层（带标记），不能静默吞掉")
+        reject = got[0][1].get("_cmq_timestamp_reject")
+        self.assertIsNotNone(reject)
+        self.assertEqual(reject["reason"], "timestamp_window")
+        self.assertEqual(reject["window"], 120.0)
+        self.assertIn("replay window", reject["error"])
+        self.assertIn("server_now_ms", reject)
 
-    def test_future_timestamp_rejected(self):
+    def test_future_timestamp_rejected_with_marker(self):
         m, sk = _make_manager()
         future = (time.time() + 600) * 1000
         _deliver(m, _signed_frame(sk, "fut1", "1+1", future))
-        self.assertEqual(_drained(m), [], "未来 timestamp 的签名帧同样拒绝（防时钟诡计）")
+        got = _drained(m)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][1]["_cmq_timestamp_reject"]["reason"],
+                         "timestamp_window")
 
     def test_wider_window_accepts_older_frame(self):
         m, sk = _make_manager(timestamp_window=3600.0)
         old = (time.time() - 1800) * 1000   # 30 分钟前，在 1h 窗口内
         _deliver(m, _signed_frame(sk, "wide1", "1+1", old))
-        self.assertEqual(len(_drained(m)), 1, "窗口参数应被尊重")
+        got = _drained(m)
+        self.assertEqual(len(got), 1, "窗口参数应被尊重")
+        self.assertNotIn("_cmq_timestamp_reject", got[0][1])
 
     def test_window_disabled_accepts_old_frame(self):
         m, sk = _make_manager(timestamp_window=0)
         old = (time.time() - 3600) * 1000
         _deliver(m, _signed_frame(sk, "off1", "1+1", old))
-        self.assertEqual(len(_drained(m)), 1, "timestamp_window<=0 应关闭校验（兼容场景）")
+        got = _drained(m)
+        self.assertEqual(len(got), 1, "timestamp_window<=0 应关闭校验（兼容场景）")
+        self.assertNotIn("_cmq_timestamp_reject", got[0][1])
 
     def test_missing_timestamp_rejected_when_window_on(self):
         m, sk = _make_manager()

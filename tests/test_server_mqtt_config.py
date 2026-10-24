@@ -266,6 +266,56 @@ class ServerMqttConfigTests(unittest.TestCase):
             server_mqtt.rpc_config(global_topic_url="ftp://reports.example.net/")
         self.assertFalse(self.config_path.exists())
 
+    def test_timestamp_reject_publishes_explicit_error_reply(self):
+        """重放窗口拒收不得静默：按标准回包格式向 reply_topic 发明确错误。
+
+        客户端（client_mqtt.request）按 req_id 匹配回包后立即把 error 打印
+        出来——不再死等到自身超时还摸不清是时钟偏差还是重放拒收。
+        """
+        recorded = []
+
+        def _rec(topic, payload, **ka):
+            recorded.append((topic, dict(payload)))
+
+        self.server.mqtt_net.publish_broadcast = _rec
+
+        class _MustNotExecute:
+            def execute(self, *a, **k):
+                raise AssertionError("窗口拒收的请求绝不能进入执行器")
+
+        self.server.executor = _MustNotExecute()
+
+        frame = {
+            "req_id": "20261024_000101.002|deadbeefcafe",
+            "reply_topic": "client/unique/reply",
+            "code": "while True: pass",
+            "timestamp": 1,   # 远古时间戳
+            "_cmq_timestamp_reject": {
+                "reason": "timestamp_window", "window": 120.0,
+                "frame_ts": 1, "server_now_ms": 1790000000000,
+                "error": ("rejected: timestamp outside replay window (±120s). "
+                          "frame_ts=1 server_now_ms=1790000000000. "
+                          "若为时钟偏差请校时(NTP)或调宽/关闭 "
+                          "MultiMQTTManager(timestamp_window=...)。"),
+            },
+        }
+        self.server.handle_message("old/request", frame, "fake-broker")
+
+        self.assertEqual(len(recorded), 1, "必须恰好回包一次错误")
+        topic, resp = recorded[0]
+        self.assertEqual(topic, "client/unique/reply")
+        self.assertFalse(resp["ok"])
+        self.assertIn("replay window", resp["error"])
+        self.assertIn("timestamp_window", resp["error"])
+        self.assertEqual(resp["rejected"], "timestamp_window")
+        self.assertEqual(resp["req_id"], "20261024_000101.002",
+                         "回包 req_id 必须剥掉签名后缀，客户端才能按 base 匹配")
+        self.assertEqual(resp["server_from"], "fake-broker")
+        self.assertIn("server_time", resp)
+        self.assertIsNone(resp["r"])
+        # 标记已消费，不残留
+        self.assertNotIn("_cmq_timestamp_reject", frame)
+
     def test_global_topic_list_publish_is_always_qos1(self):
         """global_topic_list 报告恒以 QoS1 发布：默认参数与自定义参数都如此。"""
         # 默认发布参数：QoS1 + Retain
