@@ -472,6 +472,10 @@ class _TerminalWriter:
             if len(data) > room:
                 self.dropped += len(data) - room
                 data = data[:room]
+            # 卡滞计时从本次入队起算：空闲期后第一笔数据若沿用上次 flush
+            # 时间戳，stall_seconds 会把空闲秒数虚报成卡滞（实测虚报 11s+）。
+            if self._queued_bytes == 0:
+                self._last_flush_ts = time.monotonic()
             self._queued_bytes += len(data)
         self._q.put(data)
 
@@ -2561,7 +2565,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     # 主线程：远端输出原样渲染；任何退出路径都走 _hard_exit 立即收场
     held = bytearray()  # 本地命令栏打开期间暂存远端输出，关闭后补画
     last_stall_warn = [0.0]  # 卡滞告警节流（每 30s 一条）
-    auto_unstick_done = [False]  # 本轮冻结是否已自动解除（解冻后重新武装）
+    last_unstick_ts = [0.0]  # 上次尝试自动解除的时间（每 30s 重试直到成功）
     try:
         while not stop_ev.is_set():
             try:
@@ -2581,19 +2585,20 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                     last_stall_warn[0] = time.monotonic()
                     _emit_local(
                         "[pty][WARN] 终端写卡滞 %.0fs：若窗口处于选择/"
-                        "标记模式请按 ESC 解除，或命令栏执行 redraw "
-                        "切换写线程\n" % _stall)
+                        "标记模式，请先点一下本窗口再按 ESC 解除；"
+                        "或命令栏执行 redraw 切换写线程\n" % _stall)
                 # 长时间冻结（通常是选了文本忘记退出标记模式）：前台时
-                # 合成 ESC 自动解除，鼠标左键选择/右键粘贴照常保留
+                # 合成 ESC 自动解除，鼠标左键选择/右键粘贴照常保留。
+                # 每 30s 重试直到成功：解除仅在窗口前台时生效，用户切到
+                # 别的窗口时一次尝试必然失败，旧的一次性设计会让冻结
+                # 一直挂到手工干预（实证：卡滞 7 分钟未自愈）。
                 if _stall >= _SELECTION_STALL_AUTO_UNSTICK \
-                        and not auto_unstick_done[0]:
+                        and (time.monotonic() - last_unstick_ts[0]) > 30:
+                    last_unstick_ts[0] = time.monotonic()
                     if _cancel_console_selection():
-                        auto_unstick_done[0] = True
                         _emit_local(
                             "[pty] 窗口选择模式冻结输出超过 %.0f 秒，"
                             "已自动解除\n" % _SELECTION_STALL_AUTO_UNSTICK)
-                if auto_unstick_done[0] and _stall == 0.0:
-                    auto_unstick_done[0] = False  # 解冻恢复，允许处理下次冻结
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,

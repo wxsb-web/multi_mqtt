@@ -107,6 +107,10 @@ class _TerminalWriter:
             if len(data) > room:
                 self.dropped += len(data) - room
                 data = data[:room]
+            # 卡滞计时从本次入队起算：空闲期后第一笔数据若沿用上次 flush
+            # 时间戳，stall_seconds 会把空闲秒数虚报成卡滞（实测虚报 11s+）。
+            if self._queued_bytes == 0:
+                self._last_flush_ts = time.monotonic()
             self._queued_bytes += len(data)
         self._q.put(data)
 

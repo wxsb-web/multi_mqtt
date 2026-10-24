@@ -88,4 +88,19 @@
 ## 五、回归与提交索引
 
 - 测试：`python -m unittest discover -s tests`（266 项）与 `python -m unittest discover -s tests/socks5`（51 项）全绿；新增测试 47 项（replay 9 + verify 5 + qos 1 + executor timeout 9 + socks5 2 + cmd_client 13 + pty 3 + rpc_tcp 9，另更新 1 处旧契约断言）。
-- 提交：e389797 → 8ed4f27 → 97507b0 → 5639e2c → 7ad472b → 3e5575e → 988e0c2 → b475d5a，均含完整原因与修改说明，未推送远端。
+- 提交：e389797 → 8ed4f27 → 97507b0 → 5639e2c → 7ad472b → 3e5575e → 988e0c2 → b475d5a（→ 86bb00e 重放窗口拒收回包明确错误），均含完整原因与修改说明，未推送远端。
+
+---
+
+## 附录：2026-10-24 真机（docker "hi"，时钟慢 4 年）验证补遗
+
+### 已验证的行为（符合设计）
+
+1. **未签名 + 服务端无公钥**：窗口校验完全不参与（它只在"验签通过"分支内），执行正常——"k=None 访问无公钥服务器"属正常行为。
+2. **签名 + 服务端有公钥 + 时钟偏差 ≈4 年**：请求被窗口明确拒收，客户端在 ~100ms 内收到标准格式错误回包（`rejected=timestamp_window`，error 含 `frame_ts=1792853529512 server_now_ms=1666623130570` 与处置建议）——86bb00e 的"不静默"行为在真实大幅偏差机器上验证通过。
+
+### 新发现（中）
+
+**17.〔已修 c416464〕`rpc_config()` 更换 broker/公钥时，本次请求自身的回包会丢失**：`apply_rpc_config` 在执行中途把 `self.mqtt_net` 换成新 manager，`handle_message` 随后的回包经**尚未连上任何 broker 的新 manager** 发布（`publish_broadcast` 只发给 `is_connected()` 的 client，冷启动瞬间 `published=0`）→ 配置实际已生效并已持久化，但调用方超时。实测复现：`rpc_config(pub_key=...)` 客户端超时、服务端配置生效。修复：handle_message 入口快照 manager，回包统一经 `_reply_publish` 发出——先经快照；`published==0` 且已换网时 `wait_connected` 后经新 manager 重发一次，仍 0 记 error；未换网 0 成功只记 error 不重发（顺带覆盖全 broker 瞬断丢回包）。仅改 apply_rpc_config 无法修复（回包路径不经过它）；"回退旧 manager"不可行（旧 manager 在 execute 返回前就 stop）。回归：ReplyPublishFallbackTests 4 例。
+
+**18.（部分落地 f63bb12）运维风险（2026-10-25 修正：比初版结论轻）**：验签开启 + 时钟严重偏差时，**持私钥的客户端总可自救**——从窗口拒收的错误回包（或任何成功响应）读 `server_time`，用服务器时钟作为 timestamp 重新签名（签名覆盖 ts，可签任意时间），`|now-ts|≈0` 双检通过后执行 `rpc_config(pub_key=None)`。**已落地**：`rpc()/request()/request_bg_gather()` 新增 `timestamp_ms`（别名 `ts`/`server_ms`）注入参数，req_id 与 timestamp 一并由注入值派生，救援配方写进 rpc docstring；只注入 req_id 无效（窗口读的是 timestamp 字段）。真正不可自救的情形只剩：**私钥丢失**（验签在窗口之前失败，时间伪造无效，只能改 rpc.json/重建容器）——2026-10-24 hi 锁定事故即此例。遗留：① "缺少签名结构"的静默拒绝仍无回包诊断（与 timestamp 拒收不一致）；② 配公钥前先校时仍是最佳实践。

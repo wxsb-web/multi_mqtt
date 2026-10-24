@@ -400,21 +400,42 @@ function rpc(expr) {
 }
 
 let lastCursor = null;                        // 最近一次截图携带的远端光标位置
+function fmtRate(bytesPerSec) {
+    if (bytesPerSec >= 1024 * 1024) return (bytesPerSec / 1048576).toFixed(1) + 'MB/s';
+    if (bytesPerSec >= 1024) return (bytesPerSec / 1024).toFixed(0) + 'KB/s';
+    return Math.round(bytesPerSec) + 'B/s';
+}
 function refresh() {
     if (busy) return;
     busy = true;
+    const t0 = performance.now();
+    let tHead = 0;
     fetch(BASE + screenExpr(), { cache: 'no-store' })
         .then(resp => {
             if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            tHead = performance.now();               // 响应头到达:含服务端截图+编码+网络往返
             lastCursor = resp.headers.get('X-Cursor');
             return resp.blob();
         })
         .then(blob => {
+            const tBody = performance.now();         // 图片数据下载完成
             const url = URL.createObjectURL(blob);
             const old = shot.src;
             shot.src = url;
             if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
             if (lastCursor) snapDotTo(lastCursor);   // 红点吸附到远端真实鼠标位置(与空心圈重合)
+            const total = tBody - t0;
+            const report = () => {
+                const kb = blob.size / 1024;
+                const size = kb >= 1024 ? (kb / 1024).toFixed(2) + 'MB' : kb.toFixed(1) + 'KB';
+                log('截图 ' + shot.naturalWidth + 'x' + shot.naturalHeight + ' ' + size
+                    + ' 请求' + Math.round(tHead - t0) + 'ms 传输' + Math.round(tBody - tHead)
+                    + 'ms 解码' + Math.round(performance.now() - tBody) + 'ms 共' + Math.round(performance.now() - t0) + 'ms'
+                    + ' ' + fmtRate(blob.size / (total / 1000))
+                    + (lastCursor ? ' 光标' + lastCursor : ''));
+            };
+            if (shot.complete) report();
+            else shot.addEventListener('load', report, { once: true });
         })
         .catch(err => log('截图失败: ' + err.message, 'err'))
         .finally(() => { busy = false; });
