@@ -5,6 +5,8 @@
     python pythonanywhere_update.py                              # 默认同步到 .pythonanywhere.com
     python pythonanywhere_update.py https://ip:port/  /other/dir # 自定义 base 与远程目录
     python pythonanywhere_update.py --check                      # 只对比不上传
+    
+.pythonanywhere.com/r=RPCRequestHandler.executor.alias 查询是否alias
 
 流程（全部走 HTTP RPC 通道，复用 client/client_http.py）:
     1. 收集本地源码文件（按扩展名/黑名单过滤，跳过 .git、__pycache__、*.db 等）

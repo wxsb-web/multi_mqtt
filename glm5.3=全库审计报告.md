@@ -46,17 +46,19 @@ socks5_client_mqtt.py:892（int(_sq)）、:753（int(port)）等无 try：一条
 R3. rpc_tcp.py 整体烂掉（已动态验证）
 TCPServer.__init__ 第一行就 NameError: locals_dict is not defined（rpc_tcp.py:56，参数里根本没有这个变量）；__main__ 传的 globals_dict= 也不是合法 kwarg；_process_request 调 execute(code, locals_dict=...) 而该方法签名只有 globals——9 月 17 日 executor 重构后此文件从未跟上。要么删要么修，留着会误导。
 
-R4. _server_vk_invalid 是死代码
-multi_mqtt.py:881 初始化为 False 后从未被置 True；server_mqtt.py:340 还在检查它。历史上 S3 修复承诺的 fail-closed 语义在后续重构中丢了（现在坏公钥表现为构造时抛异常，算碰巧 fail-closed，但这条检查链已无意义）。
 
 R5. 其他中等问题（子代理实锤，列举）
 U.get_machine_id() 每次调用跑 PowerShell/reg，实测 ~1 秒且无缓存（在 MQTTServer.__init__ 路径上）；get_system_id() 返回空的机器（极简容器）会得到 mf_mo_ 这种碰撞 topic（U.py:201-205）。
 rpc() 默认 min_broker_count=11（client_mqtt.py:336）：公共 broker 挂到只剩 10 个时所有请求硬失败，脆。
 服务端把执行结果广播到攻击者指定的 reply_topic（server_mqtt.py:508,578），且默认 sys/device/response 是共享 topic——任何人订阅公共 broker 上的它就能看到别人命令的全部 stdout 和返回值。
+
+
 grep/ls/pull_dir 单条回包绕过 1MiB 在线红线（remote_cmd.py:581-585 等），大输出表现为无诊断的 RemoteTimeout。
 REPL 的 %watch 丢首词（cmd_client_mqtt.py:535）、%grep --include 缺参崩溃（:661）、pty 魔术栏热调 heartbeat 不联动 dead_timeout 误杀会话、detach 意外杀远端裸 shell（与文档承诺相反）等——细节见各文件。
 _on_connect 重连重订阅不带 qos（multi_mqtt.py:1278）而 subscribe(**ka) 接受 qos——目前上层全用 QoS0 所以没炸，属 API 契约陷阱。
 每条请求 logger.info（server_mqtt.py:518）与“日志要克制”的注释自相矛盾，公共 topic 上可被刷日志。
+
+
 三、值得肯定的部分
 公平地说，这些做得很好：竞速协议（多 broker 首胜）+ 30s 去重的设计对公共 broker 的不确定性是对的；rpc.json 原子写（tempfile+fsync+os.replace，server_mqtt.py:224-231）；socks5 那批线程生命周期/反压修复（git 历史里 4f87eb1、e823093 等提交质量很高）；build_code 的双重 JSON 编码把注入面收敛得干净（子代理专项确认无逃逸）；别名表统一三处参数名；测试套件 190 项 62 秒全绿（注意：部分测试会真连公共 broker，在 CI 里算隐患）。
 
