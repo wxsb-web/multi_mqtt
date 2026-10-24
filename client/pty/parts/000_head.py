@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""pty_client_mqtt —— PTY over 公共 MQTT broker（SSH 式交互终端）。
+
+模型（和 SSH 一样）
+===================
+- 仿 cmd_client_mqtt 建立 MQTT 连接（默认 ``sys/device/request`` ↔ response）；
+- 连接成功后，client 生成会话 id 并提出 in/out 两个**新 topic**，协商成功后
+  用于实时数据传输（底层仍完全复用 multi_mqtt.MultiMQTTManager，不新建连接）；
+- 服务端只要求运行通用 server_mqtt.py：PTY 全部功能代码（openpty + 常驻
+  用户 shell + 读写线程）由本 client 在握手时**整段下发执行**；shell 只启动
+  一次，之后每个按键都经 broker 写入同一个 PTY，绝不在每条命令上重启 bash；
+- 服务端主动发送频率可用 ``--interval`` 设定（默认 0=有输出立刻实时回传；
+  >0 时按该秒数攒批合并输出，适合高延迟网络减少帧数）。
+
+用法
+====
+    python client/pty_client_mqtt.py                    # 交互式 PTY（默认参数）
+    python client/pty_client_mqtt.py -i 0.2             # 服务端最多 0.2s 攒批
+    python client/pty_client_mqtt.py --shell /bin/bash --cwd /root
+    python client/pty_client_mqtt.py -t q -k 2333 "tmux at"
+                                                        # SSH 式：连上自动执行
+                                                        # 前置命令，随后留在会话里
+
+AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
+====================================================
+本进程启动时内置一个本地 HTTP RPC 口（默认 1188）。人类先在一个终端里
+开着本窗口，AI / 其他进程不新建 MQTT 连接，直接 HTTP 复用同一个 PTY，
+命令回显与输出照样在本窗口实时可见：
+
+    from client.pty_client_mqtt import ai_pty_run, ai_pty_status, ai_pty_send
+    ai_pty_status()                 # {'attached': True, 'brokers_online': 13, ...}
+    ai_pty_run("uname -a")          # -> {'ok': True, 'rc': 0, 'out': '...'}
+    ai_pty_run("apt install -y htop", timeout=300)
+    ai_pty_send("y\\n")             # 回答交互提示（密码/确认）
+
+裸 HTTP 等价写法（POST 一段 Python 到本地口）：
+
+    curl "http://127.0.0.1:1188/$(python -c \
+"import urllib.parse;print(urllib.parse.quote('import json;p.set_data(json.dumps(ai_bridge.run(\\\"uname -a\\\"),ensure_ascii=False))'))")"
+
+本地诊断日志与 PTY 画面彻底分离
+====================================
+本终端窗口**只渲染远端 shell**；broker 连接/重连、每笔 [RPC] 请求、
+告警、任何库的 print / stdout / stderr 一律不写终端，全部进进程内
+环形缓冲，查看通道有三个：
+
+  ① 浏览器全屏实时日志台（首选，和普通控制台一样，无工具栏）：
+
+        http://192.168.1.3:1188/        # 根路径自动跳 log_html 页面
+        # 页面经 WebSocket /wslog 先收全量快照再实时增量推送，
+        # 滚到底自动跟随，向上翻则暂停，带极简 ANSI 着色；
+        # 手机/同局域网其他机器也能直接开
+
+  ② HTTP RPC 取文本：
+
+        curl "http://192.168.1.3:1188/r=get_log()"     # 最近 200 行
+        curl "http://192.168.1.3:1188/r=get_log(50)"   # 最近 50 行
+        curl "http://192.168.1.3:1188/r=clear_log()"   # 清空
+
+  ③ 窗口前的人按命令栏热键输 log（自擦覆盖层，不留痕迹）。
+
+--port 0 关闭 HTTP 口时没有查看通道，退回旧行为：日志镜像到 stderr。
+
+注意：AI 命令串行执行（一个 shell），重叠调用立刻返回 busy；run() 只
+回收非交互命令的输出，vim/top 等全屏程序请人工在窗口里操作。仅本机
+调用建议 --host 127.0.0.1。
+
+断开
+====
+- 在远端 shell 里 ``exit`` / Ctrl-D（会话自然结束，客户端立即退出）；
+- 本地脱离：Ctrl-]（默认，``--detach-key`` 可改），只断 client，远端
+  tmux/shell 原封不动继续跑，稍后重连再 ``tmux at`` 即可；
+- 本地命令栏：Ctrl+Alt+Insert（默认，``--menu-key`` 可改），可执行
+  detach、status，并热调 interval/heartbeat/ttl/dead 等时间参数，
+  输入的内容不会发到远端；
+- 服务器进程被关 / 网络中断：心跳超时（``--heartbeat`` / ``--dead-timeout``）
+  后客户端自动立即退出，绝不在 broker 仍在线时无限干等。
+
+所有退出路径都学 client_mqtt.py 直接 ``os._exit``：先恢复本地终端模式、
+fire-and-forget 发一帧 stop，不做 pty.close/transport.stop 那套慢清理。
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import codecs
+import io
+import json
+import logging
+import os
+import queue
+import re
+import shutil
+import socket
+import sys
+import threading
+import time
+from collections import deque
+
+# 本文件已迁移到 client/ 子目录：把项目根目录与本目录加入 sys.path，
+# 同时兼容「python client/pty_client_mqtt.py」直接运行与包导入。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.dirname(_HERE), _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+# 必须在 import multi_mqtt 之前：multi_mqtt 在 import 时会 basicConfig 往 root
+# 挂写 stderr 的 StreamHandler，paho/broker 的 INFO 会插进 PTY 远端画面。
+# 本进程的终端只渲染远端 shell，一切本地日志走环形缓冲 + 浏览器实时日志台。
+os.environ.setdefault("CMQ_NO_STDERR_LOG", "1")
+# 直接按脚本启动时没有包上下文，相对导入会失败，显式补上。
+if not __package__:
+    __package__ = "client"
+
+from . import client_mqtt as _cm            # noqa: E402  复用统一别名表/_cli_opts
+from .cmd_client_mqtt import (              # noqa: E402
+    MqttTransport, add_connection_args,
+)
+from .remote_cmd import (                   # noqa: E402
+    RemotePty, RemoteError, DEFAULT_PTY_TTL,
+)
+
+from multi_mqtt import stime, BROKER_LIST
+
