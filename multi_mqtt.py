@@ -850,7 +850,7 @@ class MultiMQTTManager:
     # [修复-N3] stop() 中等待分发线程退出的超时（秒）。
     DISPATCH_JOIN_TIMEOUT = 5.0
 
-    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0):
+    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0, timestamp_window=120.0):
         self.brokers = brokers
         self.keepalive = keepalive
         self.max_reconnect_delay = max_reconnect_delay
@@ -896,6 +896,10 @@ class MultiMQTTManager:
         self.stats = ConnectionQualityStats(enabled=self.enable_stats, lock=self.lock)
         # ------------------
         self.dedup_cache = TTLCache(ttl_seconds=30, max_size=50000)
+        # [重放窗口] 已验签消息的 timestamp 允许与本机时钟的最大偏差（秒）。
+        # <=0 表示关闭校验（兼容调试/手动调时场景）。仅对"配置了公钥且验签
+        # 通过"的消息生效，见 _on_message。
+        self.timestamp_window = float(timestamp_window)
         self.message_callback = None
         self.subscribed_topics = set()
         self._stop_event = threading.Event()
@@ -1359,6 +1363,25 @@ class MultiMQTTManager:
                     except Exception:
                         logger.warning(f"⚠️ [{host}] 拒绝执行: ECDSA 签名无效 , req_id={req_id} , server_pubkey={_describe_public_key(self.server_public_key_bytes,short_text=True)}")
                         return
+                    # [重放窗口] 验签只证明"签名者签过这条消息"，不证明它是新近
+                    # 发出的。公共 broker 允许 # 通配订阅（见 BROKER_LIST 上方
+                    # 注释），合法签名帧可被被动嗅探；原先唯一防线是 30s 的
+                    # dedup TTLCache，TTL 过期后同一帧可原样重发并通过验签，
+                    # 对任意 code 执行通道等于重放 RCE。这里在验签通过后校验
+                    # timestamp 与本机时钟的偏差，超窗即拒绝，使嗅探/重放的
+                    # 旧帧天然失效（客户端签名时 timestamp 均取 utc_ms()）。
+                    if self.timestamp_window and self.timestamp_window > 0:
+                        try:
+                            _ts_ms = float(data.get("timestamp"))
+                        except (TypeError, ValueError):
+                            _ts_ms = None
+                        if (_ts_ms is None
+                                or abs(time.time() * 1000.0 - _ts_ms)
+                                > self.timestamp_window * 1000.0):
+                            logger.warning(
+                                f"⚠️ [{host}] 拒绝执行: timestamp 超出重放窗口 "
+                                f"(±{self.timestamp_window:g}s), req_id={base_req_id}")
+                            return
             
             if self.message_callback:
                 try:
