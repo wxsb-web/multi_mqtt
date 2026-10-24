@@ -313,5 +313,67 @@ class PublishBroadcastTests(unittest.TestCase):
         self.assertEqual(mgr.publish_broadcast("topic", {"value": 1}), 2)
 
 
+class TimestampMsInjectionTests(unittest.TestCase):
+    """[救援通道] timestamp_ms 注入：req_id/timestamp 同源于注入的服务器时钟。
+
+    服务端验签开启且时钟偏差超窗时，"按服务器钟签名"是唯一 MQTT 侧自救
+    手段（签名覆盖 timestamp，可签任意时间）；本组锁定注入链路本身。
+    """
+
+    def _node_with_capture_net(self, captured):
+        node = client_mqtt.MQTTClientNode()
+
+        class _FakeNet:
+            client_private_key_bytes = None
+
+            def publish_broadcast(self, topic, payload, **_ka):
+                captured.update(payload)
+                node._on_message(client_mqtt.REPLY_TOPIC,
+                                 {"req_id": payload["req_id"], "ok": True},
+                                 "broker-test")
+                return 5
+
+        node.mqtt_net = _FakeNet()
+        return node
+
+    def test_request_uses_injected_timestamp_and_derives_req_id(self):
+        captured = {}
+        node = self._node_with_capture_net(captured)
+        server_ms = 1666622867720   # 模拟慢钟服务器时间（2022）
+        resp = node.request("1+1", timeout=0.5, timestamp_ms=server_ms)
+        self.assertTrue(resp["ok"])
+        self.assertEqual(captured["timestamp"], server_ms,
+                         "报文 timestamp 必须用注入值（穿窗的关键）")
+        self.assertEqual(captured["req_id"], client_mqtt.get_req_id(server_ms),
+                         "req_id 应由同一注入值派生（保持与 timestamp 同源的既有风格）")
+
+    def test_request_default_uses_local_clock(self):
+        from rpc_executor import utc_ms
+        captured = {}
+        node = self._node_with_capture_net(captured)
+        t0, t1 = utc_ms(), None
+        resp = node.request("1+1", timeout=0.5)
+        t1 = utc_ms()
+        self.assertTrue(resp["ok"])
+        self.assertGreaterEqual(captured["timestamp"], t0)
+        self.assertLessEqual(captured["timestamp"], t1)
+
+    def test_rpc_passes_ts_alias_through(self):
+        stub = SimpleNamespace(request=Mock(return_value={"ok": True}))
+        orig = client_mqtt._default_client
+        client_mqtt._default_client = stub
+        try:
+            out = client_mqtt.rpc("1+1", "t/x", timeout=1,
+                                  ts=1666622867720)
+            self.assertEqual(out, {"ok": True})
+            self.assertEqual(stub.request.call_args.kwargs.get("timestamp_ms"),
+                             1666622867720, "rpc 的 ts 别名必须透传为 timestamp_ms")
+            client_mqtt.rpc("1+1", "t/x", timeout=1)
+            self.assertIsNone(stub.request.call_args.kwargs.get("timestamp_ms"),
+                              "未传时透传 None（走默认本机时钟路径）")
+        finally:
+            client_mqtt._default_client = orig
+
+
 if __name__ == "__main__":
     unittest.main()

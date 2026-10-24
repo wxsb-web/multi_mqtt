@@ -30,6 +30,7 @@ alias_status       =('status','state','s')
 alias_help         =('help','h','?')
 alias_exit         =('exit', 'quit')
 alias_timeout      =('timeout','time','wait','second','sec')
+alias_timestamp_ms =('timestamp_ms','ts','server_ms')
 
 def _cli_opts(*names):
     """从别名生成 argparse 选项：自动加 --/- 前缀，_ 与 - 都支持；单字符只出 -x。
@@ -121,7 +122,7 @@ class MQTTClientNode:
     def request(self, payload: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_TIMEOUT,
                 client_private_key_bytes=None, allow_no_server_pubkey_response: bool = None,
                 reply_topic: str = REPLY_TOPIC, gather_window: float = 0.0,
-                republish_delays=(), min_broker_count: int = 0):
+                republish_delays=(), min_broker_count: int = 0, timestamp_ms=None):
         none={}
         if client_private_key_bytes is None:
             client_private_key_bytes = self.client_private_key_bytes or getattr(self.mqtt_net, "client_private_key_bytes", None)
@@ -139,7 +140,13 @@ class MQTTClientNode:
                     "❌ [Broker 未就绪] 需要至少 %d 个在线 Broker，当前只有 %d 个",
                     min_broker_count, online)
                 return none
-        ms = utc_ms()
+        # [救援通道] 默认取本机时钟；显式传"服务器时钟毫秒"（取自窗口拒收
+        # 错误回包或任意成功响应的 server_time 字段）时，req_id 与 timestamp
+        # 一并由该值生成——签名覆盖 timestamp，因此"按服务器钟签名"可穿过
+        # 服务端重放窗口。用途：服务端验签开启且时钟偏差超窗被拒时，用
+        # rpc(code, topic, k=私钥, timestamp_ms=<server_time>) 重发自救请求
+        # （如 rpc_config(pub_key=None) 解锁）。除本行外其余路径零改动。
+        ms = utc_ms() if timestamp_ms is None else int(timestamp_ms)
         req_id = get_req_id(ms)
         start_time = time.perf_counter()
         req_data = {"req_id": req_id, "reply_topic": reply_topic, "code": payload, "timestamp": ms}
@@ -226,7 +233,7 @@ class MQTTClientNode:
                           timeout=DEFAULT_TIMEOUT, client_private_key_bytes=None,
                           allow_no_server_pubkey_response=None,
                           reply_topic=REPLY_TOPIC, gather_window: float = 0.8,
-                          republish_delays=(), on_gather=None):
+                          republish_delays=(), on_gather=None, timestamp_ms=None):
         """与 :meth:`request` 相同的一发一收，但 **首包一到立即返回**；
         随后在后台 daemon 线程继续留 ``gather_window`` 秒收集其他持相同 key
         的服务端进程的迟到回包，收集结束后回调一次
@@ -240,7 +247,8 @@ class MQTTClientNode:
             client_private_key_bytes = self.client_private_key_bytes or getattr(self.mqtt_net, "client_private_key_bytes", None)
         if allow_no_server_pubkey_response is None:
             allow_no_server_pubkey_response = self.allow_no_server_pubkey_response
-        ms = utc_ms()
+        # [救援通道] 同 request(timestamp_ms=...)：按服务器钟签名穿窗。
+        ms = utc_ms() if timestamp_ms is None else int(timestamp_ms)
         req_id = get_req_id(ms)
         start_time = time.perf_counter()
         req_data = {"req_id": req_id, "reply_topic": reply_topic,
@@ -333,14 +341,24 @@ class MQTTClientNode:
 
 def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_TIMEOUT,
         client_private_key_bytes=None, allow_no_server_pubkey_response: bool = False,
-        reply_topic: str = REPLY_TOPIC, min_broker_count:int=11, **ka):
-    """Execute code through a lazily started shared MQTT client."""
+        reply_topic: str = REPLY_TOPIC, min_broker_count:int=10, **ka):
+    """Execute code through a lazily started shared MQTT client.
+
+    救援通道（timestamp_ms / ts / server_ms 别名）：服务端验签开启且时钟
+    偏差超窗、请求被 rejected=timestamp_window 拒收时，读错误回包（或任一
+    成功响应）里的 server_time，用服务器时钟重发即可穿窗执行自救请求：
+        d = rpc(code, topic, k=私钥)                     # 被 window 拒，拿到 d['server_time']
+        rpc("rpc_config(pub_key=None)", topic, k=私钥, timestamp_ms=d['server_time'])
+    原理：签名覆盖 timestamp，客户端可签任意时间；req_id 与 timestamp 一并
+    由注入值派生，其余路径零改动。
+    """
     global _default_client
     code=get_duplicated_kargs(ka,*alias_code,default=code)
     request_topic=get_duplicated_kargs(ka,*alias_request_topic,default=request_topic)
     client_private_key_bytes=get_duplicated_kargs(ka,*alias_private_key,default=client_private_key_bytes)
     allow_no_server_pubkey_response=get_duplicated_kargs(ka,*alias_allow_no_pub,default=allow_no_server_pubkey_response)
     timeout=get_duplicated_kargs(ka,*alias_timeout,default=timeout)
+    timestamp_ms=get_duplicated_kargs(ka,*alias_timestamp_ms,default=None)
     with _default_client_lock:
         if _default_client is None:
             _default_client = MQTTClientNode(
@@ -355,6 +373,7 @@ def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_
         allow_no_server_pubkey_response=allow_no_server_pubkey_response,
         reply_topic=reply_topic,
         min_broker_count=min_broker_count,
+        timestamp_ms=timestamp_ms,
     )
 
 def stop():
