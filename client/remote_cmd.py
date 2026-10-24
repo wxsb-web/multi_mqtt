@@ -2489,18 +2489,19 @@ class RemotePty:
         except Exception:
             pass
 
-    def wait_end(self, timeout=None) -> bool:
-        """阻塞到远端会话结束（或超时）。返回是否已结束。"""
-        return self._end_event.wait(timeout)
+    def leave(self) -> None:
+        """本地脱离：只清理本地订阅/状态，**不发 stop**，远端 shell/tmux
+        原封不动继续跑（孤儿会话由服务端按 TTL 收割，重连可续）。
 
-    def close(self) -> None:
-        """断开：通知服务端停止、取消本地订阅；不停底层 transport/node。"""
-        if self.sid is not None:
-            self.detach()
-            try:
-                self._end_event.wait(1.5)
-            except Exception:
-                pass
+        与 :meth:`detach` / :meth:`close` 的区别：后两者会通知服务端结束
+        会话并 kill 进程组。Ctrl-] / 命令栏 detach 必须走本方法——文档与
+        banner 承诺"本地脱离（远端 tmux/shell 继续运行）"，旧实现复用
+        detach 发 stop，未进 tmux 的裸 shell 前台作业会被 SIGHUP/SIGKILL。
+        """
+        self._cleanup_local()
+
+    def _cleanup_local(self):
+        """close/leave 共用的本地清理：退订输出流、关重排缓冲、复位状态。"""
         if self._handler is not None and self.out_topic is not None:
             try:
                 self.tr.stream_unsubscribe(self.out_topic, self._handler)
@@ -2514,3 +2515,17 @@ class RemotePty:
         self._owner_ready = False
         self._pending_frames = []
         self.foreign_frames = 0
+
+    def wait_end(self, timeout=None) -> bool:
+        """阻塞到远端会话结束（或超时）。返回是否已结束。"""
+        return self._end_event.wait(timeout)
+
+    def close(self) -> None:
+        """断开：通知服务端停止、取消本地订阅；不停底层 transport/node。"""
+        if self.sid is not None:
+            self.detach()
+            try:
+                self._end_event.wait(1.5)
+            except Exception:
+                pass
+        self._cleanup_local()

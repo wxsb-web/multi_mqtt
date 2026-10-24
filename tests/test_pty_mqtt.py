@@ -344,6 +344,35 @@ class RemotePtyClientTests(unittest.TestCase):
         # resize/detach 在未 open 时静默忽略，不能炸
         pty.resize(24, 80)
         pty.detach()
+        pty.leave()
+
+    def test_leave_detaches_without_stop_frame(self):
+        """本地脱离必须不发 stop：远端 shell/tmux 按承诺继续运行。
+
+        旧行为：Ctrl-] 路径复用 detach() 发 stop 帧，服务端 _in_loop 对
+        进程组 SIGHUP→SIGKILL，未进 tmux 的裸 shell 前台作业被杀。
+        """
+        tr = FakeTransport()
+        pty, _, _, _ = _open_pty(tr, "pty-leave-1")
+        pty.leave()
+        # 全部上行帧里不允许出现 stop（claim 等控制帧可以有）
+        self.assertFalse(any(f.get("stop") for _, f in tr.published),
+                         "leave() 不得发 stop 帧: %r" % tr.published)
+        # 本地订阅已退、状态已复位
+        self.assertIn(("unsub", "pty/pty-leave-1/out"), tr.events)
+        self.assertIsNone(pty.sid)
+        self.assertIsNone(pty.owner)
+        # 幂等：sid 已 None 时再次 leave 无操作
+        pty.leave()
+
+    def test_close_still_sends_stop_frame(self):
+        """close()/detach() 的"结束远端会话"语义不变。"""
+        tr = FakeTransport()
+        pty, _, _, _ = _open_pty(tr, "pty-close-1")
+        pty.close()
+        self.assertTrue(any(f.get("stop") for _, f in tr.published))
+        self.assertIn(("unsub", "pty/pty-close-1/out"), tr.events)
+        self.assertIsNone(pty.sid)
 
     def test_open_timeout_unsubscribes(self):
         tr = FakeTransport(response=None)
@@ -854,6 +883,33 @@ class PtyMagicBarTests(unittest.TestCase):
         self.assertEqual(ctx["live"]["heartbeat"], 0.0)
         pcm._run_magic("ttl 10", ctx)
         self.assertEqual(ctx["live"]["ttl"], 60.0)  # 下限夹取
+
+    def test_heartbeat_hot_tune_links_dead_timeout(self):
+        """热调 heartbeat 必须按开局规则联动 dead_timeout。
+
+        旧行为只改 live["heartbeat"]：热调 heartbeat 0 / 调大后，静默
+        shell 超过陈旧的 dead_timeout 即被误判服务器已死强制退出。
+        """
+        _, _, ctx = self._ctx()   # 初始 heartbeat=5, dead_timeout=15
+        _, lines = pcm._run_magic("heartbeat 300", ctx)
+        self.assertEqual(ctx["live"]["heartbeat"], 300.0)
+        self.assertEqual(ctx["live"]["dead_timeout"], 900.0)  # max(15, 3*300)
+        self.assertTrue(any("联动" in x for x in lines))
+        # 关闭心跳 → 同步停止判死（开局同一规则）
+        _, lines = pcm._run_magic("heartbeat 0", ctx)
+        self.assertEqual(ctx["live"]["heartbeat"], 0.0)
+        self.assertEqual(ctx["live"]["dead_timeout"], 0.0)
+        self.assertTrue(any("不再判死" in x for x in lines))
+        # 判死被显式关闭时开心跳：保持关闭（尊重用户显式选择）
+        pcm._run_magic("heartbeat 10", ctx)
+        self.assertEqual(ctx["live"]["heartbeat"], 10.0)
+        self.assertEqual(ctx["live"]["dead_timeout"], 0.0)
+        # 显式重开判死后恢复 3×心跳下限联动
+        pcm._run_magic("dead 20", ctx)
+        pcm._run_magic("heartbeat 5", ctx)
+        self.assertEqual(ctx["live"]["dead_timeout"], 20.0)  # max(20, 15)
+        pcm._run_magic("heartbeat 10", ctx)
+        self.assertEqual(ctx["live"]["dead_timeout"], 30.0)  # max(20, 30)
 
     def test_local_dead_timeout_no_frame(self):
         tr, _, ctx = self._ctx()

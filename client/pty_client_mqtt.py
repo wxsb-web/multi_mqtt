@@ -1748,23 +1748,42 @@ def _run_magic(line, ctx):
         except RemoteError as exc:
             return False, ["设置失败: %s" % exc]
         live[canon] = applied[remote_key]
-        return False, ["%s <- %s 秒（已通知服务端热调）"
-                       % (canon, applied[remote_key])]
+        lines = ["%s <- %s 秒（已通知服务端热调）"
+                 % (canon, applied[remote_key])]
+        if canon == "heartbeat":
+            # 与会话建立时（run_session 开局）同一规则联动 dead_timeout：
+            # hb<=0 → 停止判死（静默 shell 与服务器已死无法区分，不误杀）；
+            # hb>0 且判死已开启 → 下限 3×心跳。旧实现不联动：热调
+            # heartbeat 0 或调大后，静默 shell 超过陈旧的 dead_timeout 即
+            # 被误判"服务器已死"强制退出，退出路径还顺手发 stop 杀远端。
+            _hb = live["heartbeat"]
+            if _hb <= 0:
+                live["dead_timeout"] = 0.0
+                lines.append("心跳已关闭：dead_timeout 自动置 0（不再判死）")
+            elif live["dead_timeout"] > 0:
+                live["dead_timeout"] = max(live["dead_timeout"], _hb * 3)
+                lines.append("dead_timeout 联动 <- %g 秒（不小于 3×心跳）"
+                             % live["dead_timeout"])
+        return False, lines
     return False, ["未知本地命令: %s（输入 help 查看）" % cmd]
 
 
-def _hard_exit(console, code: int, message: str, pty=None):
+def _hard_exit(console, code: int, message: str, pty=None, leave=False):
     """学 client_mqtt.py 的退出风格：直接 ``os._exit``，干脆不拖泥带水。
 
     旧路径退出时要 pty.close() 干等 end 帧 1.5s + join 输入线程 2s +
     transport.stop() 逐个 broker disconnect——服务器已死时这些等待全都
     纯属浪费，界面就是这样"卡住"的。``os._exit`` 会跳过所有 finally，
-    所以这里必须自己先把终端模式恢复；stop 帧只 fire-and-forget（能发
-    出去就让远端顺手收尸，发不出去也不等）。
+    所以这里必须自己先把终端模式恢复。
+
+    leave=True（Ctrl-]/命令栏 detach 的本地脱离路径）：走 pty.leave()，
+    只清本地订阅、不发 stop——远端 shell/tmux 按承诺继续运行，孤儿会话
+    由服务端 TTL 收割。leave=False（判死/会话已结束/中断等退出路径）：
+    stop 帧只 fire-and-forget（能发出去就让远端顺手收尸，发不出去也不等）。
     """
     if pty is not None:
         try:
-            pty.detach()
+            pty.leave() if leave else pty.detach()
         except Exception:
             pass
     try:
@@ -1860,7 +1879,7 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
         f"[{stime()}] connected shell={env['shell']} pid={env['pid']} "
         f"({env['rows']}x{env['cols']}, interval={env['flush_interval']})\t"
         f"{env['in_topic']}\t{env['out_topic']}\n"
-        f"[pty] {_describe_key(detach_key)} 本地脱离（远端 tmux 不受影响）；"
+        f"[pty] {_describe_key(detach_key)} 本地脱离（远端 shell/tmux 继续运行）；"
         f"{_describe_key(menu_key)} 本地命令栏（detach/status/时间参数）；"
         f"远端 exit/Ctrl-D 结束会话\n")
     if env.get("cwd_warning"):
@@ -2183,8 +2202,11 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     except KeyboardInterrupt:
         _hard_exit(console, 130, "\r\n[pty] interrupted\r\n", pty)
 
-    # input_loop 结束：Ctrl-] 本地脱离 / 本地 stdin 关闭
-    _hard_exit(console, 0, "\r\n[pty] session ended: detached\r\n", pty)
+    # input_loop 结束：Ctrl-] 本地脱离 / 本地 stdin 关闭。
+    # leave=True：只清本地订阅不发 stop，远端 shell/tmux 继续运行
+    # （与 banner/帮助文案的承诺一致；裸 shell 前台作业不再被误杀）。
+    _hard_exit(console, 0, "\r\n[pty] session ended: detached\r\n", pty,
+               leave=True)
     return 0  # 不可达：_hard_exit 不返回；仅为类型/静态检查保留
 
 
