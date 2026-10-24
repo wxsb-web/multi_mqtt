@@ -490,6 +490,39 @@ class MQTTServer:
                 self._rpc_config = candidate
             _ACTIVE_SERVER = self
 
+    def _reply_publish(self, net, reply_topic, payload):
+        """[#17 回包防丢] 回包统一经"收到本请求的 manager"快照发出。
+
+        执行期间 apply_rpc_config 可能换掉 self.mqtt_net（rpc_config 改
+        broker/公钥）：旧 manager 在请求返回前就 stop、新 manager 冷启动
+        还没连上任何 broker——直接经 self.mqtt_net 发布会 published=0 静默
+        丢回包（配置实际已生效但调用方超时）。这里先经快照发；0 成功且
+        网络层确已被换时，等新 manager 连上后重发一次；仍 0 记 error。
+
+        publish_broadcast 返回成功入队的 broker 数；None 视为已发出
+        （测试桩/不计数实现），不触发回退。
+        """
+        try:
+            published = net.publish_broadcast(reply_topic, payload)
+        except Exception:
+            logger.exception("回包发布异常 reply=%s req_id=%s",
+                             reply_topic, payload.get("req_id"))
+            return
+        if published is None or published:
+            return
+        new_net = self.mqtt_net
+        if new_net is not net:
+            try:
+                new_net.wait_connected(min_count=1, timeout=5.0)
+                published = new_net.publish_broadcast(reply_topic, payload)
+            except Exception:
+                logger.exception("回包经新 manager 重发失败 reply=%s req_id=%s",
+                                 reply_topic, payload.get("req_id"))
+        if not published:
+            logger.error(
+                "⚠️ 回包发布 0 成功（全部 broker 不可达或换网未就绪）: "
+                "reply=%s req_id=%s", reply_topic, payload.get("req_id"))
+
     # ------------------------------------------------------------------
     # 消息处理：运行在 MultiMQTTManager 的 "MQTTMsgDispatch" 后台线程中。
     # 注意：
@@ -511,6 +544,9 @@ class MQTTServer:
             req_id = data.get("req_id")
             reply_topic = data.get("reply_topic") or self.reply_topic
             code = data.get("code",None)
+            # [#17] 快照"收到本请求的 manager"，全部回包经 _reply_publish
+            # 由它发出（执行期间 rpc_config 可能换掉 self.mqtt_net）。
+            net = self.mqtt_net
 
             # 网络层重放窗口拒收（验签通过但 timestamp 超窗）：不静默丢帧。
             # 按标准回包格式向 reply_topic 发布明确错误，客户端立即拿到
@@ -529,7 +565,7 @@ class MQTTServer:
                     _ts_reject.get("server_now_ms"),
                 )
                 if reply_topic:
-                    self.mqtt_net.publish_broadcast(reply_topic, {
+                    self._reply_publish(net, reply_topic, {
                         "req_id": req_id,
                         "r": None,
                         "stdout": "",
@@ -561,7 +597,7 @@ class MQTTServer:
                     "server_from": rx_broker,
                 }
                 if reply_topic:
-                    self.mqtt_net.publish_broadcast(reply_topic, response_data)
+                    self._reply_publish(net, reply_topic, response_data)
                 return
 
             if not isinstance(code, str):
@@ -577,7 +613,7 @@ class MQTTServer:
                     "server_from": rx_broker,
                 }
                 if reply_topic:
-                    self.mqtt_net.publish_broadcast(reply_topic, response_data)
+                    self._reply_publish(net, reply_topic, response_data)
                 return
 
             execution = self.executor.execute(code, format_result=True)
@@ -608,7 +644,7 @@ class MQTTServer:
                 # response_data["error"] = execution.get("error", "unknown error")
 
             if reply_topic:
-                self.mqtt_net.publish_broadcast(reply_topic,execution)
+                self._reply_publish(net, reply_topic, execution)
 
         except Exception as handle_message_error:# 兜底：绝不让异常冒到 MultiMQTTManager 的分发线程 logger.exception(自动追加完整 traceback
             logger.exception(f"处理MQTT请求失败:topic={topic} rx_broker={rx_broker} {handle_message_error}")

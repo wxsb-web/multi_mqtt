@@ -381,6 +381,98 @@ class ServerMqttConfigTests(unittest.TestCase):
             http_server.server_close()
 
 
+class _ReplyNet:
+    """[#17] 记录 publish_broadcast 的假 manager；result 模拟成功入队数（0=全失败）。"""
+
+    def __init__(self, result=3):
+        self.published = []
+        self.result = result
+        self.waited = None
+
+    def publish_broadcast(self, topic, payload, **ka):
+        self.published.append((topic, dict(payload)))
+        return self.result
+
+    def wait_connected(self, min_count=1, timeout=0.0):
+        self.waited = (min_count, timeout)
+        return 1
+
+
+class ReplyPublishFallbackTests(unittest.TestCase):
+    """[#17] handle_message 回包经入口 manager 快照发出；0 成功且换网时
+    等新 manager 连上后重发——rpc_config 换 broker/公钥不再丢自身回包。"""
+
+    def setUp(self):
+        self.manager_patch = mock.patch.object(
+            server_mqtt, "MultiMQTTManager", FakeMQTTManager)
+        self.manager_patch.start()
+        FakeMQTTManager.instances.clear()
+        self.server = server_mqtt.MQTTServer(
+            brokers=[("b.example", 1883)],
+            request_topic="t/request",
+            server_public_key_bytes=None,
+            enable_global_topic_list=False,
+        )
+
+    def tearDown(self):
+        self.manager_patch.stop()
+
+    def _handle(self, req_id, code, reply="rep/x"):
+        self.server.handle_message(
+            "t/request",
+            {"req_id": req_id, "reply_topic": reply, "code": code},
+            "fake-broker")
+
+    def test_normal_reply_single_publish_no_fallback(self):
+        old = _ReplyNet(result=3)
+        self.server.mqtt_net = old
+        self._handle("r1", "1+1", "rep/1")
+        self.assertEqual(len(old.published), 1, "正常路径只发一次，不触发回退")
+        topic, payload = old.published[0]
+        self.assertEqual(topic, "rep/1")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["req_id"], "r1")
+
+    def test_swapped_manager_zero_publish_falls_back_to_new(self):
+        """rpc_config 换网场景：旧 manager 已 stop（0 成功），新 manager
+        冷启动——回包必须等新 manager 连上后经它重发，不再静默丢失。"""
+        old = _ReplyNet(result=0)
+        new = _ReplyNet(result=2)
+        self.server.mqtt_net = old
+        # 执行期间换网：executor 里的代码把 self.server.mqtt_net 换成 new
+        from rpc_executor import PythonExecutor
+        self.server.executor = PythonExecutor(
+            globals={"_swap": lambda: setattr(self.server, "mqtt_net", new)})
+        self._handle("r2", "_swap(); r='done'", "rep/2")
+        self.assertEqual(len(old.published), 1, "先经入口快照（旧 manager）发一次")
+        self.assertEqual(len(new.published), 1, "0 成功后必须经新 manager 重发")
+        self.assertIsNotNone(new.waited, "重发前应等新 manager 连上")
+        topic, payload = new.published[0]
+        self.assertEqual(topic, "rep/2")
+        self.assertEqual(payload["r"], "done")
+        self.assertEqual(payload["req_id"], "r2")
+
+    def test_zero_publish_without_swap_logs_error(self):
+        old = _ReplyNet(result=0)
+        self.server.mqtt_net = old
+        with self.assertLogs("Server", level="ERROR") as cm:
+            self._handle("r3", "1+1", "rep/3")
+        self.assertTrue(any("回包发布 0 成功" in line for line in cm.output))
+        self.assertEqual(len(old.published), 1, "未换网不得重发（发了也没人收）")
+
+    def test_zero_publish_with_swap_new_also_zero_logs_error(self):
+        old = _ReplyNet(result=0)
+        new = _ReplyNet(result=0)
+        self.server.mqtt_net = old
+        from rpc_executor import PythonExecutor
+        self.server.executor = PythonExecutor(
+            globals={"_swap": lambda: setattr(self.server, "mqtt_net", new)})
+        with self.assertLogs("Server", level="ERROR") as cm:
+            self._handle("r4", "_swap(); r=1", "rep/4")
+        self.assertEqual(len(new.published), 1, "换网路径应已重发一次")
+        self.assertTrue(any("回包发布 0 成功" in line for line in cm.output))
+
+
 class IsVerifyEnabledTests(unittest.TestCase):
     """[R4 死代码清理] _server_vk_invalid 标志删除后，验签状态只由真实属性决定。
 
