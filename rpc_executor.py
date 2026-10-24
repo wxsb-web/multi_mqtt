@@ -3,10 +3,25 @@
 import ast
 import asyncio
 import io
+import keyword
 import sys
 import threading
 import textwrap
 import traceback
+
+
+# ------------------------------------------------------------------ #
+# code alias 指令关键字
+# ------------------------------------------------------------------ #
+# 关键字本身定义为 list：运行期可动态增删元素来自定义触发词。例如
+# ``rpc_executor.ALIAS_KEYWORDS.append('a')`` 之后 ``#a abc`` 与
+# ``#alias abc`` 等价；增删查改所有指令都从同一个 list 匹配。
+# 两个 list 不应包含相同元素（重叠时按 alias 语义解析）。
+ALIAS_KEYWORDS = ["alias",'a']
+UNALIAS_KEYWORDS = ["unalias",'ua','d']
+#发送只有 #alias 三个字（不带名字、不带代码）即可 list all alias
+
+ 
 
 
 class PythonExecutor:
@@ -44,6 +59,10 @@ class PythonExecutor:
     如果要在函数内部 调用 PythonExecutor 执行时绕过共享命名空间，可以直接赋值 ``self.locals_dict``。
     """
 
+    # 指令关键字：与模块级 list 共享同一对象，运行期改任一引用都立即生效
+    alias_keywords = ALIAS_KEYWORDS
+    unalias_keywords = UNALIAS_KEYWORDS
+
     def __init__(self, globals=None, main_loop=None, copy_globals=False):
         # 默认零拷贝：直接持有调用方字典，外部对它的修改实时可见
         # （server_mqtt 通道依赖此行为，启动后才创建的 gms 等名字必须可见）。
@@ -61,6 +80,9 @@ class PythonExecutor:
         self.main_loop = main_loop
         self.lock = threading.RLock()
 
+        # code alias 注册表：name -> {"code","created","updated","hits","last_used"}
+        self.aliases = {}
+
     # ------------------------------------------------------------------ #
     # 公开 API
     # ------------------------------------------------------------------ #
@@ -75,13 +97,29 @@ class PythonExecutor:
         注意：整个“保存旧值 → 注入 → 执行 → 还原”的过程都在同一把
         可重入锁内完成。否则并发请求会互相看到对方注入的上下文变量，
         并且还原顺序错乱，导致请求级名字永久泄漏到持久命名空间里。
+
+        code alias
+        ----------
+        首行是 ``#alias`` / ``#unalias``（或 ALIAS_KEYWORDS /
+        UNALIAS_KEYWORDS 列表里的任意关键字）时，按增删查改指令处理，
+        不走常规执行；define 指令注册成功后会把 body 立即执行一次，
+        注册信息附在返回 dict 的 ``alias`` 键上。整段输入**精确等于**
+        某个已注册别名时，替换为别名 body 后再执行（因此 ``abc+1``、
+        ``print(abc)`` 等普通代码完全不受别名影响）。
         """
         if not isinstance(code, str) or not code.strip():
             return {"r": "", "stdout": "", "ok": False, "error": "code is required"}
 
+        # code alias 指令拦截：增删查改不进入常规执行路径。
+        directive = self._parse_alias_directive(code)
+        if directive is not None:
+            with self.lock:
+                return self._handle_alias_directive(directive, globals, format_result)
+
         output = io.StringIO()
         # 整段注入 / 执行 / 还原都在锁内，避免并发下互相污染。
         with self.lock:
+            code = self._expand_alias(code)
             saved = {}
             injected = []
             try:
@@ -119,6 +157,150 @@ class PythonExecutor:
                         self.globals_dict[k] = saved[k]
                     else:
                         self.globals_dict.pop(k, None)
+
+    # ------------------------------------------------------------------ #
+    # code alias：#alias / #unalias 指令与别名替换
+    # ------------------------------------------------------------------ #
+    # 语法（关键字取自 ALIAS_KEYWORDS / UNALIAS_KEYWORDS，均可运行期增删）：
+    #   #alias                    列出全部别名（name -> code）
+    #   #alias abc                查询单个别名（完整记录含 hits 等元数据）
+    #   #alias abc ⏎ <code>       增 / 改：注册并立即执行一次 body
+    #   #unalias abc [def ...]    删：支持一次删多个；不存在则报错
+    #   abc                       用：整段输入精确等于别名时替换执行。
+    # 指令行必须是非空首行；其后的所有行整体作为 body（自动 dedent）。
+    # ------------------------------------------------------------------ #
+
+    def _parse_alias_directive(self, code):
+        """识别首行 ``#<关键字> ...`` 指令，返回 dict 或 None。
+
+        返回 ``{"kind": "alias"|"unalias", "arg": str, "body": str}``；
+        首行不是指令时返回 ``None``，代码按普通路径执行。纯解析不改
+        状态，无需持锁。
+        """
+        head, _, body = code.lstrip().partition("\n")
+        token = head.strip()
+        if not token.startswith("#"):
+            return None
+        words = token[1:].split(None, 1)
+        if not words:
+            return None
+        keyword, arg = words[0], (words[1].strip() if len(words) > 1 else "")
+        # alias 优先于 unalias 匹配：两个 list 有重叠元素时按 alias 语义解析
+        if keyword in self.alias_keywords:
+            return {"kind": "alias", "arg": arg, "body": body}
+        if keyword in self.unalias_keywords:
+            return {"kind": "unalias", "arg": arg, "body": body}
+        return None
+
+    def _handle_alias_directive(self, directive, globals=None, format_result=False):
+        """按指令 kind 分发增删查改。调用方（execute）已持有 self.lock。"""
+        if directive["kind"] == "unalias":
+            return self._alias_unalias(directive["arg"])
+
+        body = textwrap.dedent(directive["body"]).strip()
+        names = directive["arg"].split()
+        if not names:
+            if body:
+                return self._alias_error(
+                    "usage: #<关键字> <名字> 换行 <代码>；#<关键字> 查全部，"
+                    "#<关键字> <名字> 查单个"
+                )
+            return self._alias_list_all()
+        if len(names) > 1:
+            return self._alias_error(f"指令行只允许一个别名名字，收到: {names}")
+        if body:
+            return self._alias_define(names[0], body, globals, format_result)
+        return self._alias_show(names[0])
+
+    def _expand_alias(self, code):
+        """整段输入精确等于某个已注册别名时替换为别名 body。
+
+        只做顶层精确匹配：``abc+1``、``print(abc)`` 等不受影响，
+        因此别名不会与命名空间里的同名变量产生隐蔽干扰——
+        想访问同名变量时写出更长的表达式即可。
+        """
+        info = self.aliases.get(code.strip())
+        if info is None:
+            return code
+        info["hits"] = info.get("hits", 0) + 1
+        info["last_used"] = utc_ms()
+        return info["code"]
+
+    def _alias_define(self, name, body, globals=None, format_result=False):
+        """注册（重名覆盖，保留 created / hits 计数）并立即执行一次 body。
+
+        请求级 ``globals`` 透传给 body 的执行，因此定义时可见的上下文
+        变量在“定义即执行”这一次运行里同样可用、执行后同样被还原。
+        body 运行报错不影响注册结果（语法错误才拒绝保存）。
+        """
+        if not name.isidentifier():
+            return self._alias_error(f"别名名字必须是合法 Python 标识符: {name!r}")
+        if keyword.iskeyword(name):
+            return self._alias_error(f"别名名字不能是 Python 关键字: {name}")
+        try:
+            ast.parse(body)
+        except SyntaxError:
+            # 顶层 await 走 _execute 的异步回退路径，放行到运行期处理
+            if "await" not in body:
+                return self._alias_error("别名代码语法错误，未保存:\n" + traceback.format_exc())
+
+        now = utc_ms()
+        old = self.aliases.get(name)
+        self.aliases[name] = {
+            "code": body,
+            "created": old["created"] if old else now,
+            "updated": now,
+            "hits": old["hits"] if old else 0,
+            "last_used": old["last_used"] if old else None,
+        }
+        # 定义即执行：注册信息附在 alias 键上，执行结果保持普通返回结构，
+        # 两条传输通道（HTTP / MQTT）对此都无需特判。
+        execution = self.execute(body, globals=globals, format_result=format_result)
+        execution["alias"] = {
+            "action": "updated" if old else "saved",
+            "name": name,
+            "code": body,
+        }
+        return execution
+
+    def _alias_show(self, name):
+        info = self.aliases.get(name)
+        if info is None:
+            known = ", ".join(sorted(self.aliases)) or "(none)"
+            return self._alias_error(f"alias '{name}' not found; known: {known}")
+        return self._alias_result(
+            {"name": name, **info}, alias={"action": "show", "name": name}
+        )
+
+    def _alias_list_all(self):
+        listing = {name: info["code"] for name, info in sorted(self.aliases.items())}
+        return self._alias_result(listing, alias={"action": "list", "count": len(listing)})
+
+    def _alias_unalias(self, arg):
+        names = arg.split()
+        if not names:
+            return self._alias_error(
+                "usage: #<unalias关键字> <名字> [<名字> ...]；一次可删多个"
+            )
+        deleted, missing = [], []
+        for name in names:
+            (deleted if self.aliases.pop(name, None) is not None else missing).append(name)
+        if not deleted:
+            return self._alias_error(f"alias not found: {missing}")
+        return self._alias_result(
+            {"deleted": deleted, "missing": missing},
+            alias={"action": "unalias", "deleted": deleted, "missing": missing},
+        )
+
+    @staticmethod
+    def _alias_result(r, **extra):
+        result = {"r": r, "stdout": "", "ok": True}
+        result.update(extra)
+        return result
+
+    @staticmethod
+    def _alias_error(message):
+        return {"r": None, "stdout": "", "ok": False, "error": message}
 
     # ------------------------------------------------------------------ #
     # 内部执行逻辑

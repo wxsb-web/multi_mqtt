@@ -319,6 +319,10 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 namespace = executor.globals_dict
                 if response.data is not None:
                     result_obj = response.data
+                elif execution.get('r') is not None:
+                    # 尾表达式求值结果：与 MQTT 通道对齐，让 1+1 这类代码
+                    # 直接返回 2，不再要求显式赋值 r 或 print
+                    result_obj = execution['r']
                 elif 'r' in namespace:
                     result_obj = namespace['r']
                 elif output:
