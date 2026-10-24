@@ -266,6 +266,37 @@ class ServerMqttConfigTests(unittest.TestCase):
             server_mqtt.rpc_config(global_topic_url="ftp://reports.example.net/")
         self.assertFalse(self.config_path.exists())
 
+    def test_global_topic_list_publish_is_always_qos1(self):
+        """global_topic_list 报告恒以 QoS1 发布：默认参数与自定义参数都如此。"""
+        # 默认发布参数：QoS1 + Retain
+        self.assertEqual(self.server.global_topic_list_publish_kwargs["qos"], 1)
+        self.assertTrue(self.server.global_topic_list_publish_kwargs.get("retain"))
+
+        # 自定义发布参数缺 qos（甚至显式给 0）时都必须钉在 1：报告的
+        # broker 侧保留语义依赖 QoS1，静默跌回 QoS0 会让新订阅者拿不到
+        # 最新列表
+        other = server_mqtt.MQTTServer(
+            brokers=[("b.example", 1883)],
+            request_topic="t/request",
+            server_public_key_bytes=None,
+            enable_global_topic_list=False,
+            global_topic_list_publish_kwargs={"retain": False, "qos": 0},
+        )
+        self.assertEqual(other.global_topic_list_publish_kwargs["qos"], 1)
+
+        # 发布链路确实带 qos=1 透传到 publish_broadcast
+        recorded = {}
+
+        def _rec(_topic, _payload, **ka):
+            recorded.update(ka)
+
+        other.mqtt_net.publish_broadcast = _rec
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        with mock.patch("urllib.request.urlopen", return_value=response):
+            other._publish_global_topic_list("test")
+        self.assertEqual(recorded.get("qos"), 1)
+
     def test_rpc_functions_are_callable_over_http(self):
         import server_http
 

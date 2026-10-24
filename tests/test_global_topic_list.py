@@ -95,10 +95,12 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
         self.assertEqual(s.calls[0][1]["type"], "custom")
 
     def test_custom_publish_kwargs_passthrough(self):
+        # 自定义发布参数原样透传，但 qos 恒被钉在 1：报告的 broker 侧保留
+        # 语义依赖 QoS1，自定义值不允许把报告跌回低 QoS（见 MQTTServer.__init__）
         s = make_stub_server(global_topic_list_publish_kwargs={"qos": 2, "retain": True})
         stub_snapshot(s, {"brokerA": True})
         s.global_topic_list_tick()
-        self.assertEqual(s.calls[0][2], {"qos": 2, "retain": True})
+        self.assertEqual(s.calls[0][2], {"qos": 1, "retain": True})
 
     def test_default_check_interval_reuses_ping_interval(self):
         """默认 tick 粒度复用 ConnectionQualityStats.PING_INTERVAL，与 ping 同节拍统一时间驱动。"""

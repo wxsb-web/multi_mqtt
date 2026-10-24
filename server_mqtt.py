@@ -420,6 +420,9 @@ class MQTTServer:
             dict(global_topic_list_publish_kwargs) if global_topic_list_publish_kwargs
             else dict(DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS)
         )
+        # 报告依赖 QoS1+Retain 的 broker 侧保留语义（新订阅者上线即收最新
+        # 列表）；自定义发布参数无论传什么，qos 恒为 1，不允许静默跌回 QoS0。
+        self.global_topic_list_publish_kwargs["qos"] = 1
         # 自定义报告函数: fn(server) -> dict；None 则用默认的监听 topic 列表
         self.global_topic_list_payload_fn = global_topic_list_payload_fn
         self.global_topic_url = self._rpc_config["global_topic_url"]
