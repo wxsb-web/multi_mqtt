@@ -85,11 +85,16 @@ class PythonExecutor:
         self.alias = alias
         self.aliases = {}
 
+        # [timeout 守卫] 上一次 execute 已超时但后台代码仍在运行时为 True：
+        # 此期间新 execute 一律快速失败，避免把调用线程（MQTT 分发线程 /
+        # HTTP worker）再次挂住；后台线程结束后自动回 False（见 _run_bounded）。
+        self._stuck = False
+
     # ------------------------------------------------------------------ #
     # 公开 API
     # ------------------------------------------------------------------ #
 
-    def execute(self, code,globals=None,format_result=False,alias=None):
+    def execute(self, code,globals=None,format_result=False,alias=None,timeout=999):
         """执行 ``code``。
 
         ``globals`` 若提供，应是一个包含**请求级**上下文变量的映射。
@@ -114,6 +119,19 @@ class PythonExecutor:
         注册信息附在返回 dict 的 ``alias`` 键上。整段输入**精确等于**
         某个已注册别名时，替换为别名 body 后再执行（因此 ``abc+1``、
         ``print(abc)`` 等普通代码完全不受别名影响）。
+
+        timeout
+        -------
+        最长等待秒数（默认 999，兼容长任务；``None`` 表示无限等待的
+        旧同步行为）。执行始终发生在 daemon 工作线程上：
+
+        - 正常结束：返回执行结果 dict，语义与之前完全一致；
+        - 超时且代码已在运行：立即返回 ok=False 超时错误，执行器进入
+          busy——后续 execute 快速失败并给出明确错误，后台线程结束后
+          自动恢复。调用线程（MQTT 分发线程 / HTTP worker）不再被
+          死循环或超长任务永久挂死；
+        - 超时仍在排队等锁：本请求作废（后台取到锁后即退出），不会
+          晚到执行造成重复副作用。
         """
         if not isinstance(code, str) or not code.strip():
             return {"r": "", "stdout": "", "ok": False, "error": "code is required"}
@@ -122,55 +140,125 @@ class PythonExecutor:
         if alias is None:
             alias = self.alias
 
-        # code alias 指令拦截：增删查改不进入常规执行路径。
+        def _job():
+            with self.lock:
+                return self._execute_inner(code, globals, format_result, alias)
+
+        return self._run_bounded(_job, timeout)
+
+    def _run_bounded(self, job, timeout):
+        """在 daemon 工作线程里执行 job，最多等 ``timeout`` 秒。
+
+        ``timeout=None`` 时同步直跑（旧行为，供库内调用兼容）。job 自身
+        持 self.lock，串行语义与旧版完全一致；锁由工作线程持有，调用
+        线程超时先行返回不会破坏命名空间串行性——仍在运行的后台代码
+        独占锁，新请求要么排队要么被 busy 拒绝，绝不与之交错执行。
+        """
+        if timeout is None:
+            return job()
+        if self._stuck:
+            return {"r": None, "stdout": "", "ok": False,
+                    "error": "executor busy: 上一次执行已超时且仍在后台运行，"
+                             "其结束后自动恢复接收新请求"}
+
+        result = {}
+        done = threading.Event()
+        started = threading.Event()
+        abandoned = threading.Event()
+
+        def _work():
+            try:
+                with self.lock:
+                    if abandoned.is_set():
+                        return          # 等锁期间调用方已超时作废本请求
+                    started.set()
+                    result["v"] = job()
+            except BaseException:       # job 自带兜底返回 dict，这里再保险一层
+                result["v"] = {"r": None, "stdout": "", "ok": False,
+                               "error": traceback.format_exc()}
+            finally:
+                # 顺序必须是先 done 再清 busy：调用方只在 done 未置位时才
+                # 会置 _stuck，此序保证后台的清除必然晚于那次置位。
+                done.set()
+                self._stuck = False
+
+        threading.Thread(target=_work, name="rpc-exec", daemon=True).start()
+        if done.wait(timeout):
+            return result.get("v")
+        if started.is_set():
+            # 代码已在运行且超时：标记 busy，本调用立即返回超时错误
+            self._stuck = True
+            if done.is_set():
+                # 最后瞬间跑完：收回 busy 标记并正常取结果
+                self._stuck = False
+                return result.get("v")
+            return {"r": None, "stdout": "", "ok": False,
+                    "error": f"execution timed out after {timeout}s；"
+                             f"代码仍在后台运行，执行器将拒绝新请求直至其结束"}
+        # 仍在排队等锁：作废本请求，避免调用方已返回后才被执行
+        abandoned.set()
+        return {"r": None, "stdout": "", "ok": False,
+                "error": f"executor busy: 等待上一个执行释放锁超过 {timeout}s，"
+                         f"本请求已作废（不会被延迟执行）"}
+
+    def _execute_inner(self, code, globals=None, format_result=False, alias=True):
+        """execute 的同线程同步版（含 alias 指令解析与递归）。
+
+        调用方必须已持有 self.lock（工作线程 / alias 定义即执行的递归）。
+        _alias_define 的递归必须走这里：若再进公开 execute 会另起工作
+        线程排队等自己已持有的锁，直到超时。
+        """
         if alias:
             directive = self._parse_alias_directive(code)
             if directive is not None:
-                with self.lock:
-                    return self._handle_alias_directive(directive, globals, format_result, alias)
+                return self._handle_alias_directive(directive, globals, format_result, alias)
+        return self._execute_code_locked(code, globals, format_result, alias)
 
+    def _execute_code_locked(self, code, globals=None, format_result=False, alias=True):
+        """execute 的常规执行主体：alias 展开 / 请求级注入 / 执行 / 还原。
+
+        调用方必须已持有 self.lock。返回结构见 execute 文档。
+        """
         output = io.StringIO()
-        # 整段注入 / 执行 / 还原都在锁内，避免并发下互相污染。
-        with self.lock:
-            if alias:
-                code = self._expand_alias(code)
-            saved = {}
-            injected = []
-            try:
-                if isinstance(globals, dict):
-                    for k, v in globals.items():
-                        if k in self.globals_dict:
-                            saved[k] = self.globals_dict[k]
-                        self.globals_dict[k] = v
-                        injected.append(k)
+        if alias:
+            code = self._expand_alias(code)
+        saved = {}
+        injected = []
+        try:
+            if isinstance(globals, dict):
+                for k, v in globals.items():
+                    if k in self.globals_dict:
+                        saved[k] = self.globals_dict[k]
+                    self.globals_dict[k] = v
+                    injected.append(k)
 
-                try:
-                    with _redirect_stdout(output):
-                        result = self._execute(code)
-                    if format_result: #让 r始终是 str 对象
-                        # 参数名 format_result 遮蔽了模块级同名函数，经 sys.modules 取原函数；
-                        # 非 JSON 可序列化对象（如 sys 模块）在此统一转为字符串
-                        result = sys.modules[__name__].format_result(result)
-                    return {
-                        "r": result,
-                        "stdout": output.getvalue(),
-                        "ok": True,
-                    }
-                except (Exception, SystemExit): # 修复点：增加捕获 SystemExit，防止直接 kill server
-                    return {
-                        "r": None,
-                        "stdout": output.getvalue(),
-                        "ok": False,
-                        "error": traceback.format_exc(),
-                    }
-            finally:
-                # 还原 / 删除请求级名字。仍在锁内，保证其他线程不会在
-                # 我们还原到一半时观察到半成品命名空间。
-                for k in injected:
-                    if k in saved:
-                        self.globals_dict[k] = saved[k]
-                    else:
-                        self.globals_dict.pop(k, None)
+            try:
+                with _redirect_stdout(output):
+                    result = self._execute(code)
+                if format_result: #让 r始终是 str 对象
+                    # 参数名 format_result 遮蔽了模块级同名函数，经 sys.modules 取原函数；
+                    # 非 JSON 可序列化对象（如 sys 模块）在此统一转为字符串
+                    result = sys.modules[__name__].format_result(result)
+                return {
+                    "r": result,
+                    "stdout": output.getvalue(),
+                    "ok": True,
+                }
+            except (Exception, SystemExit): # 修复点：增加捕获 SystemExit，防止直接 kill server
+                return {
+                    "r": None,
+                    "stdout": output.getvalue(),
+                    "ok": False,
+                    "error": traceback.format_exc(),
+                }
+        finally:
+            # 还原 / 删除请求级名字。仍在锁内，保证其他线程不会在
+            # 我们还原到一半时观察到半成品命名空间。
+            for k in injected:
+                if k in saved:
+                    self.globals_dict[k] = saved[k]
+                else:
+                    self.globals_dict.pop(k, None)
 
     # ------------------------------------------------------------------ #
     # code alias：#alias / #unalias 指令与别名替换
@@ -270,7 +358,9 @@ class PythonExecutor:
         # 定义即执行：注册信息附在 alias 键上，执行结果保持普通返回结构，
         # 两条传输通道（HTTP / MQTT）对此都无需特判。alias 开关透传，
         # 逐调用启用 alias 时 body 内的别名替换行为与调用方一致。
-        execution = self.execute(body, globals=globals, format_result=format_result, alias=alias)
+        # 递归走 _execute_inner（同线程、已持锁）：再进公开 execute 会
+        # 另起工作线程排队等自己持有的锁，直到超时。
+        execution = self._execute_inner(body, globals=globals, format_result=format_result, alias=alias)
         execution["alias"] = {
             "action": "updated" if old else "saved",
             "name": name,

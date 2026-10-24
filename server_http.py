@@ -6,8 +6,6 @@ from socketserver import ThreadingMixIn
 import rpc_executor
 from rpc_executor import PythonExecutor, format_result ,stime
 
-_stdout_lock = threading.Lock()
-
 
 def get_bmp_bytes(rgb=None, size=(16, 16)):
     if not rgb:
@@ -301,16 +299,15 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
 
             executor = self.executor
             try:
-                with _stdout_lock:
-                    old_stdout = sys.stdout
-                    sys.stdout = io.StringIO()
-                    try:
-                        execution = executor.execute(code, globals=context)
-                        output = execution['stdout']
-                        if not execution['ok']:
-                            raise RuntimeError(execution['error'])
-                    finally:
-                        sys.stdout = old_stdout
+                # stdout 捕获由 PythonExecutor 内部的 _redirect_stdout 完成
+                # （execution['stdout'] 即输出），外层不再包 _stdout_lock +
+                # 二次重定向——那会把整个执行串成全局临界区，一条慢请求
+                # （长任务/死循环）就冻结全部 HTTP RPC（含日志台/诊断口）。
+                # 执行的串行化与超时守卫由执行器自身的锁与 timeout 保证。
+                execution = executor.execute(code, globals=context)
+                output = execution['stdout']
+                if not execution['ok']:
+                    raise RuntimeError(execution['error'])
 
                 # 流式响应：状态头与分块都已直接写出，跳过收尾逻辑。
                 if getattr(response, '_streamed', False):
