@@ -333,12 +333,13 @@ def _is_verify_enabled(mqtt_net):
     MultiMQTTManager 里的关键属性：
       - server_public_key_bytes: 已解析成 PEM bytes（None 表示未配置）
       - server_vk:              ecdsa.VerifyingKey 对象（None 表示未启用）
-      - _server_vk_invalid:     配置了公钥但解析失败时为 True
+
+    公钥配置但解析失败的情况在 MultiMQTTManager.__init__ 里就会让
+    ``VerifyingKey.from_pem`` 直接抛异常（构造即失败、fail-closed），
+    因此不存在"invalid 标志"这条路径。
 
     返回 (enabled: bool, reason: str)
     """
-    if getattr(mqtt_net, "_server_vk_invalid", False):
-        return False, "公钥解析失败，验签未启用！"
     if getattr(mqtt_net, "server_vk", None) is not None:
         return True, "启用"
     if getattr(mqtt_net, "server_public_key_bytes", None):

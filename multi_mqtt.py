@@ -877,8 +877,9 @@ class MultiMQTTManager:
         self.client_private_key_bytes = get_standard_pem_bytes(client_private_key_bytes)
         # ------------------------------------------------------------------
         # [修复-⑥ 严重性能瓶颈] ECDSA 密钥对象仅在初始化时解析一次并缓存。
+        # （公钥配置但解析失败时 from_pem 直接抛异常、构造即失败，fail-closed
+        # 由此保证，无需额外的 invalid 标志位。）
         # ------------------------------------------------------------------
-        self._server_vk_invalid = False
         self.server_vk = ecdsa.VerifyingKey.from_pem(self.server_public_key_bytes) if self.server_public_key_bytes else None
         try:
             self.client_sk = (

@@ -21,7 +21,6 @@ class FakeMQTTManager:
         self.brokers = brokers
         self.server_public_key_bytes = server_public_key_bytes
         self.server_vk = None
-        self._server_vk_invalid = False
         self.clients = {}
         self.subscribed_topics = set()
         self.subscribed = []
@@ -299,6 +298,55 @@ class ServerMqttConfigTests(unittest.TestCase):
         finally:
             http_server.shutdown()
             http_server.server_close()
+
+
+class IsVerifyEnabledTests(unittest.TestCase):
+    """[R4 死代码清理] _server_vk_invalid 标志删除后，验签状态只由真实属性决定。
+
+    公钥配置但解析失败的场景由 MultiMQTTManager 构造时的 from_pem 异常
+    兜底（fail-closed），不再依赖任何 invalid 标志位。
+    """
+
+    def test_enabled_when_vk_present(self):
+        net = types.SimpleNamespace(server_vk=object(),
+                                    server_public_key_bytes=b"pem")
+        enabled, reason = server_mqtt._is_verify_enabled(net)
+        self.assertTrue(enabled)
+        self.assertEqual(reason, "启用")
+
+    def test_bytes_without_vk_reported(self):
+        net = types.SimpleNamespace(server_vk=None,
+                                    server_public_key_bytes=b"pem")
+        enabled, reason = server_mqtt._is_verify_enabled(net)
+        self.assertFalse(enabled)
+        self.assertIn("未初始化", reason)
+
+    def test_disabled_without_key(self):
+        net = types.SimpleNamespace(server_vk=None,
+                                    server_public_key_bytes=None)
+        enabled, reason = server_mqtt._is_verify_enabled(net)
+        self.assertFalse(enabled)
+        self.assertIn("关闭", reason)
+
+    def test_real_manager_has_no_invalid_flag(self):
+        import ecdsa
+        from multi_mqtt import MultiMQTTManager
+        sk = ecdsa.SigningKey.generate(curve=ecdsa.NIST256p)
+        mgr = MultiMQTTManager(
+            brokers=[], enable_stats=False, log_connection=False,
+            recovery_enabled=False,
+            server_public_key_bytes=sk.get_verifying_key().to_pem())
+        self.assertFalse(hasattr(mgr, "_server_vk_invalid"),
+                         "死标志位不应再存在于 MultiMQTTManager")
+        self.assertEqual(server_mqtt._is_verify_enabled(mgr), (True, "启用"))
+
+    def test_invalid_pubkey_fails_closed_at_construction(self):
+        from multi_mqtt import MultiMQTTManager
+        with self.assertRaises(Exception):
+            MultiMQTTManager(
+                brokers=[], enable_stats=False, log_connection=False,
+                recovery_enabled=False,
+                server_public_key_bytes=b"definitely-not-a-pem")
 
 
 if __name__ == "__main__":
