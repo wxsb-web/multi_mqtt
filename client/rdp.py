@@ -384,13 +384,13 @@ body { margin: 0; overflow-x: hidden; background: var(--bg); color: var(--text);
 #panel-inner { display: flex; flex-direction: column; }
 /* 控制行:绝不允许换行;left/right_click 悬浮在本行左右两端,跟随可视区域滑动,永不遮挡截图;
    touch-action:none 屏蔽移动端在本行上触发浏览器级页面拖动/缩放 */
-#bar { position: relative; order: 10; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; padding: 8px 10px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; touch-action: none; }
-#bar .slidy { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; min-height: 40px; font-weight: 700; touch-action: none; }
+#bar { position: relative; order: 10; min-height: 60px; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; padding: 8px 10px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; touch-action: none; }
+#bar .slidy { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; min-height: 48px; font-weight: 700; touch-action: none; }
 #bar .slidy.dragging, #bar .slidyc.dragging { background: var(--accent); color: #08201c; }
 /* 刷新:浮动正方形,钉在 left/right 之间的中间 */
-#bar .slidyc { position: absolute; top: 50%; transform: translate(-50%, -50%); z-index: 5; width: 44px; height: 44px; padding: 0; font-size: 13px; line-height: 1; touch-action: none; }
-/* 滚轮方向箭头:拖动滚轮时在远端光标处本地绘制,即时反馈不等截图网络往返 */
-#wheeldir { position: absolute; display: none; pointer-events: none; z-index: 4; font-size: 30px; line-height: 1; color: var(--accent); text-shadow: 0 0 6px rgba(0,0,0,.9), 0 0 2px rgba(0,0,0,.9); transform: translate(-50%, -50%); }
+#bar .slidyc { position: absolute; top: 50%; transform: translate(-50%, -50%); z-index: 5; width: 48px; height: 48px; padding: 0; font-size: 13px; line-height: 1; touch-action: none; }
+/* 滚轮方向箭头:大小随红点圆圈(字号在 JS 里按圆圈宽设置),半透明不遮挡画面 */
+#wheeldir { position: absolute; display: none; pointer-events: none; z-index: 4; line-height: 1; color: var(--accent); opacity: .55; text-shadow: 0 0 2px rgba(0,0,0,.9); transform: translate(-50%, -50%); }
 #bar > button:not(.slidy):not(.slidyc) { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .bspace { flex: 1 1 0; min-width: 96px; }
 .cspace { flex: 1 1 36px; min-width: 36px; }
@@ -620,7 +620,7 @@ function slideButtons() {
     // 三键固定钉位:left 贴行左缘、right 贴行右缘、刷新方块中心对齐行内预留位;
     // 均用布局坐标(offsetLeft/clientWidth,不受 transform 影响),与缩放平移完全解耦
     const pad = 6;
-    const bwM = btnM.offsetWidth || 44;
+    const bwM = btnM.offsetWidth || 48;
     btnL.style.left = pad + 'px';
     btnR.style.left = (w - (btnR.offsetWidth || 70) - pad) + 'px';
     const csCenter = cspace ? cspace.offsetLeft + cspace.offsetWidth / 2 : w / 2;
@@ -822,6 +822,7 @@ const wheeldir = document.getElementById('wheeldir');
 let wheelDirTimer = null;
 function showWheelDir(clicks) {
     wheeldir.textContent = clicks > 0 ? '▲' : '▼';
+    wheeldir.style.fontSize = Math.max(dot.offsetWidth || 14, 12) + 'px';   // 随红点圆圈尺寸,下限12px保可见
     wheeldir.style.left = (lastSx || 0) + 'px';
     wheeldir.style.top = (lastSy || 0) + 'px';
     wheeldir.style.display = 'block';
