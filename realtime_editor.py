@@ -338,8 +338,8 @@ def main():
         locals=locals(),
         redirect_root='/preview_html(p)',
     )
-    # 必须在 start_rpc_server 之后：它会重置 websocket_handlers 类属性，
-    # 先注册会被清掉；服务已启动后注册即刻生效（preview_html 也会惰性补注册）
+    # websocket_handlers 现为共享注册表、只合并不替换：注册与 start 的
+    # 先后顺序已无约束（preview_html 也会惰性补注册）
     editor = get_editor(args.file)
     print(f'Open http://127.0.0.1:{args.port}/preview_html(p)')
     try:
