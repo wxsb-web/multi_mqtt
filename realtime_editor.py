@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 default_file = 'realtime_editor.txt'
 
 # str(绝对路径) -> Editor；同一文件的多次打开复用同一实例
-_editors = {}
-_editors_lock = threading.RLock()
+_editors = globals().setdefault('_editors', {})  # setdefault 防 importlib.reload：reload 复用同一模块 __dict__ 重执行顶层，普通赋值把名字重绑到空 dict——已开编辑器（带活 WS 推送连接）变孤儿、同一文件再开时新建第二个 Editor 双实例并发写
+_editors_lock = globals().setdefault('_editors_lock', threading.RLock())  # 锁必须与表一起 setdefault：reload 重造新锁对象后，已攥旧锁的线程与拿新锁的线程互不排斥、同时进临界区
 
 PAGE = r'''<!doctype html>
 <html lang="zh-CN">

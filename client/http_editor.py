@@ -40,10 +40,10 @@ from pathlib import Path
 # html(p) 未传 file 时编辑的文件（相对服务器进程 cwd），与 realtime_editor 一致
 default_file = 'http_editor.txt'
 
-_editors = {}       # str(绝对路径) -> Editor
-_by_token = {}      # token -> Editor；token = 绝对路径 md5 前 12 位，URL 安全
-_lock = threading.RLock()
-_uploads = {}       # uid -> {'editor': Editor, 'parts': [str], 'started': float}
+_editors = globals().setdefault('_editors', {})  # str(绝对路径) -> Editor。setdefault 防 importlib.reload：reload 复用同一模块 __dict__ 重执行顶层，普通赋值把名字重绑到空 dict——已开编辑器变孤儿、同一文件被再 new 一个 Editor 双实例并发写；setdefault 在 reload 后原样取回旧表
+_by_token = globals().setdefault('_by_token', {})  # token -> Editor；token = 绝对路径 md5 前 12 位，URL 安全。必须与 _editors 同为 setdefault：reload 丢表 = 已开页面的 token URL 全部 404
+_lock = globals().setdefault('_lock', threading.RLock())  # 锁必须随表一起 setdefault：reload 重造新锁对象后，已攥旧锁的线程与拿新锁的线程互不排斥、同时进临界区
+_uploads = globals().setdefault('_uploads', {})  # uid -> {'editor': Editor, 'parts': [str], 'started': float}。reload 丢表 = 进行中的分块上传会话悬挂失联
 UPLOAD_TTL = 600    # 分块会话最长存活秒数，超时由下一次 up_begin 清扫
 
 
