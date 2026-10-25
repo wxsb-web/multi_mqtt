@@ -205,7 +205,12 @@ def _rescue_path_syntax(code):
 
 # 同进程内活着的 RPC 服务器（弱引用）：set_basic_auth 等运行期开关需要
 # 同步推进每台服务器自己的 rpc_config，只改类属性碰不到它们。
-_rpc_servers = weakref.WeakSet()
+# setdefault 而非直接赋值：importlib.reload 复用同一模块 __dict__ 重新
+# 执行顶层代码，直接赋值会把名字重绑到全新空集，reload 前启动的服务器
+# 全部失联（新代码 set_basic_auth 广播不到它们）；setdefault 在 reload
+# 后取回旧 WeakSet，配合挂在服务器实例上的 rpc_config，跨 reload 的
+# 动态开关依然完整生效。
+_rpc_servers = globals().setdefault('_rpc_servers', weakref.WeakSet())
 
 
 def _conf(handler, name):
