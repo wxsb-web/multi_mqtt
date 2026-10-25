@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast
+import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -202,6 +202,8 @@ def _rescue_path_syntax(code):
 
 class RPCRequestHandler(BaseHTTPRequestHandler):
     key = ''
+    # HTTP Basic 认证凭据 'user:password'；空串不启用认证
+    basic_auth = ''
     # 复用一个持久化的执行器实例；请求级上下文通过 execute(globals=...) 注入。
     executor = None
     favicon_bytes = None
@@ -213,6 +215,16 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
     # 可选非阻塞日志出口 callable(str)；pty_client_mqtt 把它接到异步写
     # 线程上，避免控制台堵塞时 BaseHTTPRequestHandler 的 print 拖死请求线程
     log_sink = None
+
+    @classmethod
+    def set_basic_auth(cls, user='', pw=''):
+        """传入 user/pw 即开启 HTTP Basic 认证；都为空则关闭。
+
+        供 RPC 动态调用（如 /RPCRequestHandler.set_basic_auth('admin','123')），
+        也可在代码里直接调用；改动的是类属性，立即对后续所有请求生效。
+        """
+        cls.basic_auth = f"{user}:{pw}" if (user or pw) else ''
+        return cls.basic_auth or 'basic auth disabled'
 
     def log_message(self, format, *args):
         line = (f"[RPC] {stime()[12:]}  {self.client_address[0]}:"
@@ -226,7 +238,36 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 pass  # sink 挂了退回 print，不能让日志本身打挂请求
         print(line)
 
+    def check_basic_auth(self):
+        """basic_auth 非空时校验 Authorization 头；未通过则回 401 挑战。
+
+        浏览器收到 401 + WWW-Authenticate 会弹登录框，且同源的 WebSocket
+        升级请求会自动带上凭据，因此校验统一放在 do_GET/do_POST 入口，
+        RPC、重定向、favicon、WebSocket 全部被同一层拦截。
+        """
+        if not self.basic_auth:
+            return True
+        expected = b'Basic ' + base64.b64encode(self.basic_auth.encode('utf-8'))
+        # 头字段由 http.server 按 latin-1 解码，编码回去做恒定时间比较，
+        # 避免逐字节时序侧信道
+        authorization = self.headers.get('Authorization', '').encode('latin-1', 'replace')
+        if hmac.compare_digest(authorization, expected):
+            return True
+        body = b'401 Unauthorized: basic auth required'
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="RPC"')
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return False
+
     def do_GET(self):
+        if not self.check_basic_auth():
+            return
         websocket_path = self.path.split('?', 1)[0]
         websocket_handler = self.websocket_handlers.get(websocket_path, self.websocket_handler)
         if (websocket_handler and (websocket_path == self.websocket_path or websocket_path in self.websocket_handlers)
@@ -285,6 +326,8 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):
+        if not self.check_basic_auth():
+            return
         self.handle_rpc()
 
     def _execute_coroutine(self, coro, exec_globals):
@@ -308,6 +351,10 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             loop.close()
 
     def handle_rpc(self):
+        # 认证门必须放在 handle_rpc 内部而不只是 do_GET/do_POST：WSGI 垫片、
+        # Range 捕获等路径直接调用本方法，不经过 do_*，放在外面会被绕过。
+        if not self.check_basic_auth():
+            return
         try:
             raw_path = self.path
             if self.key:
@@ -468,10 +515,14 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
 def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None, daemon=True,
                      favicon_rgb=None, favicon_size=16, websocket_handler=None,
                      websocket_path='/ws', redirect_root=None, websocket_handlers=None,
-                     main_loop=None, listen=True, log_sink=None):
+                     main_loop=None, listen=True, log_sink=None, basic_auth=''):
     if not key:
         key = ''
     RPCRequestHandler.key = key
+    # basic_auth 接受 'user:password' 或 (user, password)，统一成前者；空则不启用认证
+    if isinstance(basic_auth, (tuple, list)):
+        basic_auth = ':'.join(str(item) for item in basic_auth)
+    RPCRequestHandler.basic_auth = basic_auth or ''
     # 普通函数直接挂类属性会触发描述符协议：self.log_sink 取到的是
     # bound method func(handler, line)，log_message 里 sink(line) 必抛
     # TypeError（被 except 吞掉），于是每笔请求都静默退回 print(line)
