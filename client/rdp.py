@@ -255,7 +255,7 @@ body { margin: 0; overflow-x: hidden; background: var(--bg); color: var(--text);
 #bar .slidy.dragging, #bar .slidyc.dragging { background: var(--accent); color: #08201c; }
 /* 刷新:浮动正方形,钉在 left/right 之间的中间 */
 #bar .slidyc { position: absolute; top: 50%; transform: translate(-50%, -50%); z-index: 5; width: 36px; height: 36px; padding: 0; font-size: 12px; line-height: 1; touch-action: none; }
-#bar > button:not(.slidy):not(.slidyc), #bar label { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#bar > button:not(.slidy):not(.slidyc) { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .bspace { flex: 1 1 0; min-width: 96px; }
 .cspace { flex: 1 1 36px; min-width: 36px; }
 #coord { color: var(--accent); flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center; }
@@ -264,7 +264,9 @@ button:hover { background: #2c3740; }
 button:active { background: var(--accent); color: #08201c; }
 #info { color: var(--muted); flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 label { color: var(--muted); display: flex; align-items: center; gap: 4px; cursor: pointer; }
-#keyboard { padding: 8px 6px 12px; background: var(--panel); }
+#keyboard { padding: 8px 6px 8px; background: var(--panel); }
+/* 开关行:键盘与日志之间 */
+#switches { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 4px 12px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
 .krow { display: flex; gap: 3px; margin-bottom: 4px; min-width: 0; }
 .key { flex: 1 1 0; min-width: 0; height: 34px; padding: 0 4px; overflow: hidden; white-space: nowrap; border-radius: 5px; background: #1d262c; border: 1px solid #33414a; color: var(--text); font: 11px ui-monospace, Consolas, monospace; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-touch-callout: none; }
 .key:hover { background: #28343c; }
@@ -274,13 +276,12 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
 .err { color: var(--err); } .act { color: var(--accent); }
 @media (max-width: 640px) {
   #bar button { padding: 4px 8px; font-size: 11px; }
-  #bar label { font-size: 11px; gap: 3px; }
+  #switches label { font-size: 11px; gap: 3px; }
   #info { display: none; }
   .key { font-size: 10px; }
 }
 @media (max-width: 480px) {
-  /* 极窄屏:隐藏标签文字(仅剩复选框)与坐标文本,把行中间让给刷新方块 */
-  #bar label { font-size: 0; }
+  /* 极窄屏:隐藏坐标文本,把行中间让给刷新方块 */
   #coord { display: none; }
 }
 </style>
@@ -294,8 +295,6 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
   <div id="bar">
     <button id="btn-left" class="slidy">left_click</button>
     <div class="bspace"></div>
-    <label><input type="checkbox" id="auto"> 自动刷新 2s</label>
-    <label><input type="checkbox" id="bw"> 黑白模式</label>
     <div class="cspace"></div>
     <span id="coord">坐标: 未选择</span>
     <span id="info"></span>
@@ -305,6 +304,11 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
   </div>
 
   <div id="keyboard"></div>
+  <div id="switches">
+    <label><input type="checkbox" id="auto"> 自动刷新 2s</label>
+    <label><input type="checkbox" id="bw"> 黑白模式</label>
+    <label><input type="checkbox" id="rev" checked> 滚轮取反</label>
+  </div>
   <div id="log"></div>
  </div>
 </div>
@@ -321,6 +325,8 @@ const bwEl = document.getElementById('bw');
 bwEl.checked = __BW__;                        // 由 URL 参数 rdp.html(p, bw=True) 注入
 function screenExpr() { return bwEl.checked ? 'rdp.screen(p,1)' : 'rdp.screen(p)'; }
 bwEl.onchange = () => { log('黑白模式: ' + (bwEl.checked ? '开' : '关'), 'act'); refresh(); };
+const revEl = document.getElementById('rev');    // 滚轮取反:默认开,上拖=向下滚(手机自然方向)
+revEl.onchange = () => log('滚轮取反: ' + (revEl.checked ? '开' : '关'), 'act');
 
 // left/right_click 悬浮在控制行(bar)内左右两端,并跟随可视区域横向滑动:
 // 移动端放大后拖动时,两键始终贴住当前可见范围的两边;按钮位于 bar 行内,不会遮挡截图
@@ -561,7 +567,8 @@ btnLeft.addEventListener('click', () => {
 });
 
 // ---------- 刷新按钮:点击=刷新截图;按住上下拖动=在红点坐标处滚动远端滚轮 ----------
-// 上拖=滚轮向上、下拖=滚轮向下,每 24 显示像素折算一格;不足一格视为点击,仍走刷新
+// 滚轮取反开关默认开:上拖=向下滚、下拖=向上滚(手机自然方向),关掉则与真实滚轮同向;
+// 每 24 显示像素折算一格;不足一格视为点击,仍走刷新
 const btnRefresh = document.getElementById('btn-refresh');
 let scrollState = null;                        // {id, sy, moved}
 let suppressRefreshClick = false;              // 滚动过就吞掉松手紧随的 click,避免误触刷新
@@ -577,9 +584,10 @@ btnRefresh.addEventListener('pointermove', e => {
     const notches = Math.trunc((e.clientY - scrollState.sy) / NOTCH_PX);   // 下拖为正
     if (!notches) return;                      // 累计不足一格:既不滚动也不算拖动
     if (!scrollState.moved) { scrollState.moved = true; btnRefresh.classList.add('dragging');
-                              log('滚轮拖动中…上=向上滚,下=向下滚,松手结束', 'act'); }
+                              log('滚轮拖动中…上下拖=滚轮,松手结束', 'act'); }
     scrollState.sy += notches * NOTCH_PX;      // 只消费整格位移,余量留给后续移动
-    rpc("rdp.scroll(p," + lastX + "," + lastY + "," + (-notches) + ")").then(scheduleRefresh).catch(() => {});
+    const clicks = revEl.checked ? notches : -notches;   // 默认取反:上拖(负)=向下滚
+    rpc("rdp.scroll(p," + lastX + "," + lastY + "," + clicks + ")").then(scheduleRefresh).catch(() => {});
 });
 function finishRefreshScroll() {
     const st = scrollState; scrollState = null;
