@@ -385,7 +385,7 @@ body { margin: 0; overflow-x: hidden; background: var(--bg); color: var(--text);
 /* 控制行:绝不允许换行;left/right_click 悬浮在本行左右两端,跟随可视区域滑动,永不遮挡截图;
    touch-action:none 屏蔽移动端在本行上触发浏览器级页面拖动/缩放 */
 #bar { position: relative; order: 10; min-height: 60px; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; padding: 8px 10px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; touch-action: none; }
-#bar .slidy { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; min-height: 48px; font-weight: 700; touch-action: none; }
+#bar .slidy { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; min-height: 36px; font-weight: 700; touch-action: none; }
 #bar .slidy.dragging, #bar .slidyc.dragging { background: var(--accent); color: #08201c; }
 /* 刷新:浮动正方形,钉在 left/right 之间的中间 */
 #bar .slidyc { position: absolute; top: 50%; transform: translate(-50%, -50%); z-index: 5; width: 48px; height: 48px; padding: 0; font-size: 13px; line-height: 1; touch-action: none; }
@@ -415,7 +415,9 @@ body.textfocus #inputzone { order: 1; }
 /* 历史、剪贴板等辅助按钮行:输入行下方 */
 #auxrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 0 10px 6px; border-bottom: 1px solid var(--line); }
 #auxrow button { padding: 4px 10px; font-size: 11px; }
-#histsel, #switches select { flex: 0 0 auto; max-width: 110px; background: #222b31; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 4px; font: 11px ui-monospace, Consolas, monospace; }
+#histsel, #switches select, #switches input[type=number] { flex: 0 0 auto; background: #222b31; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 4px; font: 11px ui-monospace, Consolas, monospace; }
+#histsel { max-width: 110px; }
+#switches input[type=number] { width: 60px; text-align: center; }
 /* 触屏设备输入字号提到 16px,防 iOS 聚焦时自动放大 */
 @media (pointer: coarse) { #textin { font-size: 16px; } }
 .krow { display: flex; gap: 3px; margin-bottom: 4px; min-width: 0; }
@@ -471,14 +473,16 @@ body.textfocus #inputzone { order: 1; }
     <label><input type="checkbox" id="auto"> 自动刷新 2s</label>
     <label><input type="checkbox" id="bw"> 黑白模式</label>
     <label><input type="checkbox" id="rev" checked> 滚轮取反</label>
-    <label>滚轮速度
-      <select id="speed" title="拖动多少像素滚一格,数值越小越快">
-        <option value="40">慢</option>
-        <option value="32">较慢</option>
-        <option value="24" selected>标准</option>
-        <option value="16">快</option>
-        <option value="10">很快</option>
-      </select>
+    <label>滚动距离
+      <input type="number" id="speed" min="4" max="80" step="2" value="24" list="speedpresets"
+             title="拖动多少像素滚一格,越小越快,可输入自定义数值">
+      <datalist id="speedpresets">
+        <option value="10"></option>
+        <option value="16"></option>
+        <option value="24"></option>
+        <option value="32"></option>
+        <option value="40"></option>
+      </datalist>
     </label>
   </div>
   <div id="log"></div>
@@ -807,16 +811,16 @@ btnLeft.addEventListener('click', () => {
 
 // ---------- 刷新按钮:点击=刷新截图;按住上下拖动=在红点坐标处滚动远端滚轮 ----------
 // 滚轮取反开关默认开:上拖=向下滚、下拖=向上滚(手机自然方向),关掉则与真实滚轮同向;
-// 每格像素由配置滚轮速度决定;不足一格视为点击,仍走刷新
+// 滚动距离(每格拖动像素)由配置数字框决定;不足一格视为点击,仍走刷新
 const btnRefresh = document.getElementById('btn-refresh');
 let scrollState = null;                        // {id, sy, moved}
 let suppressRefreshClick = false;              // 滚动过就吞掉松手紧随的 click,避免误触刷新
-const speedSel = document.getElementById('speed');   // 滚轮速度:每格拖动像素,越小越快
-const savedSpeed = localStorage.getItem('rdp_speed');
-if (savedSpeed) speedSel.value = savedSpeed;
-function notchPx() { return parseInt(speedSel.value, 10) || 24; }
+const speedSel = document.getElementById('speed');   // 滚动距离:每格拖动像素,越小越快
+const savedSpeed = parseInt(localStorage.getItem('rdp_speed'), 10);
+if (savedSpeed >= 4 && savedSpeed <= 80) speedSel.value = savedSpeed;
+function notchPx() { const n = parseInt(speedSel.value, 10); return (n >= 4 && n <= 80) ? n : 24; }
 speedSel.onchange = () => { saveSetting('rdp_speed', speedSel.value);
-                            log('滚轮速度: 每格 ' + notchPx() + 'px', 'act'); };
+                            log('滚动距离: 每格 ' + notchPx() + 'px', 'act'); };
 // 滚轮方向箭头:截图网络往返慢,远端画面延迟才更新,先在远端光标处本地画箭头即时反馈
 const wheeldir = document.getElementById('wheeldir');
 let wheelDirTimer = null;
