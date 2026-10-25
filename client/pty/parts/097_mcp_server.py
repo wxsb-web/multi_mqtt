@@ -27,12 +27,11 @@
 
 import asyncio
 
-_MCP_SERVER = None       # 启动/挂载成功后保存 MCP server 实例（诊断/测试用）
-_MCP_ASGI_APP = None     # 挂 1188 口模式下的 ASGI 应用
-_MCP_HTTP_PATHS = frozenset()   # 需在 RPC 口上拦截分流的路径集合
-_MCP_HOOKED = False      # RPCRequestHandler 前置分发钩子只打一次
-_MCP_LOOP = None         # ASGI 专用事件循环（后台线程）
-_MCP_LOOP_LOCK = threading.Lock()
+_MCP_SERVER = globals().setdefault('_MCP_SERVER', None)  # 启动/挂载成功后保存 MCP server 实例（诊断/测试用）；setdefault 防 reload 重绑丢引用
+_MCP_ASGI_APP = globals().setdefault('_MCP_ASGI_APP', None)  # 挂 1188 口模式下的 ASGI 应用。最要命的一个：已打进 RPCRequestHandler 的前置分发 wrapper 运行期按模块全局名查本变量，reload 把名字重绑回 None 后 /mcp 请求静默回落成普通 RPC 执行——setdefault 让旧钩子跨 reload 继续拿到活应用
+_MCP_HTTP_PATHS = globals().setdefault('_MCP_HTTP_PATHS', frozenset())  # 需在 RPC 口上拦截分流的路径集合；与 _MCP_ASGI_APP 同生共死，reload 丢集合同样让分流失效
+_MCP_LOOP = globals().setdefault('_MCP_LOOP', None)  # ASGI 专用事件循环（后台线程）；reload 丢引用会让 _mcp_ensure_loop 再起第二条循环线程
+_MCP_LOOP_LOCK = globals().setdefault('_MCP_LOOP_LOCK', threading.Lock())  # 循环线程启动互斥锁；reload 重造新锁 + _MCP_LOOP 名字回 None = 判空双起循环线程，锁必须与引用一起跨 reload 保活
 
 _MCP_INSTRUCTIONS = (
     "远端服务器的常驻交互 PTY。pty_run 跑非交互命令并回收 rc/输出；"
@@ -285,11 +284,15 @@ def _mcp_hook_handler(Handler) -> None:
             return fn(self, *args, **kwargs)
         wrapper.__name__ = getattr(fn, "__name__", "handler")
         wrapper.__doc__ = getattr(fn, "__doc__", None)
+        wrapper._mcp_wrapped = True  # 幂等键挂在被包装函数上而非模块级 _MCP_HOOKED 标志：标志在 reload 后重置 False 会把同一个类再包一层（请求链上叠双层路径检查），而函数对象自带标记跨 reload 永不失真
         return wrapper
 
     for name in ("do_GET", "do_POST", "do_DELETE"):
         base = getattr(Handler, name, None)
-        if base is not None:
+        # 已带 _mcp_wrapped 的（含 reload 前包过的旧类）直接跳过；server_http 被
+        # reload 出新类时此处自然给新类补钩子，旧类旧钩子经 setdefault 保住的
+        # _MCP_ASGI_APP 继续工作，两边都不脱靶
+        if base is not None and not getattr(base, "_mcp_wrapped", False):
             setattr(Handler, name, _wrap(base))
 
 
@@ -299,7 +302,7 @@ def mount_mcp_on_rpc(prefer: str = "", host: str = "0.0.0.0") -> dict:
     1188 一个口上 RPC / 浏览器日志台 / MCP 三种服务并存；返回启动结果
     dict；任何失败只进本地日志，不影响 PTY 会话。
     """
-    global _MCP_SERVER, _MCP_ASGI_APP, _MCP_HTTP_PATHS, _MCP_HOOKED
+    global _MCP_SERVER, _MCP_ASGI_APP, _MCP_HTTP_PATHS  # 原 _MCP_HOOKED 模块标志已删除：幂等改由被包装函数上的 _mcp_wrapped 标记承担，标志在 reload 后重置 False 会失真
     if _MCP_ASGI_APP is not None:
         return {"ok": True, "already": True, "paths": sorted(_MCP_HTTP_PATHS)}
     try:
@@ -315,9 +318,7 @@ def mount_mcp_on_rpc(prefer: str = "", host: str = "0.0.0.0") -> dict:
     if app is None or not paths:
         return {"ok": False, "error": "当前 mcp SDK 未提供可挂载的 HTTP 应用"}
 
-    if not _MCP_HOOKED:
-        _mcp_hook_handler(server_http.RPCRequestHandler)
-        _MCP_HOOKED = True
+    _mcp_hook_handler(server_http.RPCRequestHandler)  # 无条件调用：钩子按 fn._mcp_wrapped 自幂等，不再依赖会被 reload 重置的模块标志
     loop = _mcp_ensure_loop()
     _mcp_drive_lifespan(app, loop)
     _MCP_SERVER = server
