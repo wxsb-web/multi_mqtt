@@ -15,6 +15,7 @@ RPC 入口(p 为 server_http 注入的请求级 response 对象):
     rdp.move(p, x, y)                 移动光标
     rdp.click(p, x, y, 'left')        移动并点击;left / right
     rdp.drag(p, x1, y1, x2, y2)       按住拖动(选择模式松手时调用)
+    rdp.scroll(p, x, y, n)            移动到选定坐标滚动滚轮,n 正=向上、负=向下
     rdp.key(p, 'ctrl+shift+esc')      按键 / 组合键,加号连接
 
 仅适配 Windows:user32 的 keybd_event / mouse_event / SetCursorPos,
@@ -557,7 +558,7 @@ const ROWS = [
  [['`','backtick'],['1','1'],['2','2'],['3','3'],['4','4'],['5','5'],['6','6'],['7','7'],['8','8'],['9','9'],['0','0'],['-','minus'],['=','equal'],['Backspace','backspace',2],['Ins','insert'],['Home','home'],['PgUp','pageup']],
  [['Tab','tab',1.5],['Q','q'],['W','w'],['E','e'],['R','r'],['T','t'],['Y','y'],['U','u'],['I','i'],['O','o'],['P','p'],['[','lbracket'],[']','rbracket'],['\\','backslash'],['Del','delete'],['End','end'],['PgDn','pagedown']],
  [['Caps','capslock',1.8],['A','a'],['S','s'],['D','d'],['F','f'],['G','g'],['H','h'],['J','j'],['K','k'],['L','l'],[';','semicolon'],["'",'quote'],['Enter','enter',2.2]],
- [['Shift','shift',2.3],['Z','z'],['X','x'],['C','c'],['V','v'],['B','b'],['N','n'],['M','m'],[',','comma'],['.','period'],['/','slash'],['Shift','shift',2.3],['↑','up']],
+ [['Shift','shift',2.3],['Z','z'],['X','x'],['C','c'],['V','v'],['B','b'],['N','n'],['M','m'],[',','comma'],['.','period'],['/','slash'],['Shift','shift',1.7],['↑','up']],
  [['Ctrl','ctrl',1.4],['Win','win',1.2],['Alt','alt',1.2],['Space','space',6],['Alt','alt',1.2],['Win','win',1.2],['Menu','menu',1.2],['Ctrl','ctrl',1.4],['←','left'],['↓','down'],['→','right']]
 ];
 const held = new Set();

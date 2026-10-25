@@ -17,5 +17,6 @@ _*.py
 !client/pty/__*.py
 !client/socks5/__*.py
 
+realtime_editor.txt
 
 rpc.json
