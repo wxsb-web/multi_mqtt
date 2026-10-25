@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, io, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast
+import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -113,6 +113,76 @@ class WebSocket:
                 return b''
             data += chunk
         return data
+
+
+def _split_code_strings(code):
+    """按字符串字面量边界切段，返回 [(片段, 是否字符串), ...]。
+
+    裸路径救援只允许改写字符串外的部分，因此先把 'xxx' / "xxx" / 三引号
+    （含转义）整段切出来跳过，避免把字符串内容里的路径再包一层引号。
+    """
+    segments = []
+    buf = []
+    i, n = 0, len(code)
+    while i < n:
+        ch = code[i]
+        if ch in '\'"':
+            triple = code[i:i + 3]
+            if triple in ('"""', "'''"):
+                end = code.find(triple, i + 3)
+                end = n if end == -1 else end + 3
+            else:
+                j = i + 1
+                while j < n and code[j] != ch:
+                    j += 2 if code[j] == '\\' else 1
+                end = min(j + 1, n)
+            segments.append((''.join(buf), False))
+            buf = []
+            segments.append((code[i:end], True))
+            i = end
+        else:
+            buf.append(ch)
+            i += 1
+    segments.append((''.join(buf), False))
+    return segments
+
+
+# 表达式起始位置：前一个非空白字符是这些（或整段开头）时，token 才可能被救援。
+# mid 表达式的 a/b 是合法除法，轮不到救援；能走到救援的前提是整段已 SyntaxError。
+_EXPR_START_CTX = '=(,[{;'
+# POSIX 绝对路径 /a/b.txt 与盘符路径 C:/a/b.txt、C:\\a\\b.txt（段内无空白）
+_PATH_TOKEN_RE = re.compile(r'(?:[A-Za-z]:)?(?:[/\\][\w.\-]+)+[/\\]?')
+
+
+def _rescue_path_syntax(code):
+    """给裸路径 token 补引号，如 ``file=/tmp/txt`` → ``file='/tmp/txt'``。
+
+    URL 即代码场景里手输路径常不带引号，而 /tmp/txt 在 Python 里是语法错误。
+    仅当整段代码已 SyntaxError 时由 handle_rpc 调用本函数重试：跳过字符串
+    字面量内部；只处理位于表达式起始位置（见 _EXPR_START_CTX）的路径 token，
+    避免误伤除法与 http:// 协议头；含反斜杠的 Windows 路径转义后按普通串包。
+    无法安全改写时原样返回，由调用方保留原始报错。
+    """
+    out = []
+    changed = False
+    for segment, is_string in _split_code_strings(code):
+        if is_string or not segment:
+            out.append(segment)
+            continue
+        pos = 0
+        for m in _PATH_TOKEN_RE.finditer(segment):
+            token = m.group(0)
+            context = ''.join(out) + segment[:m.start()]
+            prev = next((c for c in reversed(context) if not c.isspace()), '')
+            if prev and prev not in _EXPR_START_CTX:
+                continue
+            literal = token.replace('\\', '\\\\')
+            out.append(segment[pos:m.start()])
+            out.append("'" + literal + "'")
+            pos = m.end()
+            changed = True
+        out.append(segment[pos:])
+    return ''.join(out) if changed else code
 
 
 class RPCRequestHandler(BaseHTTPRequestHandler):
@@ -245,6 +315,19 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 code = code_str
             else:
                 code = urllib.parse.unquote(code_str)
+
+            # 裸路径救援：URL 里 file=/tmp/txt 不带引号是 SyntaxError，
+            # 补引号后能通过语法检查才采用，否则保留原始报错。
+            try:
+                ast.parse(code)
+            except SyntaxError:
+                rescued = _rescue_path_syntax(code)
+                if rescued is not code and rescued != code:
+                    try:
+                        ast.parse(rescued)
+                        code = rescued
+                    except SyntaxError:
+                        pass
 
             class ResponseWrapper:
                 """RPC 代码里的 response/p 对象。
