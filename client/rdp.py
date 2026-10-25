@@ -399,7 +399,9 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
 #keyboard { order: 20; padding: 8px 6px 8px; background: var(--panel); }
 /* 开关行:输入区与日志之间 */
 #switches { order: 40; display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 4px 12px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
-/* 输入区:默认排键盘下方;聚焦时上移画面正下方;输入行只有文本框与发送按钮 */
+/* 默认布局按钮:输入区上移(非默认布局)时高亮提示可点回 */
+body.textfocus #btn-layout { background: var(--accent); color: #08201c; border-color: var(--accent); font-weight: 700; }
+/* 输入区:默认排键盘下方;聚焦后上移画面正下方并保持,点默认布局按钮才复位 */
 #inputzone { order: 30; background: var(--panel); }
 body.textfocus #inputzone { order: 1; }
 #inputrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 10px 4px; }
@@ -446,6 +448,7 @@ body.textfocus #inputzone { order: 1; }
       <select id="histsel" title="选择历史输入填入输入框"><option>历史</option></select>
       <button id="btn-setclip" title="把输入框文本写入远端剪贴板">设剪贴板</button>
       <button id="btn-getclip" title="读取远端剪贴板文本到输入框">取剪贴板</button>
+      <button id="btn-layout" title="恢复默认布局:输入区回到键盘下方">默认布局</button>
     </div>
   </div>
   <div id="bar">
@@ -484,10 +487,14 @@ bwEl.onchange = () => { log('黑白模式: ' + (bwEl.checked ? '开' : '关'), '
 const revEl = document.getElementById('rev');    // 滚轮取反:默认开,上拖=向下滚(手机自然方向)
 revEl.onchange = () => log('滚轮取反: ' + (revEl.checked ? '开' : '关'), 'act');
 
-// ---------- 文本输入区:聚焦时整区上移画面正下方(flex 调序,不隐藏任何区块) ----------
+// ---------- 文本输入区:聚焦整区上移画面正下方并保持,失焦不自动跳回 ----------
 const textin = document.getElementById('textin');
 textin.addEventListener('focus', () => { document.body.classList.add('textfocus'); });
-textin.addEventListener('blur', () => { document.body.classList.remove('textfocus'); });
+// 恢复默认布局:仅明确点按钮才复位(输入区回到键盘下方),同时收起输入焦点
+document.getElementById('btn-layout').onclick = () => {
+    textin.blur();
+    document.body.classList.remove('textfocus');
+};
 function autoGrow() {                       // 多行时自动长高,封顶 160px 转内部滚动
     textin.style.height = 'auto';
     textin.style.height = Math.min(textin.scrollHeight, 160) + 'px';
