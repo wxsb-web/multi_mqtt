@@ -559,8 +559,9 @@ document.getElementById('btn-getclip').onclick = () => {
     }).catch(() => {});
 };
 
-// left/right_click 悬浮在控制行(bar)内左右两端,并跟随可视区域横向滑动:
-// 移动端放大后拖动时,两键始终贴住当前可见范围的两边;按钮位于 bar 行内,不会遮挡截图
+// left/right_click 悬浮在控制行(bar)内左右两端:固定钉在行内两端、刷新方块钉在
+// 行内中心(.cspace 预留位),不随缩放平移滑动,left/刷新/right 相对位置任何状态下不变,
+// 想看某侧按键时自然平移页面即可
 const bar = document.getElementById('bar');
 const btnL = document.getElementById('btn-left');
 const btnR = document.getElementById('btn-right');
@@ -568,59 +569,38 @@ const btnM = document.getElementById('btn-refresh');
 const cspace = document.querySelector('.cspace');   // 行内为刷新方块预留的空位
 const panel = document.getElementById('panel');
 const keyboardEl = document.getElementById('keyboard');
-// 控制条+键盘的最大放大倍数:宽排 17 键,到顶时整排可见 ~11 键(17/1.55);
-// 1.55 时可视窗口 232px,容纳 left+刷新+right 三键(223px)尚有余量不重叠
+// 控制条+键盘的最大放大倍数:宽排 17 键,到顶时整排可见 ~11 键(17/1.55)
 const PANEL_CAP = 1.55;
 function slideButtons() {
     const vv = window.visualViewport;
     // 页面缩放 s:
     //   s ≤ CAP:panel 保持文档流,随页面自然放大、与图片一起平移;
     //   s > CAP:panel 反向缩放封顶(有效放大恒为 CAP,整排可见 ~10 键),
-    //            左缘钉在可视片左缘(永远满屏宽、无空带);仅键盘行随平移左移
-    //            (拖到最右即露出右侧按键,移到尽头则保持),输入行/日志恒左对齐
-    //            不被推出屏幕,按钮恒有充足空间。
+    //            左缘钉在可视片左缘(永远满屏宽、无空带),仅键盘行随平移左移
+    //            (拖到最右即露出右侧按键,移到尽头则保持),输入区/日志恒左对齐不被推出屏幕。
     const zoomed = !!(vv && vv.scale && Math.abs(vv.scale - 1) > 0.01);
     const s = zoomed ? vv.scale : 1;
     const k = zoomed ? Math.min(1, PANEL_CAP / s) : 1;
     const capped = zoomed && k < 1;
     const pageLeft = zoomed ? vv.pageLeft : 0;
     const w = bar.clientWidth;
-    let vpLeft, vpWidth;
     if (capped) {
         panel.style.transform = 'translateX(' + pageLeft + 'px) scale(' + k + ')';
-        vpWidth = window.innerWidth / (s * k);                       // = innerWidth / CAP,恒定
+        const vpWidth = window.innerWidth / (s * k);                 // = innerWidth / CAP,恒定
         const shift = Math.max(0, Math.min(pageLeft, w - vpWidth));  // 键盘行随平移左移,到尽头保持
         keyboardEl.style.transform = 'translateX(' + (-shift) + 'px)';
-        vpLeft = shift;
     } else {
         panel.style.transform = '';
         keyboardEl.style.transform = '';
-        vpLeft = zoomed ? pageLeft : 0;
-        vpWidth = zoomed ? (window.innerWidth / s) : w;
     }
+    // 三键固定钉位:left 贴行左缘、right 贴行右缘、刷新方块中心对齐行内预留位;
+    // 均用布局坐标(offsetLeft/clientWidth,不受 transform 影响),与缩放平移完全解耦
     const pad = 6;
-    // ☰ 收起时左右键 display:none(offsetParent 为 null),按 0 宽参与定位,刷新方块可整行居中
-    const hideL = !btnL.offsetParent, hideR = !btnR.offsetParent;
-    const bwL = hideL ? 0 : (btnL.offsetWidth || 70);
-    const bwR = hideR ? 0 : (btnR.offsetWidth || 70);
     const bwM = btnM.offsetWidth || 36;
-    let lx = hideL ? 0 : Math.max(pad, Math.min(vpLeft + pad, w - bwL - pad));
-    let rx = hideR ? w : Math.max(lx + bwL + pad, Math.min(vpLeft + vpWidth - bwR - pad, w - bwR - pad));
-    btnL.style.transform = '';
-    btnR.style.transform = '';
-    btnM.style.transform = '';
-    btnL.style.left = lx + 'px';
-    btnR.style.left = rx + 'px';
-    // 刷新方块:left 取其中心点。未缩放钉在行内预留位(.cspace)中心;
-    // 缩放拖动跟随可见区域中心;始终夹在左右两键之间
-    let target = vpLeft + vpWidth / 2;
-    if (!zoomed && cspace) {
-        const cr = cspace.getBoundingClientRect();
-        const br = bar.getBoundingClientRect();
-        target = cr.left + cr.width / 2 - br.left;
-    }
-    const mx = Math.max(lx + bwL + pad + bwM / 2, Math.min(target, rx - pad - bwM / 2));
-    btnM.style.left = mx + 'px';
+    btnL.style.left = pad + 'px';
+    btnR.style.left = (w - (btnR.offsetWidth || 70) - pad) + 'px';
+    const csCenter = cspace ? cspace.offsetLeft + cspace.offsetWidth / 2 : w / 2;
+    btnM.style.left = Math.max(pad + bwM / 2, Math.min(csCenter, w - pad - bwM / 2)) + 'px';
 }
 if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', () => requestAnimationFrame(slideButtons));
