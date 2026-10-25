@@ -130,6 +130,20 @@ def drag_at(x1, y1, x2, y2, button='left', steps=12):
     return f'drag {str(button).lower()} ({x1},{y1})->({x2},{y2})'
 
 
+def scroll_at(x, y, clicks=1):
+    """移动到 (x,y) 后滚动鼠标滚轮:clicks 正数向上滚、负数向下滚,一格为 120。"""
+    width, height = screen_size()
+    x = max(0, min(int(x), width - 1))
+    y = max(0, min(int(y), height - 1))
+    user32.SetCursorPos(x, y)
+    time.sleep(click_delay)
+    clicks = max(-20, min(20, int(clicks)))     # 防误传巨值导致长时间连续滚动
+    for _ in range(abs(clicks)):                # MOUSEEVENTF_WHEEL 逐格发送,贴近真实滚轮
+        user32.mouse_event(0x0800, 0, 0, 120 if clicks > 0 else -120, 0)
+        time.sleep(0.01)
+    return f'scroll {clicks:+d} at ({x},{y})'
+
+
 def _vk_of(name):
     text = str(name).strip().lower()
     if text in VK:
@@ -208,6 +222,10 @@ def drag(p, x1, y1, x2, y2, button='left'):
     return drag_at(x1, y1, x2, y2, button)
 
 
+def scroll(p, x, y, clicks=1):
+    return scroll_at(x, y, clicks)
+
+
 def key(p, combo):
     return press(combo)
 
@@ -234,7 +252,7 @@ body { margin: 0; overflow-x: hidden; background: var(--bg); color: var(--text);
    touch-action:none 屏蔽移动端在本行上触发浏览器级页面拖动/缩放 */
 #bar { position: relative; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; padding: 8px 10px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; touch-action: none; }
 #bar .slidy { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; font-weight: 700; touch-action: none; }
-#bar .slidy.dragging { background: var(--accent); color: #08201c; }
+#bar .slidy.dragging, #bar .slidyc.dragging { background: var(--accent); color: #08201c; }
 /* 刷新:浮动正方形,钉在 left/right 之间的中间 */
 #bar .slidyc { position: absolute; top: 50%; transform: translate(-50%, -50%); z-index: 5; width: 36px; height: 36px; padding: 0; font-size: 12px; line-height: 1; touch-action: none; }
 #bar > button:not(.slidy):not(.slidyc), #bar label { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
@@ -283,7 +301,7 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
     <span id="info"></span>
     <div class="bspace"></div>
     <button id="btn-right" class="slidy">right_click</button>
-    <button id="btn-refresh" class="slidyc" title="刷新截图">刷新</button>
+    <button id="btn-refresh" class="slidyc" title="点击刷新截图;按住上下拖动=远端滚轮">刷新</button>
   </div>
 
   <div id="keyboard"></div>
@@ -492,7 +510,6 @@ function sendClick(button) {
     rpc("rdp.click(p," + lastX + "," + lastY + ",'" + button + "')").then(scheduleRefresh).catch(() => {});
 }
 document.getElementById('btn-right').onclick = () => sendClick('right');
-document.getElementById('btn-refresh').onclick = refresh;
 
 // ---------- 选择模式:按住 left_click 拖动 → 半透明红条预览,松手才发送拖动请求 ----------
 const btnLeft = document.getElementById('btn-left');
@@ -541,6 +558,39 @@ btnLeft.addEventListener('pointercancel', () => finishLeftDrag(false));
 btnLeft.addEventListener('click', () => {
     if (suppressLeftClick) { suppressLeftClick = false; return; }
     sendClick('left');
+});
+
+// ---------- 刷新按钮:点击=刷新截图;按住上下拖动=在红点坐标处滚动远端滚轮 ----------
+// 上拖=滚轮向上、下拖=滚轮向下,每 24 显示像素折算一格;不足一格视为点击,仍走刷新
+const btnRefresh = document.getElementById('btn-refresh');
+let scrollState = null;                        // {id, sy, moved}
+let suppressRefreshClick = false;              // 滚动过就吞掉松手紧随的 click,避免误触刷新
+const NOTCH_PX = 24;                           // 拖动多少显示像素 = 远端滚轮一格
+btnRefresh.addEventListener('pointerdown', e => {
+    if (lastX === null && lastCursor) snapDotTo(lastCursor);   // 首帧图未解码完吸附失败,此处兜底
+    if (lastX === null) return;                // 未选坐标时不进滚轮模式,保持纯点击刷新
+    scrollState = { id: e.pointerId, sy: e.clientY, moved: false };
+    try { btnRefresh.setPointerCapture(e.pointerId); } catch (err) {}
+});
+btnRefresh.addEventListener('pointermove', e => {
+    if (!scrollState || e.pointerId !== scrollState.id) return;
+    const notches = Math.trunc((e.clientY - scrollState.sy) / NOTCH_PX);   // 下拖为正
+    if (!notches) return;                      // 累计不足一格:既不滚动也不算拖动
+    if (!scrollState.moved) { scrollState.moved = true; btnRefresh.classList.add('dragging');
+                              log('滚轮拖动中…上=向上滚,下=向下滚,松手结束', 'act'); }
+    scrollState.sy += notches * NOTCH_PX;      // 只消费整格位移,余量留给后续移动
+    rpc("rdp.scroll(p," + lastX + "," + lastY + "," + (-notches) + ")").then(scheduleRefresh).catch(() => {});
+});
+function finishRefreshScroll() {
+    const st = scrollState; scrollState = null;
+    btnRefresh.classList.remove('dragging');
+    if (st && st.moved) { suppressRefreshClick = true; setTimeout(() => { suppressRefreshClick = false; }, 400); }
+}
+btnRefresh.addEventListener('pointerup', finishRefreshScroll);
+btnRefresh.addEventListener('pointercancel', finishRefreshScroll);
+btnRefresh.addEventListener('click', () => {
+    if (suppressRefreshClick) { suppressRefreshClick = false; return; }
+    refresh();
 });
 
 // 屏蔽按钮/按键上的长按复制粘贴与右键菜单(移动端)
