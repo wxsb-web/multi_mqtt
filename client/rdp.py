@@ -18,6 +18,7 @@ RPC 入口(p 为 server_http 注入的请求级 response 对象):
     rdp.scroll(p, x, y, n)            移动到选定坐标滚动滚轮,n 正=向上、负=向下
     rdp.input(p, 'text')              文本逐字符敲入远端前台窗口(Unicode 键,不动剪贴板)
     rdp.clipboard(p)                  读取远端剪贴板文本
+    rdp.setclip(p, 'text')            把文本写入远端剪贴板
     rdp.key(p, 'ctrl+shift+esc')      按键 / 组合键,加号连接
 
 仅适配 Windows:user32 的 keybd_event / mouse_event / SetCursorPos,
@@ -204,6 +205,13 @@ user32.GetClipboardData.restype = ctypes.c_void_p
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalLock.restype = ctypes.c_void_p
 kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = ctypes.c_void_p
+kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+kernel32.GlobalFree.restype = ctypes.c_void_p
+user32.EmptyClipboard.restype = wintypes.BOOL
+user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+user32.SetClipboardData.restype = ctypes.c_void_p
 
 
 def get_clipboard_text():
@@ -221,6 +229,35 @@ def get_clipboard_text():
             return ctypes.wstring_at(ptr)
         finally:
             kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def set_clipboard_text(text):
+    """把文本写入远端剪贴板 CF_UNICODETEXT;SetClipboardData 成功后内存归系统接管。"""
+    data = str(text)
+    size = (len(data) + 1) * ctypes.sizeof(ctypes.c_wchar)
+    handle = kernel32.GlobalAlloc(0x0002, size)          # GMEM_MOVEABLE
+    if not handle:
+        return 'setclip alloc failed'
+    ptr = kernel32.GlobalLock(handle)
+    if not ptr:
+        kernel32.GlobalFree(handle)
+        return 'setclip lock failed'
+    try:
+        ctypes.memmove(ptr, ctypes.create_unicode_buffer(data, len(data) + 1), size)
+    finally:
+        kernel32.GlobalUnlock(handle)
+    if not user32.OpenClipboard(None):
+        kernel32.GlobalFree(handle)
+        return 'setclip open failed'
+    try:
+        user32.EmptyClipboard()
+        ok = user32.SetClipboardData(13, handle)          # CF_UNICODETEXT
+        if not ok:
+            kernel32.GlobalFree(handle)
+            return 'setclip failed'
+        return f'set clipboard {len(data)} chars'
     finally:
         user32.CloseClipboard()
 
@@ -315,6 +352,10 @@ def clipboard(p):
     return get_clipboard_text()
 
 
+def setclip(p, text):
+    return set_clipboard_text(text)
+
+
 def key(p, combo):
     return press(combo)
 
@@ -356,8 +397,15 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
 #keyboard { padding: 8px 6px 8px; background: var(--panel); }
 /* 开关行:键盘与日志之间 */
 #switches { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 4px 12px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
-#switches input[type=text] { flex: 1 1 180px; min-width: 140px; background: #0a0e10; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: 12px ui-monospace, Consolas, monospace; }
-#switches button { padding: 4px 10px; font-size: 11px; }
+/* 输入行:紧贴截图下缘常显;textarea 多行自动长高,发送按钮恒在输入框后面不换行走失 */
+#inputrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+#textin { flex: 1 1 140px; min-width: 120px; min-height: 36px; max-height: 160px; resize: none; overflow-y: auto; background: #0a0e10; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: 12px/1.4 ui-monospace, Consolas, monospace; }
+#inputrow button { flex: 0 0 auto; padding: 5px 10px; font-size: 11px; }
+#btn-send { background: var(--accent); color: #08201c; border-color: var(--accent); font-weight: 700; }
+/* 触屏设备输入字号提到 16px,防 iOS 聚焦时自动放大页面 */
+@media (pointer: coarse) { #textin { font-size: 16px; } }
+/* 默认隐藏 left、right 与配置开关,点 ☰ 展开,让输入行紧贴画面 */
+body:not(.more) #btn-left, body:not(.more) #btn-right, body:not(.more) #switches { display: none; }
 .krow { display: flex; gap: 3px; margin-bottom: 4px; min-width: 0; }
 .key { flex: 1 1 0; min-width: 0; height: 34px; padding: 0 4px; overflow: hidden; white-space: nowrap; border-radius: 5px; background: #1d262c; border: 1px solid #33414a; color: var(--text); font: 11px ui-monospace, Consolas, monospace; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-touch-callout: none; }
 .key:hover { background: #28343c; }
@@ -383,6 +431,13 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
 
 <div id="panel">
  <div id="panel-inner">
+  <div id="inputrow">
+    <button id="btn-more" title="显示/隐藏 left、right 与配置开关">☰</button>
+    <textarea id="textin" rows="1" placeholder="要发送的文本,可多行,Enter 换行,Ctrl+Enter 发送"></textarea>
+    <button id="btn-send" title="把文本逐字符敲入远端前台窗口,换行转回车键">发送</button>
+    <button id="btn-setclip" title="把输入框文本写入远端剪贴板">设剪贴板</button>
+    <button id="btn-getclip" title="读取远端剪贴板文本到输入框">取剪贴板</button>
+  </div>
   <div id="bar">
     <button id="btn-left" class="slidy">left_click</button>
     <div class="bspace"></div>
@@ -399,9 +454,6 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
     <label><input type="checkbox" id="auto"> 自动刷新 2s</label>
     <label><input type="checkbox" id="bw"> 黑白模式</label>
     <label><input type="checkbox" id="rev" checked> 滚轮取反</label>
-    <input type="text" id="textin" placeholder="要发送到远端的文本" autocomplete="off">
-    <button id="btn-send" title="把输入框文本逐字符敲入远端前台窗口">发送输入</button>
-    <button id="btn-clip" title="读取远端剪贴板文本到输入框">获取剪贴板</button>
   </div>
   <div id="log"></div>
  </div>
@@ -422,24 +474,43 @@ bwEl.onchange = () => { log('黑白模式: ' + (bwEl.checked ? '开' : '关'), '
 const revEl = document.getElementById('rev');    // 滚轮取反:默认开,上拖=向下滚(手机自然方向)
 revEl.onchange = () => log('滚轮取反: ' + (revEl.checked ? '开' : '关'), 'act');
 
-// ---------- 文本输入:聚焦收起远端键盘,发送敲入远端,剪贴板回读 ----------
+// ---------- 文本输入行:聚焦收起远端键盘;多行自动长高;Enter 换行,Ctrl+Enter 发送 ----------
 const textin = document.getElementById('textin');
 const kbEl = document.getElementById('keyboard');
 textin.addEventListener('focus', () => { kbEl.style.display = 'none'; });   // 省出屏幕给输入框
 textin.addEventListener('blur', () => { kbEl.style.display = ''; });
-function pyQuote(s) { return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+function autoGrow() {                       // 多行时自动长高,封顶 160px 转内部滚动
+    textin.style.height = 'auto';
+    textin.style.height = Math.min(textin.scrollHeight, 160) + 'px';
+}
+textin.addEventListener('input', autoGrow);
+function pyQuote(s) {                       // 串进 Python 单引号字面量:换行必须转义
+    return s.replace(/\r/g, '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n');
+}
 function sendText() {
     const text = textin.value;
     if (!text) { log('输入框为空,未发送', 'err'); return; }
     rpc("rdp.input(p,'" + pyQuote(text) + "')").then(() => scheduleRefresh()).catch(() => {});
 }
-textin.addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
+textin.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendText(); }
+});
 document.getElementById('btn-send').onclick = sendText;
-document.getElementById('btn-clip').onclick = () => {
+document.getElementById('btn-setclip').onclick = () => {
+    if (!textin.value) { log('输入框为空,未写入剪贴板', 'err'); return; }
+    rpc("rdp.setclip(p,'" + pyQuote(textin.value) + "')").then(scheduleRefresh).catch(() => {});
+};
+document.getElementById('btn-getclip').onclick = () => {
     rpc('rdp.clipboard(p)').then(t => {
         textin.value = t;
+        autoGrow();
         log('远程剪贴板 ' + t.length + ' 字符: ' + (t.slice(0, 80).replace(/\s+/g, ' ') || '空'), 'act');
     }).catch(() => {});
+};
+// ☰:默认隐藏 left/right 与配置开关让输入行紧贴画面,点此展开/收起
+document.getElementById('btn-more').onclick = () => {
+    document.body.classList.toggle('more');
+    requestAnimationFrame(slideButtons);    // 左右键显隐变化后重排悬浮按钮
 };
 
 // left/right_click 悬浮在控制行(bar)内左右两端,并跟随可视区域横向滑动:
@@ -481,11 +552,13 @@ function slideButtons() {
         vpWidth = zoomed ? (window.innerWidth / s) : w;
     }
     const pad = 6;
-    const bwL = btnL.offsetWidth || 70;
-    const bwR = btnR.offsetWidth || 70;
+    // ☰ 收起时左右键 display:none(offsetParent 为 null),按 0 宽参与定位,刷新方块可整行居中
+    const hideL = !btnL.offsetParent, hideR = !btnR.offsetParent;
+    const bwL = hideL ? 0 : (btnL.offsetWidth || 70);
+    const bwR = hideR ? 0 : (btnR.offsetWidth || 70);
     const bwM = btnM.offsetWidth || 36;
-    let lx = Math.max(pad, Math.min(vpLeft + pad, w - bwL - pad));
-    let rx = Math.max(lx + bwL + pad, Math.min(vpLeft + vpWidth - bwR - pad, w - bwR - pad));
+    let lx = hideL ? 0 : Math.max(pad, Math.min(vpLeft + pad, w - bwL - pad));
+    let rx = hideR ? w : Math.max(lx + bwL + pad, Math.min(vpLeft + vpWidth - bwR - pad, w - bwR - pad));
     btnL.style.transform = '';
     btnR.style.transform = '';
     btnM.style.transform = '';
