@@ -46,7 +46,8 @@ class FakeMQTTManager:
         self.subscribed_topics.discard(topic)
         self.unsubscribed.append(topic)
 
-    def set_periodic_task(self, _fn, interval=60.0):
+    def set_periodic_task(self, fn, interval=60.0):
+        self.periodic_fn = fn
         self.periodic_interval = interval
 
     def stop(self):
@@ -346,6 +347,97 @@ class ServerMqttConfigTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", return_value=response):
             other._publish_global_topic_list("test")
         self.assertEqual(recorded.get("qos"), 1)
+
+    def test_global_topic_list_settings_load_from_rpc_json(self):
+        """rpc.json 中的 global_topic_list_* 键必须进配置并生效到 MQTTServer。"""
+        self.config_path.write_text(
+            json.dumps({
+                "global_topic_list": "rpc/topic_list",
+                "global_topic_list_interval": 30,
+                "global_topic_list_idle_threshold": 60,
+                "global_topic_list_check_interval": 15,
+                "enable_global_topic_list": False,
+                "global_topic_list_publish_kwargs": {"retain": False},
+            }),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+        self.assertEqual(config["global_topic_list"], "rpc/topic_list")
+        self.assertEqual(config["global_topic_list_interval"], 30.0)
+        self.assertEqual(config["global_topic_list_idle_threshold"], 60.0)
+        self.assertEqual(config["global_topic_list_check_interval"], 15.0)
+        self.assertFalse(config["enable_global_topic_list"])
+        self.assertEqual(config["global_topic_list_publish_kwargs"], {"retain": False})
+
+        server = server_mqtt.MQTTServer(
+            brokers=[("b.example", 1883)],
+            request_topic="t/request",
+            server_public_key_bytes=None,
+            rpc_config_source=config,
+        )
+        self.assertEqual(server.global_topic_list, "rpc/topic_list")
+        self.assertEqual(server.global_topic_list_interval, 30.0)
+        self.assertEqual(server.global_topic_list_idle_threshold, 60.0)
+        self.assertEqual(server.global_topic_list_check_interval, 15.0)
+        self.assertFalse(server.enable_global_topic_list)
+        # rpc.json 值进入 _rpc_config：get_rpc_config()/后续 rpc_config() 以此为基线
+        self.assertEqual(server.get_rpc_config()["global_topic_list_interval"], 30.0)
+        # qos 无论配置什么都不允许跌回低档（retain 可自定义）
+        self.assertEqual(server.global_topic_list_publish_kwargs, {"qos": 1, "retain": False})
+
+    def test_rpc_config_updates_global_topic_list_settings_hot(self):
+        """rpc_config(global_topic_list_interval=...) 运行期热生效并持久化。"""
+        result = server_mqtt.rpc_config(
+            global_topic_list_interval=120.0,
+            global_topic_list_idle_threshold=300.0,
+            global_topic_list="hot/topic_list",
+        )
+
+        self.assertEqual(result["global_topic_list_interval"], 120.0)
+        self.assertEqual(self.server.global_topic_list_interval, 120.0)
+        self.assertEqual(self.server.global_topic_list_idle_threshold, 300.0)
+        self.assertEqual(self.server.global_topic_list, "hot/topic_list")
+        stored = json.loads(self.config_path.read_text())
+        self.assertEqual(stored["global_topic_list_interval"], 120.0)
+        self.assertEqual(stored["global_topic_list_idle_threshold"], 300.0)
+        self.assertEqual(stored["global_topic_list"], "hot/topic_list")
+
+    def test_rpc_config_check_interval_change_reregisters_tick(self):
+        """check_interval 变更须以新粒度重注册 tick；开关翻转须注册/注销。"""
+        server_mqtt.rpc_config(
+            enable_global_topic_list=True,
+            global_topic_list_check_interval=5.0,
+        )
+        self.assertTrue(self.server.enable_global_topic_list)
+        self.assertIs(
+            self.server.mqtt_net.periodic_fn.__func__,
+            self.server.global_topic_list_tick.__func__,
+        )   # bound method 每次访问都是新对象，比较底层函数
+        self.assertEqual(self.server.mqtt_net.periodic_interval, 5.0)
+
+        server_mqtt.rpc_config(global_topic_list_check_interval=17.0)
+        self.assertEqual(self.server.mqtt_net.periodic_interval, 17.0)
+
+        server_mqtt.rpc_config(enable_global_topic_list=False)
+        self.assertIsNone(self.server.mqtt_net.periodic_fn)
+        self.assertFalse(self.server.enable_global_topic_list)
+
+    def test_invalid_global_topic_list_settings_rejected(self):
+        """非法报告参数必须整体拒收：运行时与 rpc.json 均不变。"""
+        for bad_updates in (
+            {"global_topic_list_interval": 0},
+            {"global_topic_list_idle_threshold": -5},
+            {"global_topic_list_check_interval": "abc"},
+            {"global_topic_list": " "},
+            {"enable_global_topic_list": "yes"},
+            {"global_topic_list_publish_kwargs": "qos1"},
+        ):
+            with self.assertRaises(ValueError):
+                server_mqtt.rpc_config(**bad_updates)
+        self.assertEqual(self.server.global_topic_list_interval,
+                         server_mqtt.DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL)
+        self.assertFalse(self.config_path.exists())
 
     def test_rpc_functions_are_callable_over_http(self):
         import server_http

@@ -33,6 +33,7 @@ _ACTIVE_SERVER = None
 # --- [global_topic_list 监听 topic 定期报告] 默认配置 ---
 # 命名说明：stats.get_report 是网络连接质量报告；本组是"监听 topic 列表"报告，
 # 定期发布到 global_topic_list，供新订阅者经 Retain 消息发现服务端监听 topic
+# 全部参数均可在 rpc.json 中按同名键覆盖，运行期经 rpc_config(...) 热更新
 DEFAULT_GLOBAL_TOPIC_LIST = "global_topic_list"          # 报告发布到的 topic
 DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL = 3600.0              # 发布间隔：空闲期每小时一次
 DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD = 86400.0       # 距上次下发指令超过 24 小时视为空闲（可配置）
@@ -51,6 +52,13 @@ def _default_rpc_config():
         "request_topic": REQUEST_TOPIC,
         "pub_key": DEFAULT_PUB_KEY,
         "global_topic_url": DEFAULT_GLOBAL_TOPIC_URL,
+        # [global_topic_list 监听 topic 报告] 参数（同名键可在 rpc.json 覆盖）
+        "enable_global_topic_list": True,
+        "global_topic_list": DEFAULT_GLOBAL_TOPIC_LIST,
+        "global_topic_list_interval": DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL,
+        "global_topic_list_idle_threshold": DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD,
+        "global_topic_list_check_interval": DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL,
+        "global_topic_list_publish_kwargs": dict(DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS),
     }
 
 
@@ -90,6 +98,19 @@ def _normalize_broker_list(brokers, name, allow_empty=False):
 
 def _broker_identity(broker):
     return broker[0].casefold(), broker[1]
+
+
+def _normalize_positive_seconds(value, name):
+    """正数秒校验：接受 int/float/纯数字字符串，统一归一为 float。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{name} 必须是正数（秒）")
+    try:
+        number = float(value.strip() if isinstance(value, str) else value)
+    except ValueError as error:
+        raise ValueError(f"{name} 必须是正数（秒）") from error
+    if not (number > 0.0) or number == float("inf"):   # 同时挡住 0/负数/NaN/inf
+        raise ValueError(f"{name} 必须是正数（秒）")
+    return number
 
 
 def _normalize_rpc_config(config):
@@ -154,6 +175,34 @@ def _normalize_rpc_config(config):
     if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
         raise ValueError("global_topic_url 必须是非空 HTTP(S) URL")
     result["global_topic_url"] = global_topic_url
+
+    # [global_topic_list 监听 topic 报告] 参数校验（qos 钉死规则在 MQTTServer.__init__）
+    report_topic = result["global_topic_list"]
+    if not isinstance(report_topic, str) or not report_topic.strip():
+        raise ValueError("global_topic_list 必须是非空字符串")
+    result["global_topic_list"] = report_topic.strip()
+    result["global_topic_list_interval"] = _normalize_positive_seconds(
+        result["global_topic_list_interval"], "global_topic_list_interval")
+    result["global_topic_list_idle_threshold"] = _normalize_positive_seconds(
+        result["global_topic_list_idle_threshold"], "global_topic_list_idle_threshold")
+    result["global_topic_list_check_interval"] = _normalize_positive_seconds(
+        result["global_topic_list_check_interval"], "global_topic_list_check_interval")
+    enable_report = result["enable_global_topic_list"]
+    if isinstance(enable_report, bool):
+        pass
+    elif isinstance(enable_report, str) and enable_report.strip().lower() in ("true", "false"):
+        enable_report = enable_report.strip().lower() == "true"
+    elif isinstance(enable_report, int) and enable_report in (0, 1):
+        enable_report = bool(enable_report)
+    else:
+        raise ValueError("enable_global_topic_list 必须是布尔值（true/false）")
+    result["enable_global_topic_list"] = enable_report
+    publish_kwargs = result["global_topic_list_publish_kwargs"]
+    if publish_kwargs is None:
+        publish_kwargs = dict(DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS)
+    elif not isinstance(publish_kwargs, dict):
+        raise ValueError("global_topic_list_publish_kwargs 必须是 JSON object 或 null")
+    result["global_topic_list_publish_kwargs"] = dict(publish_kwargs)
     return result
 
 
@@ -165,6 +214,12 @@ def _json_rpc_config(config):
         "request_topic": config["request_topic"],
         "pub_key": config["pub_key"],
         "global_topic_url": config["global_topic_url"],
+        "enable_global_topic_list": config["enable_global_topic_list"],
+        "global_topic_list": config["global_topic_list"],
+        "global_topic_list_interval": config["global_topic_list_interval"],
+        "global_topic_list_idle_threshold": config["global_topic_list_idle_threshold"],
+        "global_topic_list_check_interval": config["global_topic_list_check_interval"],
+        "global_topic_list_publish_kwargs": config["global_topic_list_publish_kwargs"],
     }
 
 
@@ -358,11 +413,11 @@ class MQTTServer:
         reply_topic=DEFAULT_REPLY_TOPIC,
         keepalive=None,
         max_reconnect_delay=None,
-        enable_global_topic_list=True,
-        global_topic_list=DEFAULT_GLOBAL_TOPIC_LIST,
-        global_topic_list_interval=DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL,
-        global_topic_list_idle_threshold=DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD,
-        global_topic_list_check_interval=DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL,
+        enable_global_topic_list=None,
+        global_topic_list=None,
+        global_topic_list_interval=None,
+        global_topic_list_idle_threshold=None,
+        global_topic_list_check_interval=None,
         global_topic_list_publish_kwargs=None,
         global_topic_list_payload_fn=None,
         global_topic_url=DEFAULT_GLOBAL_TOPIC_URL,
@@ -409,16 +464,39 @@ class MQTTServer:
         self.executor = PythonExecutor(globals=globals)
 
         # --- [global_topic_list 定期报告] 状态（tick 由 _dispatch_loop 周期驱动，不另开线程） ---
-        self.enable_global_topic_list = enable_global_topic_list
-        self.global_topic_list = global_topic_list
-        self.global_topic_list_interval = float(global_topic_list_interval)
+        # 生效优先级：显式构造参数 > rpc.json（rpc_config_source）> 模块默认值；
+        # 解析结果回写 _rpc_config，get_rpc_config()/apply_rpc_config() 看到的即生效值
+        self.enable_global_topic_list = (
+            self._rpc_config["enable_global_topic_list"]
+            if enable_global_topic_list is None
+            else bool(enable_global_topic_list)
+        )
+        self.global_topic_list = (
+            self._rpc_config["global_topic_list"]
+            if global_topic_list is None
+            else str(global_topic_list)
+        )
+        self.global_topic_list_interval = (
+            self._rpc_config["global_topic_list_interval"]
+            if global_topic_list_interval is None
+            else float(global_topic_list_interval)
+        )
         # 距上次下发指令超过该秒数视为空闲（默认 24 小时，可配置），恢复每小时发布
-        self.global_topic_list_idle_threshold = float(global_topic_list_idle_threshold)
-        self.global_topic_list_check_interval = float(global_topic_list_check_interval)
+        self.global_topic_list_idle_threshold = (
+            self._rpc_config["global_topic_list_idle_threshold"]
+            if global_topic_list_idle_threshold is None
+            else float(global_topic_list_idle_threshold)
+        )
+        self.global_topic_list_check_interval = (
+            self._rpc_config["global_topic_list_check_interval"]
+            if global_topic_list_check_interval is None
+            else float(global_topic_list_check_interval)
+        )
         # 发布参数缺省 QoS1+Retain，经 **ka 一路透传到 paho-mqtt
         self.global_topic_list_publish_kwargs = (
-            dict(global_topic_list_publish_kwargs) if global_topic_list_publish_kwargs
-            else dict(DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS)
+            dict(self._rpc_config["global_topic_list_publish_kwargs"])
+            if global_topic_list_publish_kwargs is None
+            else dict(global_topic_list_publish_kwargs)
         )
         # 报告依赖 QoS1+Retain 的 broker 侧保留语义（新订阅者上线即收最新
         # 列表）；自定义发布参数无论传什么，qos 恒为 1，不允许静默跌回 QoS0。
@@ -426,6 +504,14 @@ class MQTTServer:
         # 自定义报告函数: fn(server) -> dict；None 则用默认的监听 topic 列表
         self.global_topic_list_payload_fn = global_topic_list_payload_fn
         self.global_topic_url = self._rpc_config["global_topic_url"]
+        self._rpc_config.update({
+            "enable_global_topic_list": self.enable_global_topic_list,
+            "global_topic_list": self.global_topic_list,
+            "global_topic_list_interval": self.global_topic_list_interval,
+            "global_topic_list_idle_threshold": self.global_topic_list_idle_threshold,
+            "global_topic_list_check_interval": self.global_topic_list_check_interval,
+            "global_topic_list_publish_kwargs": dict(self.global_topic_list_publish_kwargs),
+        })
         self._last_gtl_publish_ts = 0.0           # 上次发布报告的时间，0=尚未发布过
         self.last_command_ts = 0.0                # 最近一次收到控制指令的时间，0=从未收到
 
@@ -443,7 +529,11 @@ class MQTTServer:
             return copy.deepcopy(self._rpc_config)
 
     def apply_rpc_config(self, config):
-        """更新服务设置；broker 或公钥变更时以新网络管理器平滑替换旧实例。"""
+        """更新服务设置；broker 或公钥变更时以新网络管理器平滑替换旧实例。
+
+        global_topic_list 报告参数（间隔/阈值/tick 粒度/开关）随之热生效：
+        check_interval 变更或开关翻转时在当前 manager 上重注册/注销周期任务。
+        """
         global _ACTIVE_SERVER
         candidate = _normalize_rpc_config(config)
         with self._rpc_config_lock:
@@ -453,6 +543,8 @@ class MQTTServer:
                 or candidate["pub_key"] != previous["pub_key"]
             )
             topic_changed = candidate["request_topic"] != previous["request_topic"]
+            gtl_was_enabled = self.enable_global_topic_list
+            gtl_old_check_interval = self.global_topic_list_check_interval
             if network_changed:
                 replacement = MultiMQTTManager(
                     brokers=candidate["broker_list"],
@@ -474,6 +566,7 @@ class MQTTServer:
                 self.mqtt_net = replacement
                 self.request_topic = candidate["request_topic"]
                 self.global_topic_url = candidate["global_topic_url"]
+                self._apply_global_topic_list_settings(candidate)
                 self._rpc_config = candidate
                 if self.enable_global_topic_list:
                     replacement.set_periodic_task(
@@ -487,8 +580,27 @@ class MQTTServer:
                     self.mqtt_net.unsubscribe(previous["request_topic"])
                 self.request_topic = candidate["request_topic"]
                 self.global_topic_url = candidate["global_topic_url"]
+                self._apply_global_topic_list_settings(candidate)
                 self._rpc_config = candidate
+                if self.enable_global_topic_list and (
+                    not gtl_was_enabled
+                    or self.global_topic_list_check_interval != gtl_old_check_interval
+                ):
+                    self._register_global_topic_list_tick()   # set_periodic_task 覆盖式注册
+                elif gtl_was_enabled and not self.enable_global_topic_list:
+                    self._unregister_global_topic_list_tick()
             _ACTIVE_SERVER = self
+
+    def _apply_global_topic_list_settings(self, candidate):
+        """把候选配置的 global_topic_list 报告参数热更新到实例字段。"""
+        self.enable_global_topic_list = candidate["enable_global_topic_list"]
+        self.global_topic_list = candidate["global_topic_list"]
+        self.global_topic_list_interval = candidate["global_topic_list_interval"]
+        self.global_topic_list_idle_threshold = candidate["global_topic_list_idle_threshold"]
+        self.global_topic_list_check_interval = candidate["global_topic_list_check_interval"]
+        self.global_topic_list_publish_kwargs = dict(candidate["global_topic_list_publish_kwargs"])
+        # 与 __init__ 同规则：报告的 broker 侧保留语义依赖 QoS1，qos 恒钉在 1
+        self.global_topic_list_publish_kwargs["qos"] = 1
 
     def _reply_publish(self, net, reply_topic, payload):
         """[#17 回包防丢] 回包统一经"收到本请求的 manager"快照发出。
@@ -650,7 +762,7 @@ class MQTTServer:
             logger.exception(f"处理MQTT请求失败:topic={topic} rx_broker={rx_broker} {handle_message_error}")
 
     # ------------------------------------------------------------------
-    # global_topic_list 定期报告（可配置，见 __init__ / start(config)）
+    # global_topic_list 定期报告（可配置：rpc.json / rpc_config() / start(config)）
     # 与 stats.get_report 网络质量报告不同，本功能发布"服务端监听 topic 列表"。
     # tick 经 mqtt_net.set_periodic_task 并入 _dispatch_loop，与 Ping/统计报告
     # 同级别调度，不额外创建线程。
@@ -813,6 +925,12 @@ def start(config=None,globals=None):
         "request_topic",
         "pub_key",
         "global_topic_url",
+        "global_topic_list",
+        "global_topic_list_interval",
+        "global_topic_list_idle_threshold",
+        "global_topic_list_check_interval",
+        "global_topic_list_publish_kwargs",
+        "enable_global_topic_list",
     ):
         if key in config:
             explicit_rpc_settings[key] = config[key]
@@ -822,15 +940,23 @@ def start(config=None,globals=None):
         explicit_rpc_settings["request_topic"] = config["mqtt_request_topic"]
     if "mqtt_pub_key" in config:
         explicit_rpc_settings["pub_key"] = config["mqtt_pub_key"]
+    # 兼容既有 mqtt_ 前缀的 global_topic_list_* 键（Chaquopy start(config) 约定）
+    for key in (
+        "mqtt_enable_global_topic_list",
+        "mqtt_global_topic_list",
+        "mqtt_global_topic_list_interval",
+        "mqtt_global_topic_list_idle_threshold",
+        "mqtt_global_topic_list_check_interval",
+        "mqtt_global_topic_list_publish_kwargs",
+    ):
+        if key in config:
+            explicit_rpc_settings[key[len("mqtt_"):]] = config[key]
     if "broker_list" in explicit_rpc_settings:
         rpc_settings["_broker_list_base"] = explicit_rpc_settings["broker_list"]
     rpc_settings = _normalize_rpc_config({**rpc_settings, **explicit_rpc_settings})
     request_topic = _resolve_request_topic(explicit_rpc_settings.get("request_topic"))
     rpc_settings["request_topic"] = request_topic
     reply_topic = str(config.get("mqtt_reply_topic") or DEFAULT_REPLY_TOPIC)
-
-    # 监听 topic 定期报告配置（均可缺省）
-    report_publish_kwargs = config.get("mqtt_global_topic_list_publish_kwargs")
 
     # 直接把原始值交给 MultiMQTTManager，由它统一走 get_standard_public_pem_bytes
     server = MQTTServer(
@@ -841,18 +967,12 @@ def start(config=None,globals=None):
         rpc_config_source=rpc_settings,
         reply_topic=reply_topic,
         globals=globals,
-        enable_global_topic_list=bool(config.get("mqtt_enable_global_topic_list", True)),
-        global_topic_list=str(config.get("mqtt_global_topic_list") or DEFAULT_GLOBAL_TOPIC_LIST),
-        global_topic_list_interval=float(
-            config.get("mqtt_global_topic_list_interval") or DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL
-        ),
-        global_topic_list_idle_threshold=float(
-            config.get("mqtt_global_topic_list_idle_threshold") or DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD
-        ),
-        global_topic_list_check_interval=float(
-            config.get("mqtt_global_topic_list_check_interval") or DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL
-        ),
-        global_topic_list_publish_kwargs=report_publish_kwargs,
+        enable_global_topic_list=rpc_settings["enable_global_topic_list"],
+        global_topic_list=rpc_settings["global_topic_list"],
+        global_topic_list_interval=rpc_settings["global_topic_list_interval"],
+        global_topic_list_idle_threshold=rpc_settings["global_topic_list_idle_threshold"],
+        global_topic_list_check_interval=rpc_settings["global_topic_list_check_interval"],
+        global_topic_list_publish_kwargs=rpc_settings["global_topic_list_publish_kwargs"],
         global_topic_list_payload_fn=config.get("mqtt_global_topic_list_payload_fn"),
     )
 
