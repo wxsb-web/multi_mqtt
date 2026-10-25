@@ -27,8 +27,8 @@ DEFAULT_REPLY_TOPIC = "sys/device/response"
 DEFAULT_PUB_KEY='ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOf+GndQauvHHEICc3HTrEeV9bv5S/FTiI64tnMAUPCAaofEbRDmXa8d5R54k8tYOPjt+zdnZJaoSMmJ2pnp4ys='
 
 RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
-_RPC_CONFIG_LOCK = threading.RLock()
-_ACTIVE_SERVER = None
+_RPC_CONFIG_LOCK = globals().setdefault('_RPC_CONFIG_LOCK', threading.RLock())  # reload 会重造新锁对象：正攥旧锁写 rpc.json 的线程与拿新锁的线程同时进临界区，setdefault 保住同一把锁跨 reload
+_ACTIVE_SERVER = globals().setdefault('_ACTIVE_SERVER', None)  # 实例在构造时自注册（_ACTIVE_SERVER = self），reload 重执行把名字重绑回 None——rpc_config()/apply 热配置路径（324-352 行）静默失效直到下次实例化；setdefault 让 reload 后仍指向活着的实例
 
 # --- [global_topic_list 监听 topic 定期报告] 默认配置 ---
 # 命名说明：stats.get_report 是网络连接质量报告；本组是"监听 topic 列表"报告，
