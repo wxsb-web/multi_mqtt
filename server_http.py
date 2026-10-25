@@ -31,7 +31,22 @@ def get_bmp_bytes(rgb=None, size=(16, 16)):
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows 的 SO_REUSEADDR 与 Linux 语义不同：Linux 只允许复用 TIME_WAIT
+    # 状态的端口，Windows 却允许两个都设了该选项的 socket 同时 bind 同一
+    # 监听端口（已实测复现：第二次 bind 静默成功，netstat 出现两个
+    # LISTENING）。旧实例没退干净时新实例照常"启动成功"，但新连接可能被
+    # 投递给旧 listener 的内核 backlog——客户端表现为 TCP 连上、请求发出
+    # 后永远无响应。Windows 改用 SO_EXCLUSIVEADDRUSE 占住端口：端口被占
+    # 时启动立即报 WinError 10013/10048，快速失败而不是静默双绑挂死。
+    if sys.platform == 'win32':
+        allow_reuse_address = False  # 与 SO_EXCLUSIVEADDRUSE 互斥，必须关闭
+    else:
+        allow_reuse_address = True   # POSIX 保持原语义：仅复用 TIME_WAIT
+
+    def server_bind(self):
+        if sys.platform == 'win32':
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 class WebSocket:

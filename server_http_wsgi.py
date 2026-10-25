@@ -31,6 +31,7 @@ import queue
 import logging
 import threading
 import traceback
+import socket
 import socketserver
 import urllib.parse
 import http.client as _http_client
@@ -380,7 +381,18 @@ application = _build_wsgi_application()
 
 class _ThreadingWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # 同 server_http.ThreadedHTTPServer：Windows 上 SO_REUSEADDR 会静默
+    # 双绑正在监听的端口（Linux 只复用 TIME_WAIT），改用 SO_EXCLUSIVEADDRUSE
+    # 让端口被占时启动立即报错，快速失败而不是静默挂死。
+    if sys.platform == 'win32':
+        allow_reuse_address = False
+    else:
+        allow_reuse_address = True
+
+    def server_bind(self):
+        if sys.platform == 'win32':
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 class _QuietHandler(WSGIRequestHandler):
