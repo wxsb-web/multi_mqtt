@@ -378,9 +378,11 @@ body { margin: 0; overflow-x: hidden; background: var(--bg); color: var(--text);
 #dragrect { position: absolute; background: rgba(229,57,53,.25); border: 1px solid rgba(229,57,53,.8); display: none; pointer-events: none; z-index: 3; }
 /* 控制条+键盘+日志整体容器:页面双指放大时反向缩放,保持原始视觉大小 */
 #panel { transform-origin: 0 0; }
+/* 面板内纵向 flex 排序:聚焦输入框时输入区上移到画面正下方,不隐藏任何区块 */
+#panel-inner { display: flex; flex-direction: column; }
 /* 控制行:绝不允许换行;left/right_click 悬浮在本行左右两端,跟随可视区域滑动,永不遮挡截图;
    touch-action:none 屏蔽移动端在本行上触发浏览器级页面拖动/缩放 */
-#bar { position: relative; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; padding: 8px 10px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; touch-action: none; }
+#bar { position: relative; order: 10; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; padding: 8px 10px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; touch-action: none; }
 #bar .slidy { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; font-weight: 700; touch-action: none; }
 #bar .slidy.dragging, #bar .slidyc.dragging { background: var(--accent); color: #08201c; }
 /* 刷新:浮动正方形,钉在 left/right 之间的中间 */
@@ -394,24 +396,27 @@ button:hover { background: #2c3740; }
 button:active { background: var(--accent); color: #08201c; }
 #info { color: var(--muted); flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 label { color: var(--muted); display: flex; align-items: center; gap: 4px; cursor: pointer; }
-#keyboard { padding: 8px 6px 8px; background: var(--panel); }
-/* 开关行:键盘与日志之间 */
-#switches { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 4px 12px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
-/* 输入行:紧贴截图下缘常显;textarea 多行自动长高,发送按钮恒在输入框后面不换行走失 */
-#inputrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line); }
+#keyboard { order: 20; padding: 8px 6px 8px; background: var(--panel); }
+/* 开关行:输入区与日志之间 */
+#switches { order: 40; display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 4px 12px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
+/* 输入区:默认排键盘下方;聚焦时上移画面正下方;输入行只有文本框与发送按钮 */
+#inputzone { order: 30; background: var(--panel); }
+body.textfocus #inputzone { order: 1; }
+#inputrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px 10px 4px; }
 #textin { flex: 1 1 140px; min-width: 120px; min-height: 36px; max-height: 160px; resize: none; overflow-y: auto; background: #0a0e10; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: 12px/1.4 ui-monospace, Consolas, monospace; }
 #inputrow button { flex: 0 0 auto; padding: 5px 10px; font-size: 11px; }
 #btn-send { background: var(--accent); color: #08201c; border-color: var(--accent); font-weight: 700; }
-/* 触屏设备输入字号提到 16px,防 iOS 聚焦时自动放大页面 */
-@media (pointer: coarse) { #textin { font-size: 16px; } }
-/* 默认隐藏配置开关,点 ☰ 展开;left/right 行保持常显 */
-body:not(.more) #switches { display: none; }
+/* 历史、剪贴板等辅助按钮行:输入行下方 */
+#auxrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 0 10px 6px; border-bottom: 1px solid var(--line); }
+#auxrow button { padding: 4px 10px; font-size: 11px; }
 #histsel { flex: 0 0 auto; max-width: 110px; background: #222b31; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 4px; font: 11px ui-monospace, Consolas, monospace; }
+/* 触屏设备输入字号提到 16px,防 iOS 聚焦时自动放大 */
+@media (pointer: coarse) { #textin { font-size: 16px; } }
 .krow { display: flex; gap: 3px; margin-bottom: 4px; min-width: 0; }
 .key { flex: 1 1 0; min-width: 0; height: 34px; padding: 0 4px; overflow: hidden; white-space: nowrap; border-radius: 5px; background: #1d262c; border: 1px solid #33414a; color: var(--text); font: 11px ui-monospace, Consolas, monospace; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-touch-callout: none; }
 .key:hover { background: #28343c; }
 .key.mod.held { background: var(--accent); border-color: var(--accent); color: #08201c; font-weight: 700; }
-#log { height: 220px; overflow-y: auto; padding: 8px 10px; font-size: 12px; white-space: pre-wrap; word-break: break-all; background: #0a0e10; }
+#log { order: 50; height: 220px; overflow-y: auto; padding: 8px 10px; font-size: 12px; white-space: pre-wrap; word-break: break-all; background: #0a0e10; }
 .line { border-bottom: 1px dashed #1b2429; padding: 2px 0; }
 .err { color: var(--err); } .act { color: var(--accent); }
 @media (max-width: 640px) {
@@ -432,13 +437,16 @@ body:not(.more) #switches { display: none; }
 
 <div id="panel">
  <div id="panel-inner">
-  <div id="inputrow">
-    <button id="btn-more" title="显示/隐藏配置开关">☰</button>
-    <textarea id="textin" rows="1" placeholder="要发送的文本,可多行,Enter 换行,Ctrl+Enter 发送"></textarea>
-    <button id="btn-send" title="把文本逐字符敲入远端前台窗口,换行转回车键">发送</button>
-    <button id="btn-setclip" title="把输入框文本写入远端剪贴板">设剪贴板</button>
-    <button id="btn-getclip" title="读取远端剪贴板文本到输入框">取剪贴板</button>
-    <select id="histsel" title="选择历史输入填入输入框"><option>历史</option></select>
+  <div id="inputzone">
+    <div id="inputrow">
+      <textarea id="textin" rows="1" placeholder="要发送的文本,可多行,Enter 换行,Ctrl+Enter 发送"></textarea>
+      <button id="btn-send" title="把文本逐字符敲入远端前台窗口,换行转回车键">发送</button>
+    </div>
+    <div id="auxrow">
+      <select id="histsel" title="选择历史输入填入输入框"><option>历史</option></select>
+      <button id="btn-setclip" title="把输入框文本写入远端剪贴板">设剪贴板</button>
+      <button id="btn-getclip" title="读取远端剪贴板文本到输入框">取剪贴板</button>
+    </div>
   </div>
   <div id="bar">
     <button id="btn-left" class="slidy">left_click</button>
@@ -476,10 +484,10 @@ bwEl.onchange = () => { log('黑白模式: ' + (bwEl.checked ? '开' : '关'), '
 const revEl = document.getElementById('rev');    // 滚轮取反:默认开,上拖=向下滚(手机自然方向)
 revEl.onchange = () => log('滚轮取反: ' + (revEl.checked ? '开' : '关'), 'act');
 
-// ---------- 文本输入行:聚焦收起远端键盘;多行自动长高;Enter 换行,Ctrl+Enter 发送 ----------
+// ---------- 文本输入区:聚焦时整区上移画面正下方(flex 调序,不隐藏任何区块) ----------
 const textin = document.getElementById('textin');
-textin.addEventListener('focus', () => { keyboardEl.style.display = 'none'; });   // 省出屏幕给输入框
-textin.addEventListener('blur', () => { keyboardEl.style.display = ''; });
+textin.addEventListener('focus', () => { document.body.classList.add('textfocus'); });
+textin.addEventListener('blur', () => { document.body.classList.remove('textfocus'); });
 function autoGrow() {                       // 多行时自动长高,封顶 160px 转内部滚动
     textin.style.height = 'auto';
     textin.style.height = Math.min(textin.scrollHeight, 160) + 'px';
@@ -550,11 +558,6 @@ document.getElementById('btn-getclip').onclick = () => {
         log('远程剪贴板 ' + t.length + ' 字符: ' + (t.slice(0, 80).replace(/\s+/g, ' ') || '空'), 'act');
     }).catch(() => {});
 };
-// ☰:默认隐藏配置开关,点此展开/收起;left/right 行保持常显
-document.getElementById('btn-more').onclick = () => {
-    document.body.classList.toggle('more');
-    requestAnimationFrame(slideButtons);    // 开关行显隐后重排悬浮按钮
-};
 
 // left/right_click 悬浮在控制行(bar)内左右两端,并跟随可视区域横向滑动:
 // 移动端放大后拖动时,两键始终贴住当前可见范围的两边;按钮位于 bar 行内,不会遮挡截图
@@ -564,7 +567,6 @@ const btnR = document.getElementById('btn-right');
 const btnM = document.getElementById('btn-refresh');
 const cspace = document.querySelector('.cspace');   // 行内为刷新方块预留的空位
 const panel = document.getElementById('panel');
-const panelInner = document.getElementById('panel-inner');
 const keyboardEl = document.getElementById('keyboard');
 // 控制条+键盘的最大放大倍数:宽排 17 键,到顶时整排可见 ~11 键(17/1.55);
 // 1.55 时可视窗口 232px,容纳 left+刷新+right 三键(223px)尚有余量不重叠
