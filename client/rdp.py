@@ -16,6 +16,8 @@ RPC 入口(p 为 server_http 注入的请求级 response 对象):
     rdp.click(p, x, y, 'left')        移动并点击;left / right
     rdp.drag(p, x1, y1, x2, y2)       按住拖动(选择模式松手时调用)
     rdp.scroll(p, x, y, n)            移动到选定坐标滚动滚轮,n 正=向上、负=向下
+    rdp.input(p, 'text')              文本逐字符敲入远端前台窗口(Unicode 键,不动剪贴板)
+    rdp.clipboard(p)                  读取远端剪贴板文本
     rdp.key(p, 'ctrl+shift+esc')      按键 / 组合键,加号连接
 
 仅适配 Windows:user32 的 keybd_event / mouse_event / SetCursorPos,
@@ -144,6 +146,85 @@ def scroll_at(x, y, clicks=1):
     return f'scroll {clicks:+d} at ({x},{y})'
 
 
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [('wVk', wintypes.WORD), ('wScan', wintypes.WORD),
+                ('dwFlags', wintypes.DWORD), ('time', wintypes.DWORD),
+                ('dwExtraInfo', ctypes.c_size_t)]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [('dx', wintypes.LONG), ('dy', wintypes.LONG),
+                ('mouseData', wintypes.DWORD), ('dwFlags', wintypes.DWORD),
+                ('time', wintypes.DWORD), ('dwExtraInfo', ctypes.c_size_t)]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [('uMsg', wintypes.DWORD),
+                ('wParamL', wintypes.WORD), ('wParamH', wintypes.WORD)]
+
+
+class _INPUTunion(ctypes.Union):
+    _fields_ = [('mi', _MOUSEINPUT), ('ki', _KEYBDINPUT), ('hi', _HARDWAREINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [('type', wintypes.DWORD), ('union', _INPUTunion)]
+
+
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+
+
+def type_text(text):
+    """把字符串逐字符敲到远端前台窗口:SendInput Unicode 键入,支持任意语言、不占剪贴板。
+    keybd_event 的 bScan 是 BYTE,Unicode 码位会被截成低字节,中文全乱,故必须走 SendInput。"""
+    text = str(text)
+    sent = 0
+    for ch in text:
+        if ch == '\n':                          # 换行走真实回车键,多数编辑器不认 U+000A
+            _key_event(VK['enter'])
+            time.sleep(click_delay)
+            _key_event(VK['enter'], up=True)
+            continue
+        pair = (_INPUT * 2)()
+        for item in pair:
+            item.type = 1                       # INPUT_KEYBOARD
+            item.union.ki.wScan = ord(ch)
+            item.union.ki.dwFlags = 0x0004      # KEYEVENTF_UNICODE
+        pair[1].union.ki.dwFlags |= 0x0002      # 第二个事件为抬起(+KEYEVENTF_KEYUP)
+        sent += user32.SendInput(2, pair, ctypes.sizeof(_INPUT))
+        time.sleep(0.005)
+    return f'input {len(text)} chars, {sent} events'
+
+
+# 剪贴板句柄是 64 位值,必须显式声明 argtypes/restype,否则 ctypes 按 c_int 截断;
+# GlobalLock/GlobalUnlock 在 kernel32,OpenClipboard 等在 user32
+kernel32 = ctypes.windll.kernel32
+user32.GetClipboardData.argtypes = [wintypes.UINT]
+user32.GetClipboardData.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+
+
+def get_clipboard_text():
+    """读取远端剪贴板文本;空剪贴板或非文本内容返回空串。"""
+    if not user32.OpenClipboard(None):
+        return ''
+    try:
+        handle = user32.GetClipboardData(13)    # CF_UNICODETEXT
+        if not handle:
+            return ''
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return ''
+        try:
+            return ctypes.wstring_at(ptr)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
 def _vk_of(name):
     text = str(name).strip().lower()
     if text in VK:
@@ -226,6 +307,14 @@ def scroll(p, x, y, clicks=1):
     return scroll_at(x, y, clicks)
 
 
+def input(p, text):
+    return type_text(text)
+
+
+def clipboard(p):
+    return get_clipboard_text()
+
+
 def key(p, combo):
     return press(combo)
 
@@ -267,6 +356,8 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
 #keyboard { padding: 8px 6px 8px; background: var(--panel); }
 /* 开关行:键盘与日志之间 */
 #switches { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 4px 12px 8px; background: var(--panel); border-bottom: 1px solid var(--line); }
+#switches input[type=text] { flex: 1 1 180px; min-width: 140px; background: #0a0e10; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: 12px ui-monospace, Consolas, monospace; }
+#switches button { padding: 4px 10px; font-size: 11px; }
 .krow { display: flex; gap: 3px; margin-bottom: 4px; min-width: 0; }
 .key { flex: 1 1 0; min-width: 0; height: 34px; padding: 0 4px; overflow: hidden; white-space: nowrap; border-radius: 5px; background: #1d262c; border: 1px solid #33414a; color: var(--text); font: 11px ui-monospace, Consolas, monospace; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-touch-callout: none; }
 .key:hover { background: #28343c; }
@@ -308,6 +399,9 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
     <label><input type="checkbox" id="auto"> 自动刷新 2s</label>
     <label><input type="checkbox" id="bw"> 黑白模式</label>
     <label><input type="checkbox" id="rev" checked> 滚轮取反</label>
+    <input type="text" id="textin" placeholder="要发送到远端的文本" autocomplete="off">
+    <button id="btn-send" title="把输入框文本逐字符敲入远端前台窗口">发送输入</button>
+    <button id="btn-clip" title="读取远端剪贴板文本到输入框">获取剪贴板</button>
   </div>
   <div id="log"></div>
  </div>
@@ -327,6 +421,26 @@ function screenExpr() { return bwEl.checked ? 'rdp.screen(p,1)' : 'rdp.screen(p)
 bwEl.onchange = () => { log('黑白模式: ' + (bwEl.checked ? '开' : '关'), 'act'); refresh(); };
 const revEl = document.getElementById('rev');    // 滚轮取反:默认开,上拖=向下滚(手机自然方向)
 revEl.onchange = () => log('滚轮取反: ' + (revEl.checked ? '开' : '关'), 'act');
+
+// ---------- 文本输入:聚焦收起远端键盘,发送敲入远端,剪贴板回读 ----------
+const textin = document.getElementById('textin');
+const kbEl = document.getElementById('keyboard');
+textin.addEventListener('focus', () => { kbEl.style.display = 'none'; });   // 省出屏幕给输入框
+textin.addEventListener('blur', () => { kbEl.style.display = ''; });
+function pyQuote(s) { return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
+function sendText() {
+    const text = textin.value;
+    if (!text) { log('输入框为空,未发送', 'err'); return; }
+    rpc("rdp.input(p,'" + pyQuote(text) + "')").then(() => scheduleRefresh()).catch(() => {});
+}
+textin.addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
+document.getElementById('btn-send').onclick = sendText;
+document.getElementById('btn-clip').onclick = () => {
+    rpc('rdp.clipboard(p)').then(t => {
+        textin.value = t;
+        log('远程剪贴板 ' + t.length + ' 字符: ' + (t.slice(0, 80).replace(/\s+/g, ' ') || '空'), 'act');
+    }).catch(() => {});
+};
 
 // left/right_click 悬浮在控制行(bar)内左右两端,并跟随可视区域横向滑动:
 // 移动端放大后拖动时,两键始终贴住当前可见范围的两边;按钮位于 bar 行内,不会遮挡截图
