@@ -404,8 +404,9 @@ label { color: var(--muted); display: flex; align-items: center; gap: 4px; curso
 #btn-send { background: var(--accent); color: #08201c; border-color: var(--accent); font-weight: 700; }
 /* 触屏设备输入字号提到 16px,防 iOS 聚焦时自动放大页面 */
 @media (pointer: coarse) { #textin { font-size: 16px; } }
-/* 默认隐藏 left、right 与配置开关,点 ☰ 展开,让输入行紧贴画面 */
-body:not(.more) #btn-left, body:not(.more) #btn-right, body:not(.more) #switches { display: none; }
+/* 默认隐藏配置开关,点 ☰ 展开;left/right 行保持常显 */
+body:not(.more) #switches { display: none; }
+#histsel { flex: 0 0 auto; max-width: 110px; background: #222b31; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 4px; font: 11px ui-monospace, Consolas, monospace; }
 .krow { display: flex; gap: 3px; margin-bottom: 4px; min-width: 0; }
 .key { flex: 1 1 0; min-width: 0; height: 34px; padding: 0 4px; overflow: hidden; white-space: nowrap; border-radius: 5px; background: #1d262c; border: 1px solid #33414a; color: var(--text); font: 11px ui-monospace, Consolas, monospace; cursor: pointer; touch-action: manipulation; user-select: none; -webkit-touch-callout: none; }
 .key:hover { background: #28343c; }
@@ -432,11 +433,12 @@ body:not(.more) #btn-left, body:not(.more) #btn-right, body:not(.more) #switches
 <div id="panel">
  <div id="panel-inner">
   <div id="inputrow">
-    <button id="btn-more" title="显示/隐藏 left、right 与配置开关">☰</button>
+    <button id="btn-more" title="显示/隐藏配置开关">☰</button>
     <textarea id="textin" rows="1" placeholder="要发送的文本,可多行,Enter 换行,Ctrl+Enter 发送"></textarea>
     <button id="btn-send" title="把文本逐字符敲入远端前台窗口,换行转回车键">发送</button>
     <button id="btn-setclip" title="把输入框文本写入远端剪贴板">设剪贴板</button>
     <button id="btn-getclip" title="读取远端剪贴板文本到输入框">取剪贴板</button>
+    <select id="histsel" title="选择历史输入填入输入框"><option>历史</option></select>
   </div>
   <div id="bar">
     <button id="btn-left" class="slidy">left_click</button>
@@ -476,9 +478,8 @@ revEl.onchange = () => log('滚轮取反: ' + (revEl.checked ? '开' : '关'), '
 
 // ---------- 文本输入行:聚焦收起远端键盘;多行自动长高;Enter 换行,Ctrl+Enter 发送 ----------
 const textin = document.getElementById('textin');
-const kbEl = document.getElementById('keyboard');
-textin.addEventListener('focus', () => { kbEl.style.display = 'none'; });   // 省出屏幕给输入框
-textin.addEventListener('blur', () => { kbEl.style.display = ''; });
+textin.addEventListener('focus', () => { keyboardEl.style.display = 'none'; });   // 省出屏幕给输入框
+textin.addEventListener('blur', () => { keyboardEl.style.display = ''; });
 function autoGrow() {                       // 多行时自动长高,封顶 160px 转内部滚动
     textin.style.height = 'auto';
     textin.style.height = Math.min(textin.scrollHeight, 160) + 'px';
@@ -487,10 +488,52 @@ textin.addEventListener('input', autoGrow);
 function pyQuote(s) {                       // 串进 Python 单引号字面量:换行必须转义
     return s.replace(/\r/g, '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n');
 }
+// 输入历史:localStorage 持久化,发送成功才入库,下拉选择回填
+const histsel = document.getElementById('histsel');
+const histKey = 'rdp_input_hist';
+function loadHist() { try { return JSON.parse(localStorage.getItem(histKey)) || []; } catch (err) { return []; } }
+function saveHist(t) {
+    if (!t.trim()) return;
+    let h = loadHist().filter(x => x !== t);
+    h.unshift(t);
+    try { localStorage.setItem(histKey, JSON.stringify(h.slice(0, 30))); } catch (err) {}
+    renderHist();
+}
+function renderHist() {
+    const h = loadHist();
+    histsel.innerHTML = '';
+    const ph = document.createElement('option');
+    ph.textContent = '历史' + (h.length ? '(' + h.length + ')' : '');
+    histsel.appendChild(ph);
+    h.forEach((t, i) => {
+        const o = document.createElement('option');
+        o.textContent = t.replace(/\s+/g, ' ').slice(0, 40);
+        o.title = t;
+        o.value = String(i);
+        histsel.appendChild(o);
+    });
+}
+histsel.onchange = () => {
+    const h = loadHist(), i = parseInt(histsel.value, 10);
+    if (!isNaN(i) && h[i] !== undefined) {
+        textin.value = h[i];
+        autoGrow();
+        log('历史填入 ' + h[i].length + ' 字符', 'act');
+    }
+    histsel.selectedIndex = 0;               // 复位,同一项可再次选择
+};
+renderHist();
 function sendText() {
     const text = textin.value;
     if (!text) { log('输入框为空,未发送', 'err'); return; }
-    rpc("rdp.input(p,'" + pyQuote(text) + "')").then(() => scheduleRefresh()).catch(() => {});
+    rpc("rdp.input(p,'" + pyQuote(text) + "')")
+        .then(() => {                        // 发送成功:清空输入,截图刷新确认远端已上屏
+            textin.value = '';
+            autoGrow();
+            saveHist(text);
+            scheduleRefresh();
+        })
+        .catch(() => {});
 }
 textin.addEventListener('keydown', e => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendText(); }
@@ -507,10 +550,10 @@ document.getElementById('btn-getclip').onclick = () => {
         log('远程剪贴板 ' + t.length + ' 字符: ' + (t.slice(0, 80).replace(/\s+/g, ' ') || '空'), 'act');
     }).catch(() => {});
 };
-// ☰:默认隐藏 left/right 与配置开关让输入行紧贴画面,点此展开/收起
+// ☰:默认隐藏配置开关,点此展开/收起;left/right 行保持常显
 document.getElementById('btn-more').onclick = () => {
     document.body.classList.toggle('more');
-    requestAnimationFrame(slideButtons);    // 左右键显隐变化后重排悬浮按钮
+    requestAnimationFrame(slideButtons);    // 开关行显隐后重排悬浮按钮
 };
 
 // left/right_click 悬浮在控制行(bar)内左右两端,并跟随可视区域横向滑动:
@@ -522,6 +565,7 @@ const btnM = document.getElementById('btn-refresh');
 const cspace = document.querySelector('.cspace');   // 行内为刷新方块预留的空位
 const panel = document.getElementById('panel');
 const panelInner = document.getElementById('panel-inner');
+const keyboardEl = document.getElementById('keyboard');
 // 控制条+键盘的最大放大倍数:宽排 17 键,到顶时整排可见 ~11 键(17/1.55);
 // 1.55 时可视窗口 232px,容纳 left+刷新+right 三键(223px)尚有余量不重叠
 const PANEL_CAP = 1.55;
@@ -530,8 +574,9 @@ function slideButtons() {
     // 页面缩放 s:
     //   s ≤ CAP:panel 保持文档流,随页面自然放大、与图片一起平移;
     //   s > CAP:panel 反向缩放封顶(有效放大恒为 CAP,整排可见 ~10 键),
-    //            左缘钉在可视片左缘(永远满屏宽、无空带),内部内容随平移左移
-    //            (拖到最右即露出右侧按键,移到尽头则保持),按钮恒有充足空间。
+    //            左缘钉在可视片左缘(永远满屏宽、无空带);仅键盘行随平移左移
+    //            (拖到最右即露出右侧按键,移到尽头则保持),输入行/日志恒左对齐
+    //            不被推出屏幕,按钮恒有充足空间。
     const zoomed = !!(vv && vv.scale && Math.abs(vv.scale - 1) > 0.01);
     const s = zoomed ? vv.scale : 1;
     const k = zoomed ? Math.min(1, PANEL_CAP / s) : 1;
@@ -542,12 +587,12 @@ function slideButtons() {
     if (capped) {
         panel.style.transform = 'translateX(' + pageLeft + 'px) scale(' + k + ')';
         vpWidth = window.innerWidth / (s * k);                       // = innerWidth / CAP,恒定
-        const shift = Math.max(0, Math.min(pageLeft, w - vpWidth));  // 内容随平移左移,到尽头保持
-        panelInner.style.transform = 'translateX(' + (-shift) + 'px)';
+        const shift = Math.max(0, Math.min(pageLeft, w - vpWidth));  // 键盘行随平移左移,到尽头保持
+        keyboardEl.style.transform = 'translateX(' + (-shift) + 'px)';
         vpLeft = shift;
     } else {
         panel.style.transform = '';
-        panelInner.style.transform = '';
+        keyboardEl.style.transform = '';
         vpLeft = zoomed ? pageLeft : 0;
         vpWidth = zoomed ? (window.innerWidth / s) : w;
     }
