@@ -385,10 +385,12 @@ body { margin: 0; overflow-x: hidden; background: var(--bg); color: var(--text);
 /* 控制行:绝不允许换行;left/right_click 悬浮在本行左右两端,跟随可视区域滑动,永不遮挡截图;
    touch-action:none 屏蔽移动端在本行上触发浏览器级页面拖动/缩放 */
 #bar { position: relative; order: 10; display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; padding: 8px 10px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; touch-action: none; }
-#bar .slidy { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; font-weight: 700; touch-action: none; }
+#bar .slidy { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; min-height: 40px; font-weight: 700; touch-action: none; }
 #bar .slidy.dragging, #bar .slidyc.dragging { background: var(--accent); color: #08201c; }
 /* 刷新:浮动正方形,钉在 left/right 之间的中间 */
-#bar .slidyc { position: absolute; top: 50%; transform: translate(-50%, -50%); z-index: 5; width: 36px; height: 36px; padding: 0; font-size: 12px; line-height: 1; touch-action: none; }
+#bar .slidyc { position: absolute; top: 50%; transform: translate(-50%, -50%); z-index: 5; width: 44px; height: 44px; padding: 0; font-size: 13px; line-height: 1; touch-action: none; }
+/* 滚轮方向箭头:拖动滚轮时在远端光标处本地绘制,即时反馈不等截图网络往返 */
+#wheeldir { position: absolute; display: none; pointer-events: none; z-index: 4; font-size: 30px; line-height: 1; color: var(--accent); text-shadow: 0 0 6px rgba(0,0,0,.9), 0 0 2px rgba(0,0,0,.9); transform: translate(-50%, -50%); }
 #bar > button:not(.slidy):not(.slidyc) { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .bspace { flex: 1 1 0; min-width: 96px; }
 .cspace { flex: 1 1 36px; min-width: 36px; }
@@ -413,7 +415,7 @@ body.textfocus #inputzone { order: 1; }
 /* 历史、剪贴板等辅助按钮行:输入行下方 */
 #auxrow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 0 10px 6px; border-bottom: 1px solid var(--line); }
 #auxrow button { padding: 4px 10px; font-size: 11px; }
-#histsel { flex: 0 0 auto; max-width: 110px; background: #222b31; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 4px; font: 11px ui-monospace, Consolas, monospace; }
+#histsel, #switches select { flex: 0 0 auto; max-width: 110px; background: #222b31; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 5px 4px; font: 11px ui-monospace, Consolas, monospace; }
 /* 触屏设备输入字号提到 16px,防 iOS 聚焦时自动放大 */
 @media (pointer: coarse) { #textin { font-size: 16px; } }
 .krow { display: flex; gap: 3px; margin-bottom: 4px; min-width: 0; }
@@ -437,7 +439,7 @@ body.textfocus #inputzone { order: 1; }
 </head>
 <body>
 
-<div id="stage"><img id="shot" alt="desktop"><div id="dragrect"></div><div id="dot"></div></div>
+<div id="stage"><img id="shot" alt="desktop"><div id="dragrect"></div><div id="dot"></div><div id="wheeldir"></div></div>
 
 <div id="panel">
  <div id="panel-inner">
@@ -469,6 +471,15 @@ body.textfocus #inputzone { order: 1; }
     <label><input type="checkbox" id="auto"> 自动刷新 2s</label>
     <label><input type="checkbox" id="bw"> 黑白模式</label>
     <label><input type="checkbox" id="rev" checked> 滚轮取反</label>
+    <label>滚轮速度
+      <select id="speed" title="拖动多少像素滚一格,数值越小越快">
+        <option value="40">慢</option>
+        <option value="32">较慢</option>
+        <option value="24" selected>标准</option>
+        <option value="16">快</option>
+        <option value="10">很快</option>
+      </select>
+    </label>
   </div>
   <div id="log"></div>
  </div>
@@ -483,11 +494,21 @@ const infoEl = document.getElementById('info');
 const logEl = document.getElementById('log');
 const autoEl = document.getElementById('auto');
 const bwEl = document.getElementById('bw');
-bwEl.checked = __BW__;                        // 由 URL 参数 rdp.html(p, bw=True) 注入
+// ---------- 设置持久化:所有配置存 localStorage,刷新页面不丢 ----------
+function saveSetting(key, val) { try { localStorage.setItem(key, val); } catch (err) {} }
+const savedAuto = localStorage.getItem('rdp_auto');
+autoEl.checked = savedAuto === null ? false : savedAuto === '1';
+autoEl.onchange = () => saveSetting('rdp_auto', autoEl.checked ? '1' : '0');
+const savedBw = localStorage.getItem('rdp_bw');   // 无存档时才用 URL 参数 rdp.html(p, bw=True) 注入值
+bwEl.checked = savedBw === null ? __BW__ : savedBw === '1';
 function screenExpr() { return bwEl.checked ? 'rdp.screen(p,1)' : 'rdp.screen(p)'; }
-bwEl.onchange = () => { log('黑白模式: ' + (bwEl.checked ? '开' : '关'), 'act'); refresh(); };
+bwEl.onchange = () => { saveSetting('rdp_bw', bwEl.checked ? '1' : '0');
+                        log('黑白模式: ' + (bwEl.checked ? '开' : '关'), 'act'); refresh(); };
 const revEl = document.getElementById('rev');    // 滚轮取反:默认开,上拖=向下滚(手机自然方向)
-revEl.onchange = () => log('滚轮取反: ' + (revEl.checked ? '开' : '关'), 'act');
+const savedRev = localStorage.getItem('rdp_rev');
+if (savedRev !== null) revEl.checked = savedRev === '1';
+revEl.onchange = () => { saveSetting('rdp_rev', revEl.checked ? '1' : '0');
+                         log('滚轮取反: ' + (revEl.checked ? '开' : '关'), 'act'); };
 
 // ---------- 文本输入区:聚焦整区上移画面正下方并保持,失焦不自动跳回 ----------
 const textin = document.getElementById('textin');
@@ -599,7 +620,7 @@ function slideButtons() {
     // 三键固定钉位:left 贴行左缘、right 贴行右缘、刷新方块中心对齐行内预留位;
     // 均用布局坐标(offsetLeft/clientWidth,不受 transform 影响),与缩放平移完全解耦
     const pad = 6;
-    const bwM = btnM.offsetWidth || 36;
+    const bwM = btnM.offsetWidth || 44;
     btnL.style.left = pad + 'px';
     btnR.style.left = (w - (btnR.offsetWidth || 70) - pad) + 'px';
     const csCenter = cspace ? cspace.offsetLeft + cspace.offsetWidth / 2 : w / 2;
@@ -786,11 +807,27 @@ btnLeft.addEventListener('click', () => {
 
 // ---------- 刷新按钮:点击=刷新截图;按住上下拖动=在红点坐标处滚动远端滚轮 ----------
 // 滚轮取反开关默认开:上拖=向下滚、下拖=向上滚(手机自然方向),关掉则与真实滚轮同向;
-// 每 24 显示像素折算一格;不足一格视为点击,仍走刷新
+// 每格像素由配置滚轮速度决定;不足一格视为点击,仍走刷新
 const btnRefresh = document.getElementById('btn-refresh');
 let scrollState = null;                        // {id, sy, moved}
 let suppressRefreshClick = false;              // 滚动过就吞掉松手紧随的 click,避免误触刷新
-const NOTCH_PX = 24;                           // 拖动多少显示像素 = 远端滚轮一格
+const speedSel = document.getElementById('speed');   // 滚轮速度:每格拖动像素,越小越快
+const savedSpeed = localStorage.getItem('rdp_speed');
+if (savedSpeed) speedSel.value = savedSpeed;
+function notchPx() { return parseInt(speedSel.value, 10) || 24; }
+speedSel.onchange = () => { saveSetting('rdp_speed', speedSel.value);
+                            log('滚轮速度: 每格 ' + notchPx() + 'px', 'act'); };
+// 滚轮方向箭头:截图网络往返慢,远端画面延迟才更新,先在远端光标处本地画箭头即时反馈
+const wheeldir = document.getElementById('wheeldir');
+let wheelDirTimer = null;
+function showWheelDir(clicks) {
+    wheeldir.textContent = clicks > 0 ? '▲' : '▼';
+    wheeldir.style.left = (lastSx || 0) + 'px';
+    wheeldir.style.top = (lastSy || 0) + 'px';
+    wheeldir.style.display = 'block';
+    clearTimeout(wheelDirTimer);
+    wheelDirTimer = setTimeout(() => { wheeldir.style.display = 'none'; }, 600);
+}
 btnRefresh.addEventListener('pointerdown', e => {
     if (lastX === null && lastCursor) snapDotTo(lastCursor);   // 首帧图未解码完吸附失败,此处兜底
     if (lastX === null) return;                // 未选坐标时不进滚轮模式,保持纯点击刷新
@@ -799,12 +836,13 @@ btnRefresh.addEventListener('pointerdown', e => {
 });
 btnRefresh.addEventListener('pointermove', e => {
     if (!scrollState || e.pointerId !== scrollState.id) return;
-    const notches = Math.trunc((e.clientY - scrollState.sy) / NOTCH_PX);   // 下拖为正
+    const notches = Math.trunc((e.clientY - scrollState.sy) / notchPx());   // 下拖为正
     if (!notches) return;                      // 累计不足一格:既不滚动也不算拖动
     if (!scrollState.moved) { scrollState.moved = true; btnRefresh.classList.add('dragging');
                               log('滚轮拖动中…上下拖=滚轮,松手结束', 'act'); }
-    scrollState.sy += notches * NOTCH_PX;      // 只消费整格位移,余量留给后续移动
+    scrollState.sy += notches * notchPx();     // 只消费整格位移,余量留给后续移动
     const clicks = revEl.checked ? notches : -notches;   // 默认取反:上拖(负)=向下滚
+    showWheelDir(clicks);                      // 本地箭头先行,不等远端截图
     rpc("rdp.scroll(p," + lastX + "," + lastY + "," + clicks + ")").then(scheduleRefresh).catch(() => {});
 });
 function finishRefreshScroll() {
