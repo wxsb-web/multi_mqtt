@@ -1146,7 +1146,7 @@ class LogHub:
 
 
 # 模块级单例：必须在 main() 调 start_rpc_server 之前存在（handler 引用它）
-_LOG_HUB = LogHub(_LOCAL_LOG)
+_LOG_HUB = globals().setdefault('_LOG_HUB', LogHub(_LOCAL_LOG))  # setdefault 防 reload 日志分脑：120_cli 已把 .serve 按值捕获进服务器配置、浏览器订阅全挂在旧 hub 上，reload 普通赋值会重绑到新 hub——新代码往新 hub 发、旧 WS 订阅者收不到，快照/增量各走一半；LogHub 构造只存 ring 引用无副作用，reload 时重复求值仅多一个即弃对象
 
 
 def _lan_ip() -> str:
