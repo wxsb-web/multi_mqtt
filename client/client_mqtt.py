@@ -29,8 +29,9 @@ alias_history      =('history', 'history_file', 'his', 'hist')
 alias_status       =('status','state','s')
 alias_help         =('help','h','?')
 alias_exit         =('exit', 'quit')
-alias_timeout      =('timeout','time','wait','second','sec')
+alias_timeout      =('timeout','time','wait','second','sec','to')
 alias_timestamp_ms =('timestamp_ms','ts','server_ms')
+alias_min_broker_count =('min_broker_count','mb','min')
 
 def _cli_opts(*names):
     """从别名生成 argparse 选项：自动加 --/- 前缀，_ 与 - 都支持；单字符只出 -x。
@@ -359,6 +360,7 @@ def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_
     allow_no_server_pubkey_response=get_duplicated_kargs(ka,*alias_allow_no_pub,default=allow_no_server_pubkey_response)
     timeout=get_duplicated_kargs(ka,*alias_timeout,default=timeout)
     timestamp_ms=get_duplicated_kargs(ka,*alias_timestamp_ms,default=None)
+    min_broker_count=get_duplicated_kargs(ka,*alias_min_broker_count,default=min_broker_count)
     with _default_client_lock:
         if _default_client is None:
             _default_client = MQTTClientNode(
