@@ -9,8 +9,8 @@ _TERMINAL_CLEANUP = (b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l"
                      b"\x1b[?1006l\x1b[0m\x1b[?25h\r\n")
 
 
-_BIN_STDOUT_CACHE = None
-_BIN_STDERR_CACHE = None
+_BIN_STDOUT_CACHE = globals().setdefault('_BIN_STDOUT_CACHE', None)  # reload 重绑 None 会触发二次解析：会话期 sys.stdout 正被 _RingTextIO/redirect 替换，重解析可能锁错流；setdefault 保住首解析结果
+_BIN_STDERR_CACHE = globals().setdefault('_BIN_STDERR_CACHE', None)  # 同 _BIN_STDOUT_CACHE：stderr 会话期被 _RingTextIO 导流，首解析结果必须跨 reload 保活
 
 
 def _bin_stdout():
@@ -56,9 +56,9 @@ def _bin_stderr():
 _TERM_QUEUE_MAX = 8 * 1024 * 1024
 
 # 会话期 stdout 异步写线程（run_session 创建）；启动前为 None。
-_OUT_WRITER = None
+_OUT_WRITER = globals().setdefault('_OUT_WRITER', None)  # 必须防 reload：110_session/080_writerdiag 判空创建 _TerminalWriter（各带独立写线程），reload 把名字重绑 None 后会再起一条写线程，双线程并发写同一控制台；setdefault 保住活线程引用
 # stderr 异步写线程，懒初始化（_info 在 main 最早阶段就会用到）。
-_ERR_WRITER = None
+_ERR_WRITER = globals().setdefault('_ERR_WRITER', None)  # 同 _OUT_WRITER：050_status 判空懒建，reload 重绑 None = 再起一条 err 写线程，与旧线程并发写终端
 
 
 class _TerminalWriter:
@@ -105,8 +105,13 @@ class _TerminalWriter:
                 return
             room = self._max_bytes - self._queued_bytes
             if len(data) > room:
-                self.dropped += len(data) - room
-                data = data[:room]
+                # 按 UTF-8 字符边界截断：硬切 data[:room] 会切出半个汉字，
+                # 这种残尾正是控制台零进度死循环的燃料（2026-10-25 实证）。
+                clipped = _clip_utf8(data, room)
+                self.dropped += len(data) - len(clipped)
+                data = clipped
+            if not data:
+                return
             # 卡滞计时从本次入队起算：空闲期后第一笔数据若沿用上次 flush
             # 时间戳，stall_seconds 会把空闲秒数虚报成卡滞（实测虚报 11s+）。
             if self._queued_bytes == 0:
@@ -126,12 +131,20 @@ class _TerminalWriter:
         self._thread.join(timeout)
 
     def stall_seconds(self) -> float:
-        """有积压未写出时，距上次成功 flush 的秒数；无积压返回 0。"""
+        """有积压未写出时，距上次成功 flush 的秒数；无积压返回 0。
+
+        队列里没数据（正卡在一条原生写上）时改用通道自身的忙碌时长：
+        否则零进度 carry 僵住会被误判成"空闲"，自愈永远不触发。
+        """
         with self._lock:
             pending = self._queued_bytes
-        if pending <= 0:
-            return 0.0
-        return max(0.0, time.monotonic() - self._last_flush_ts)
+        s = 0.0
+        if pending > 0:
+            s = max(0.0, time.monotonic() - self._last_flush_ts)
+        busy = getattr(self._stream, "busy_seconds", None)
+        if busy is not None:
+            s = max(s, busy())
+        return s
 
     def abandon_pending(self) -> None:
         """自愈：当前块写完（或原生阻塞解除）后丢弃全部剩余积压并退出。
@@ -188,10 +201,11 @@ def _terminal_cleanup(sync: bool = False):
         _OUT_WRITER.write(_TERMINAL_CLEANUP)
         return
     try:
-        buf = _bin_stdout()
-        if buf is not None:
-            buf.write(_TERMINAL_CLEANUP)
-            buf.flush()
+        # 同步兜底也走独立控制台通道：绝不再碰 BufferedWriter
+        # （它可能正被一条零进度的 flush 占着锁）。
+        sink = _ConsoleSink("cleanup")
+        sink.write(_TERMINAL_CLEANUP)
+        sink.flush()
     except Exception:
         pass
 

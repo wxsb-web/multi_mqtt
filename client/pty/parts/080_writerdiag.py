@@ -1,15 +1,37 @@
 # ---- 写线程诊断与自愈（AI 经 RPC 可直接调用） ----
 
+# 自愈次数：诊断用，也是"每次 reset 是否真的换了新通道"的旁证
+_WRITER_RESETS = globals().setdefault('_WRITER_RESETS', 0)
+
+# 自动换通道次数上限：正常一次就够；上限只兜"换了也没用"的极端场景，
+# 避免像旧版那样每 60 秒留一个永久阻塞线程（实测堆到 62 个）。
+_AUTO_RESET_MAX = 50
+
+
+def _writer_sink_snapshot() -> dict:
+    """当前 stdout 通道快照（写线程卡滞告警用；不含写线程自身状态）。"""
+    w = _OUT_WRITER
+    snap = getattr(w._stream, "snapshot", None) if w is not None else None
+    return snap() if snap is not None else {}
+
+
 def _writer_state(w):
     if w is None:
         return None
-    return {
+    state = {
         "queued_bytes": w._queued_bytes,
         "queue_items": w._q.qsize(),
         "dropped": w.dropped,
         "stall_seconds": round(w.stall_seconds(), 2),
         "abandon": w._abandon,
+        "thread": (w._thread.ident, w._thread.name, w._thread.is_alive()),
+        "stream_kind": type(w._stream).__name__,
     }
+    snap = getattr(w._stream, "snapshot", None)
+    # 通道快照：holder=正在原生写里的线程、zero_progress=0 进度次数、
+    # busy_seconds=本条原生写持续秒数，一眼定位"锁死/零进度"两类冻结。
+    state["sink"] = snap() if snap is not None else None
+    return state
 
 
 def writer_diag() -> dict:
@@ -19,23 +41,43 @@ def writer_diag() -> dict:
     （它在快照之后的 run_session 里创建）；本函数运行时动态读模块全局，
     一条 RPC 即可看清卡滞现场：``r=writer_diag()``。
     """
-    return {"out": _writer_state(_OUT_WRITER), "err": _writer_state(_ERR_WRITER)}
+    ts = [t for t in threading.enumerate() if t.name.startswith("pty-out")]
+    return {
+        "out": _writer_state(_OUT_WRITER),
+        "err": _writer_state(_ERR_WRITER),
+        "pty_out_threads": len(ts),
+        "resets": _WRITER_RESETS,
+        "mcp_port": globals().get("_MCP_PORT"),
+    }
 
 
 def reset_out_writer() -> dict:
     """stdout 写线程卡死时自愈：旧 writer 写完当前块即丢弃积压退出，
-    新建 writer 接管后续输出。调用方随后应发 redraw 让远端整屏重绘。"""
-    global _OUT_WRITER
+    新建 writer + **全新控制台通道** 接管后续输出。
+
+    2026-10-25 实证：旧实现复用 _bin_stdout() 缓存的同一个 BufferedWriter，
+    新旧 writer 共享同一把被零进度 flush 占住的锁，换线程毫无意义，只会
+    每 60 秒多留一个永久阻塞线程（实测堆到 62 个）。必须换 _ConsoleSink
+    新实例（新锁 + 新 CONOUT$ 句柄）才能真正恢复输出。
+    """
+    global _OUT_WRITER, _WRITER_RESETS
     old = _OUT_WRITER
     if old is None:
         return {"ok": False, "error": "无 stdout writer（会话未建立？）"}
     stall = old.stall_seconds()
+    old_state = _writer_state(old)
     old.abandon_pending()
-    term_out = _bin_stdout()
-    if term_out is None:
+    if _bin_stdout() is None:
         return {"ok": False, "error": "终端输出流不可用"}
-    _OUT_WRITER = _TerminalWriter(term_out, name="pty-out")
-    return {"ok": True, "stall_seconds": round(stall, 2)}
+    _OUT_WRITER = _TerminalWriter(_new_console_sink("pty-out"), name="pty-out")
+    _WRITER_RESETS += 1
+    return {
+        "ok": True,
+        "stall_seconds": round(stall, 2),
+        "resets": _WRITER_RESETS,
+        "old": old_state,
+        "new": _writer_state(_OUT_WRITER),
+    }
 
 
 # ---- QuickEdit 选择模式冻结：自动解除（保留左键选择/右键粘贴） ----

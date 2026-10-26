@@ -12,6 +12,7 @@ pty/
 │   ├── 010_alias.py          # 统一别名表（CLI 选项 + 魔术栏 + rpc 别名共用）
 │   ├── 020_console.py        # 本地终端 raw 输入/输出、输入转码、剪贴板粘贴
 │   ├── 030_termwrite.py      # 二进制流锁定、_TerminalWriter 异步写线程、终端复位、控制台守卫
+│   ├── 031_console_sink.py   # 控制台输出通道 _ConsoleSink：UTF-8 跨帧 carry + 零进度保护 + 新句柄自愈
 │   ├── 040_hotkey.py         # 热键按键名解析（ctrl-] / ctrl-alt-insert → VT 序列）
 │   ├── 050_status.py         # broker 在线状态、stderr 异步写出
 │   ├── 060_logring.py        # 本地日志环形缓冲 _LogRing / _RingTextIO / _RingLogHandler
@@ -91,3 +92,24 @@ claude mcp add --transport http pty http://192.168.1.3:1188/mcp
 `None`）。因此 `__init__.py` 采用**共享命名空间顺序 exec**：加载语义与
 单文件完全一致；重组侧则因为分片是逐字节切片，拼接结果与原文件
 **逐字节一致**（sha256 相同），功能不变有硬证据。
+
+## 设计说明：控制台输出通道（031_console_sink）
+
+2026-10-25 现场实证（1188 RPC + py-spy）确认了控制台冻结的完整链路：
+
+1. 远端输出按字节分帧，切点可能落在 UTF-8 字符中间（汉字 3B / emoji 4B）；
+2. `_io._WindowsConsoleIO.write` 对**末尾不完整的多字节序列**返回 0 字节且
+   不抛异常（实测 `b"abc\xe4\xb8"` 只写 3B，剩下的 `b"\xe4\xb8"` 永远返回 0）；
+3. CPython `BufferedWriter.flush()` 的 C 循环在 0 进度上无限重试：持锁 +
+   约占满一个核（3 秒采样 73% 单核，线程停在 flush 行）；
+4. 旧实现所有 `_TerminalWriter` 共用 `_bin_stdout()` 缓存的**同一个**
+   `BufferedWriter`，`reset_out_writer()` 换线程换不掉那把锁，于是每 60 秒
+   多留一个永久阻塞线程（实测 62 个在等同一把锁）。
+
+因此 `_ConsoleSink` 做了四件事：直接 Win32 `WriteConsoleW`（非控制台退回
+`os.write`），彻底绕开 `BufferedWriter`；写前把末尾不完整的 UTF-8 字节留进
+carry，下一帧补齐，半个字符永不进控制台；原生写 0 进度只记账并保留数据，
+绝不原地重试；每个 sink 自带锁和自己的 `CONOUT$` 句柄，reset 即换新实例，
+旧实例卡死也拖不住新写线程。`writer_diag()` 会给出通道快照（`kind`、
+`zero_progress`、`carried_bytes`、`holder` 持锁线程、`busy_seconds`），
+一眼区分"锁死"与"零进度"。

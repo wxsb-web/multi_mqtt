@@ -442,8 +442,8 @@ _TERMINAL_CLEANUP = (b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l"
                      b"\x1b[?1006l\x1b[0m\x1b[?25h\r\n")
 
 
-_BIN_STDOUT_CACHE = None
-_BIN_STDERR_CACHE = None
+_BIN_STDOUT_CACHE = globals().setdefault('_BIN_STDOUT_CACHE', None)  # reload 重绑 None 会触发二次解析：会话期 sys.stdout 正被 _RingTextIO/redirect 替换，重解析可能锁错流；setdefault 保住首解析结果
+_BIN_STDERR_CACHE = globals().setdefault('_BIN_STDERR_CACHE', None)  # 同 _BIN_STDOUT_CACHE：stderr 会话期被 _RingTextIO 导流，首解析结果必须跨 reload 保活
 
 
 def _bin_stdout():
@@ -489,9 +489,9 @@ def _bin_stderr():
 _TERM_QUEUE_MAX = 8 * 1024 * 1024
 
 # 会话期 stdout 异步写线程（run_session 创建）；启动前为 None。
-_OUT_WRITER = None
+_OUT_WRITER = globals().setdefault('_OUT_WRITER', None)  # 必须防 reload：110_session/080_writerdiag 判空创建 _TerminalWriter（各带独立写线程），reload 把名字重绑 None 后会再起一条写线程，双线程并发写同一控制台；setdefault 保住活线程引用
 # stderr 异步写线程，懒初始化（_info 在 main 最早阶段就会用到）。
-_ERR_WRITER = None
+_ERR_WRITER = globals().setdefault('_ERR_WRITER', None)  # 同 _OUT_WRITER：050_status 判空懒建，reload 重绑 None = 再起一条 err 写线程，与旧线程并发写终端
 
 
 class _TerminalWriter:
@@ -538,8 +538,13 @@ class _TerminalWriter:
                 return
             room = self._max_bytes - self._queued_bytes
             if len(data) > room:
-                self.dropped += len(data) - room
-                data = data[:room]
+                # 按 UTF-8 字符边界截断：硬切 data[:room] 会切出半个汉字，
+                # 这种残尾正是控制台零进度死循环的燃料（2026-10-25 实证）。
+                clipped = _clip_utf8(data, room)
+                self.dropped += len(data) - len(clipped)
+                data = clipped
+            if not data:
+                return
             # 卡滞计时从本次入队起算：空闲期后第一笔数据若沿用上次 flush
             # 时间戳，stall_seconds 会把空闲秒数虚报成卡滞（实测虚报 11s+）。
             if self._queued_bytes == 0:
@@ -559,12 +564,20 @@ class _TerminalWriter:
         self._thread.join(timeout)
 
     def stall_seconds(self) -> float:
-        """有积压未写出时，距上次成功 flush 的秒数；无积压返回 0。"""
+        """有积压未写出时，距上次成功 flush 的秒数；无积压返回 0。
+
+        队列里没数据（正卡在一条原生写上）时改用通道自身的忙碌时长：
+        否则零进度 carry 僵住会被误判成"空闲"，自愈永远不触发。
+        """
         with self._lock:
             pending = self._queued_bytes
-        if pending <= 0:
-            return 0.0
-        return max(0.0, time.monotonic() - self._last_flush_ts)
+        s = 0.0
+        if pending > 0:
+            s = max(0.0, time.monotonic() - self._last_flush_ts)
+        busy = getattr(self._stream, "busy_seconds", None)
+        if busy is not None:
+            s = max(s, busy())
+        return s
 
     def abandon_pending(self) -> None:
         """自愈：当前块写完（或原生阻塞解除）后丢弃全部剩余积压并退出。
@@ -621,10 +634,11 @@ def _terminal_cleanup(sync: bool = False):
         _OUT_WRITER.write(_TERMINAL_CLEANUP)
         return
     try:
-        buf = _bin_stdout()
-        if buf is not None:
-            buf.write(_TERMINAL_CLEANUP)
-            buf.flush()
+        # 同步兜底也走独立控制台通道：绝不再碰 BufferedWriter
+        # （它可能正被一条零进度的 flush 占着锁）。
+        sink = _ConsoleSink("cleanup")
+        sink.write(_TERMINAL_CLEANUP)
+        sink.flush()
     except Exception:
         pass
 
@@ -695,6 +709,242 @@ def install_console_guards(console, on_signal=None):
     return restore
 
 
+# ============ 控制台输出通道（UTF-8 跨帧重组 + 零进度保护） ============
+#
+# 2026-10-25 冻结实证（1188 RPC + py-spy 现场）：
+#   1) 远端输出按字节分帧，切点可能落在 UTF-8 字符中间（汉字 3B / emoji 4B）；
+#   2) _io._WindowsConsoleIO.write 对"末尾不完整的多字节序列"返回 0 字节且
+#      不抛异常（实测 b"abc\\xe4\\xb8" 只写 3B，剩下的 b"\\xe4\\xb8" 永远返回 0）；
+#   3) CPython BufferedWriter.flush() 的 C 循环在 0 进度上无限重试：持锁 + 烧核
+#      （实测 3 秒采样 73% 单核、线程停在 pty_client_mqtt.py 的 flush 行）；
+#   4) 旧 _TerminalWriter 全部共用 _bin_stdout() 缓存的同一个 BufferedWriter，
+#      于是 reset_out_writer 换线程也换不掉那把锁，60 秒一次的自愈反而每 60 秒
+#      多留一个永久阻塞线程（实测 62 个 pty-out 线程在等同一把锁）。
+#
+# 本通道的对策：
+#   * 绕开 BufferedWriter，直接 Win32 WriteConsoleW（非控制台退回 os.write）；
+#   * 写前把末尾不完整的 UTF-8 字节留进 carry，等下一帧补齐再写，半字符永不
+#     进入控制台；
+#   * 原生写返回 0 进度时只记账并保留剩余数据，绝不原地空转重试；
+#   * 每个 sink 自带锁和自己的 CONOUT$ 句柄，reset 即换新实例：旧实例就算卡死
+#     在原生写里，也拖不住新写线程。
+
+_UTF8_TAIL_SCAN = 4                 # 末尾最多回看 3 字节找 UTF-8 起始字节
+_CONSOLE_CARRY_MAX = 64 * 1024      # carry 上限：异常时也不让内存无限涨
+
+
+def _utf8_complete_len(data: bytes) -> int:
+    """返回 data 中"最后一个完整 UTF-8 字符"结束处的偏移。
+
+    末尾若是半个字符（如 b"abc\\xe4\\xb8" 里的 \\xe4\\xb8），返回截断点；
+    数据本身非法（4 字节内都找不到起始字节）时按完整处理，交给控制台做替换。
+    """
+    n = len(data)
+    for back in range(1, _UTF8_TAIL_SCAN + 1):
+        if back > n:
+            return n                        # 全是延续字节：非法数据，按完整处理
+        lead = data[n - back]
+        if lead < 0x80:                     # ASCII：末尾即完整
+            return n
+        if 0x80 <= lead <= 0xBF:            # 延续字节：继续往前找起始字节
+            continue
+        if 0xC0 <= lead <= 0xF7:            # 合法起始字节：按长度判断是否补齐
+            need = 2 if lead <= 0xDF else (3 if lead <= 0xEF else 4)
+            return n if back >= need else n - back
+        return n                            # 非法字节（0xF8+）：按完整处理
+    return n
+
+
+def _clip_utf8(data: bytes, room: int) -> bytes:
+    """把 data 截到 room 字节内，且切点必须落在字符边界（不切断多字节字符）。"""
+    if room <= 0:
+        return b""
+    if len(data) <= room:
+        return data
+    return data[:_utf8_complete_len(data[:room])]
+
+
+class _ConsoleSink:
+    """单一控制台输出通道：自有锁 + UTF-8 carry + 零进度保护。
+
+    与旧设计（共用 sys.stdout.buffer 那个 BufferedWriter）的关键差别：锁和
+    控制台句柄都是本对象私有的。reset 时换新实例即换新通道，旧实例即使卡在
+    原生写里也不会阻塞新写线程。
+    """
+
+    def __init__(self, name: str = "stdout"):
+        self._name = name
+        self._lock = threading.Lock()
+        self._carry = b""
+        self._handle = None
+        self._own_handle = False
+        self._win32 = False
+        self._fd = 1
+        self._open_console()
+        self.created_ts = time.monotonic()
+        self._busy_since = 0.0
+        self._last_progress_ts = time.monotonic()
+        # 诊断计数（writer_diag 直接可见）
+        self.writes = 0
+        self.written_bytes = 0
+        self.zero_progress = 0     # 原生写返回 0 进度的次数
+        self.partial_writes = 0    # 原生写只写了一部分的次数
+        self.dropped_bytes = 0
+        self.holder = None         # 正在原生写里的线程名（持锁者）
+
+    # ---- 通道建立 ----
+
+    def _open_console(self) -> None:
+        """优先新开 CONOUT$ 句柄；拿不到控制台句柄时退回 fd 直写（管道/文件）。"""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            # 显式声明 64 位安全的签名：默认 c_int 会截断 HANDLE
+            k.CreateFileW.restype = wintypes.HANDLE
+            k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                      wintypes.DWORD, wintypes.LPVOID,
+                                      wintypes.DWORD, wintypes.DWORD,
+                                      wintypes.HANDLE]
+            k.GetStdHandle.restype = wintypes.HANDLE
+            k.GetStdHandle.argtypes = [wintypes.DWORD]
+            k.GetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.LPDWORD]
+            k.WriteConsoleW.restype = wintypes.BOOL
+            k.WriteConsoleW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR,
+                                        wintypes.DWORD, wintypes.LPDWORD,
+                                        wintypes.LPVOID]
+            k.CloseHandle.argtypes = [wintypes.HANDLE]
+            invalid = wintypes.HANDLE(-1).value
+            # 先确认进程 stdout 本身是不是控制台：重定向到文件/管道时必须
+            # 继续写 fd（尊重 > out.txt、| tee 这类用法），不能偷写 CONOUT$。
+            std = k.GetStdHandle(0xFFFFFFF5)  # STD_OUTPUT_HANDLE(-11)
+            mode = wintypes.DWORD()
+            if not (std and std != invalid
+                    and k.GetConsoleMode(std, ctypes.byref(mode))):
+                return
+            h = k.CreateFileW("CONOUT$", 0x40000000 | 0x80000000,  # GENERIC_READ|WRITE
+                              0x1 | 0x2,                           # FILE_SHARE_READ|WRITE
+                              None, 3, 0, None)                    # OPEN_EXISTING
+            if h and h != invalid:
+                if k.GetConsoleMode(h, ctypes.byref(mode)):
+                    self._handle = h
+                    self._own_handle = True
+                    self._win32 = True
+                    return
+                k.CloseHandle(h)
+            self._handle = std
+            self._win32 = True
+        except Exception:
+            self._win32 = False
+            self._handle = None
+
+    # ---- 原生写 ----
+
+    def _raw_write(self, data: bytes) -> int:
+        """返回实际消费的字节数；0 表示没有进度（调用方保留剩余数据）。"""
+        if self._win32:
+            import ctypes
+            from ctypes import wintypes
+            text = data.decode("utf-8", "replace")
+            if not text:
+                return len(data)
+            buf = ctypes.create_unicode_buffer(text)
+            n = wintypes.DWORD(0)
+            ok = ctypes.windll.kernel32.WriteConsoleW(
+                self._handle, buf, len(buf) - 1, ctypes.byref(n), None)
+            if not ok:
+                return 0
+            # 控制台把整串收进屏幕缓冲区，n 为 0 才算零进度
+            return len(data) if n.value else 0
+        return os.write(self._fd, data)
+
+    # ---- 对外接口（与 _TerminalWriter 期望的 write/flush 兼容） ----
+
+    def write(self, data) -> int:
+        data = bytes(data)
+        if not data:
+            return 0
+        with self._lock:
+            self.holder = threading.current_thread().name
+            self._busy_since = time.monotonic()
+            try:
+                buf = self._carry + data
+                self._carry = b""
+                cut = _utf8_complete_len(buf)
+                if cut < len(buf):
+                    # 末尾半个字符：留到下一帧补齐，绝不交给控制台
+                    self._carry = buf[cut:]
+                    buf = buf[:cut]
+                if not buf:
+                    return 0
+                total = len(buf)
+                done = 0
+                while done < total:
+                    try:
+                        k = self._raw_write(buf[done:])
+                    except Exception:
+                        k = 0
+                    if not k or k < 0:
+                        # 零进度：记账 + 保留剩余（含 carry），不原地重试
+                        self.zero_progress += 1
+                        rest = buf[done:] + self._carry
+                        if len(rest) > _CONSOLE_CARRY_MAX:
+                            self.dropped_bytes += len(rest) - _CONSOLE_CARRY_MAX
+                            rest = rest[-_CONSOLE_CARRY_MAX:]
+                        self._carry = rest
+                        break
+                    if k < total - done:
+                        self.partial_writes += 1
+                    done += k
+                    self._last_progress_ts = time.monotonic()
+                self.writes += 1
+                self.written_bytes += done
+                return done
+            finally:
+                self._busy_since = 0.0
+                self.holder = None
+
+    def flush(self) -> None:
+        """Win32 控制台/裸 fd 都是无缓冲写，flush 无事可做。"""
+
+    def busy_seconds(self) -> float:
+        """当前原生写已持续多久（秒）；卡在 OS 调用上时它会持续增长。"""
+        since = self._busy_since
+        s = max(0.0, time.monotonic() - since) if since else 0.0
+        # carry 长期写不出去 = 零进度僵住，同样算卡滞
+        if self._carry:
+            s = max(s, time.monotonic() - self._last_progress_ts)
+        return s
+
+    def snapshot(self) -> dict:
+        # 刻意不加 self._lock：写线程可能正持锁卡在原生写里，诊断/自愈必须
+        # 随时可读（属性读取在 GIL 下足够安全），否则 writer_diag 也会被冻住。
+        carry = self._carry
+        return {
+            "kind": "writeconsolew" if self._win32 else "fd",
+            "handle": int(self._handle) if self._handle else None,
+            "writes": self.writes,
+            "written_bytes": self.written_bytes,
+            "zero_progress": self.zero_progress,
+            "partial_writes": self.partial_writes,
+            "dropped_bytes": self.dropped_bytes,
+            "carried_bytes": len(carry),
+            "carry_head": carry[:8].hex(),
+            "holder": self.holder,
+            "busy_seconds": round(self.busy_seconds(), 2),
+            "age_seconds": round(time.monotonic() - self.created_ts, 1),
+        }
+
+
+def _new_console_sink(name: str = "stdout") -> "_ConsoleSink":
+    """新建一个独立控制台通道（新锁 + 新 CONOUT$ 句柄）。
+
+    reset_out_writer 必须走这里：只有换新实例才能真正甩掉旧通道里卡死的
+    原生写调用；沿用同一个流对象是上一版自愈失效的直接原因。
+    """
+    return _ConsoleSink(name)
 # ============================ 本地热键：按键名解析 ============================
 
 # 多字节热键（如 Ctrl+Alt+Insert 的 ESC[2;7~）到达时，ESC 可能与后续字节
@@ -1344,16 +1594,38 @@ def _info(msg):
 
 # ---- 写线程诊断与自愈（AI 经 RPC 可直接调用） ----
 
+# 自愈次数：诊断用，也是"每次 reset 是否真的换了新通道"的旁证
+_WRITER_RESETS = globals().setdefault('_WRITER_RESETS', 0)
+
+# 自动换通道次数上限：正常一次就够；上限只兜"换了也没用"的极端场景，
+# 避免像旧版那样每 60 秒留一个永久阻塞线程（实测堆到 62 个）。
+_AUTO_RESET_MAX = 50
+
+
+def _writer_sink_snapshot() -> dict:
+    """当前 stdout 通道快照（写线程卡滞告警用；不含写线程自身状态）。"""
+    w = _OUT_WRITER
+    snap = getattr(w._stream, "snapshot", None) if w is not None else None
+    return snap() if snap is not None else {}
+
+
 def _writer_state(w):
     if w is None:
         return None
-    return {
+    state = {
         "queued_bytes": w._queued_bytes,
         "queue_items": w._q.qsize(),
         "dropped": w.dropped,
         "stall_seconds": round(w.stall_seconds(), 2),
         "abandon": w._abandon,
+        "thread": (w._thread.ident, w._thread.name, w._thread.is_alive()),
+        "stream_kind": type(w._stream).__name__,
     }
+    snap = getattr(w._stream, "snapshot", None)
+    # 通道快照：holder=正在原生写里的线程、zero_progress=0 进度次数、
+    # busy_seconds=本条原生写持续秒数，一眼定位"锁死/零进度"两类冻结。
+    state["sink"] = snap() if snap is not None else None
+    return state
 
 
 def writer_diag() -> dict:
@@ -1363,23 +1635,43 @@ def writer_diag() -> dict:
     （它在快照之后的 run_session 里创建）；本函数运行时动态读模块全局，
     一条 RPC 即可看清卡滞现场：``r=writer_diag()``。
     """
-    return {"out": _writer_state(_OUT_WRITER), "err": _writer_state(_ERR_WRITER)}
+    ts = [t for t in threading.enumerate() if t.name.startswith("pty-out")]
+    return {
+        "out": _writer_state(_OUT_WRITER),
+        "err": _writer_state(_ERR_WRITER),
+        "pty_out_threads": len(ts),
+        "resets": _WRITER_RESETS,
+        "mcp_port": globals().get("_MCP_PORT"),
+    }
 
 
 def reset_out_writer() -> dict:
     """stdout 写线程卡死时自愈：旧 writer 写完当前块即丢弃积压退出，
-    新建 writer 接管后续输出。调用方随后应发 redraw 让远端整屏重绘。"""
-    global _OUT_WRITER
+    新建 writer + **全新控制台通道** 接管后续输出。
+
+    2026-10-25 实证：旧实现复用 _bin_stdout() 缓存的同一个 BufferedWriter，
+    新旧 writer 共享同一把被零进度 flush 占住的锁，换线程毫无意义，只会
+    每 60 秒多留一个永久阻塞线程（实测堆到 62 个）。必须换 _ConsoleSink
+    新实例（新锁 + 新 CONOUT$ 句柄）才能真正恢复输出。
+    """
+    global _OUT_WRITER, _WRITER_RESETS
     old = _OUT_WRITER
     if old is None:
         return {"ok": False, "error": "无 stdout writer（会话未建立？）"}
     stall = old.stall_seconds()
+    old_state = _writer_state(old)
     old.abandon_pending()
-    term_out = _bin_stdout()
-    if term_out is None:
+    if _bin_stdout() is None:
         return {"ok": False, "error": "终端输出流不可用"}
-    _OUT_WRITER = _TerminalWriter(term_out, name="pty-out")
-    return {"ok": True, "stall_seconds": round(stall, 2)}
+    _OUT_WRITER = _TerminalWriter(_new_console_sink("pty-out"), name="pty-out")
+    _WRITER_RESETS += 1
+    return {
+        "ok": True,
+        "stall_seconds": round(stall, 2),
+        "resets": _WRITER_RESETS,
+        "old": old_state,
+        "new": _writer_state(_OUT_WRITER),
+    }
 
 
 # ---- QuickEdit 选择模式冻结：自动解除（保留左键选择/右键粘贴） ----
@@ -2404,10 +2696,12 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     console = _make_raw_console()
     # 终端输出全部交给异步写线程：唯一可能阻塞的原生控制台 IO 只发生在
     # 那个可牺牲线程上，渲染主线程 / RPC 线程再也不会被控制台堵死。
-    # term_out 仍锁定真实二进制流（RPC 线程会把 sys.stdout 换成 StringIO）。
-    term_out = _bin_stdout()
-    if term_out is not None:
-        _OUT_WRITER = _TerminalWriter(term_out, name="pty-out")
+    # 通道用 _ConsoleSink（Win32 WriteConsoleW + 自有锁），彻底绕开
+    # sys.stdout.buffer 那个共享 BufferedWriter——它的 flush 在遇到半截
+    # UTF-8 时会零进度死循环并占死锁（2026-10-25 实证）。
+    if _bin_stdout() is not None:
+        _OUT_WRITER = _TerminalWriter(_new_console_sink("pty-out"),
+                                      name="pty-out")
 
     def _out_write(data: bytes) -> None:
         if _OUT_WRITER is not None:
@@ -2653,10 +2947,15 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                           if _OUT_WRITER is not None else 0.0)
                 if _stall > 10 and (time.monotonic() - last_stall_warn[0]) > 30:
                     last_stall_warn[0] = time.monotonic()
+                    _snap = _writer_sink_snapshot()
                     _emit_local(
-                        "[pty][WARN] 终端写卡滞 %.0fs：若窗口处于选择/"
-                        "标记模式，请先点一下本窗口再按 ESC 解除；"
-                        "或命令栏执行 redraw 切换写线程\n" % _stall)
+                        "[pty][WARN] 终端写卡滞 %.0fs（通道=%s 零进度=%s次 "
+                        "carry=%sB 持锁线程=%s）：窗口选择/标记模式请先点"
+                        "本窗口再按 ESC；否则 60s 后自动换新输出通道\n"
+                        % (_stall, _snap.get("kind"),
+                           _snap.get("zero_progress"),
+                           _snap.get("carried_bytes"),
+                           _snap.get("holder")))
                 # 长时间冻结（通常是选了文本忘记退出标记模式）：前台时
                 # 合成 ESC 自动解除，鼠标左键选择/右键粘贴照常保留。
                 # 每 30s 重试直到成功：解除仅在窗口前台时生效，用户切到
@@ -2669,15 +2968,25 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                         _emit_local(
                             "[pty] 窗口选择模式冻结输出超过 %.0f 秒，"
                             "已自动解除\n" % _SELECTION_STALL_AUTO_UNSTICK)
-                # 写线程活锁兜底（实证 2026-10-25）：_WindowsConsoleIO.write
-                # 对特定输出内容永不返回，线程持 GIL 空转（py-spy 三次采样
-                # 均 active），ESC/关 QuickEdit/抖动缓冲区全部无效；同一流
-                # 对象换一个新写线程立即排空恢复。卡滞超过 60s 直接切换。
+                # 写线程活锁兜底（2026-10-25 实证）：源头是半截 UTF-8 让
+                # BufferedWriter.flush 零进度死循环并占死共享锁。现在新通道
+                # 换的是新锁 + 新 CONOUT$ 句柄，旧实例卡死也拖不住新写线程。
                 if _stall >= 60.0 \
                         and (time.monotonic() - last_writer_reset_ts[0]) > 60:
                     last_writer_reset_ts[0] = time.monotonic()
-                    _emit_local("[pty] 写卡滞 %.0fs，自动切换写线程: %s\n"
-                                % (_stall, reset_out_writer()))
+                    # 换新通道（新锁 + 新 CONOUT$ 句柄）才真正有效；次数
+                    # 封顶防止"换了也没用"的极端场景无限堆线程。
+                    if _WRITER_RESETS >= _AUTO_RESET_MAX:
+                        _emit_local("[pty] 写卡滞 %.0fs，自愈已尝试 %d 次，"
+                                    "停止自动换通道（需人工介入）\n"
+                                    % (_stall, _WRITER_RESETS))
+                    else:
+                        _r = reset_out_writer()
+                        _emit_local("[pty] 写卡滞 %.0fs，自动换输出通道: "
+                                    "ok=%s resets=%s零进度=%s\n"
+                                    % (_stall, _r.get("ok"),
+                                       _r.get("resets"),
+                                       (_r.get("old") or {}).get("sink")))
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,

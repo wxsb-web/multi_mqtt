@@ -100,10 +100,12 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     console = _make_raw_console()
     # 终端输出全部交给异步写线程：唯一可能阻塞的原生控制台 IO 只发生在
     # 那个可牺牲线程上，渲染主线程 / RPC 线程再也不会被控制台堵死。
-    # term_out 仍锁定真实二进制流（RPC 线程会把 sys.stdout 换成 StringIO）。
-    term_out = _bin_stdout()
-    if term_out is not None:
-        _OUT_WRITER = _TerminalWriter(term_out, name="pty-out")
+    # 通道用 _ConsoleSink（Win32 WriteConsoleW + 自有锁），彻底绕开
+    # sys.stdout.buffer 那个共享 BufferedWriter——它的 flush 在遇到半截
+    # UTF-8 时会零进度死循环并占死锁（2026-10-25 实证）。
+    if _bin_stdout() is not None:
+        _OUT_WRITER = _TerminalWriter(_new_console_sink("pty-out"),
+                                      name="pty-out")
 
     def _out_write(data: bytes) -> None:
         if _OUT_WRITER is not None:
@@ -349,10 +351,15 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                           if _OUT_WRITER is not None else 0.0)
                 if _stall > 10 and (time.monotonic() - last_stall_warn[0]) > 30:
                     last_stall_warn[0] = time.monotonic()
+                    _snap = _writer_sink_snapshot()
                     _emit_local(
-                        "[pty][WARN] 终端写卡滞 %.0fs：若窗口处于选择/"
-                        "标记模式，请先点一下本窗口再按 ESC 解除；"
-                        "或命令栏执行 redraw 切换写线程\n" % _stall)
+                        "[pty][WARN] 终端写卡滞 %.0fs（通道=%s 零进度=%s次 "
+                        "carry=%sB 持锁线程=%s）：窗口选择/标记模式请先点"
+                        "本窗口再按 ESC；否则 60s 后自动换新输出通道\n"
+                        % (_stall, _snap.get("kind"),
+                           _snap.get("zero_progress"),
+                           _snap.get("carried_bytes"),
+                           _snap.get("holder")))
                 # 长时间冻结（通常是选了文本忘记退出标记模式）：前台时
                 # 合成 ESC 自动解除，鼠标左键选择/右键粘贴照常保留。
                 # 每 30s 重试直到成功：解除仅在窗口前台时生效，用户切到
@@ -365,15 +372,25 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                         _emit_local(
                             "[pty] 窗口选择模式冻结输出超过 %.0f 秒，"
                             "已自动解除\n" % _SELECTION_STALL_AUTO_UNSTICK)
-                # 写线程活锁兜底（实证 2026-10-25）：_WindowsConsoleIO.write
-                # 对特定输出内容永不返回，线程持 GIL 空转（py-spy 三次采样
-                # 均 active），ESC/关 QuickEdit/抖动缓冲区全部无效；同一流
-                # 对象换一个新写线程立即排空恢复。卡滞超过 60s 直接切换。
+                # 写线程活锁兜底（2026-10-25 实证）：源头是半截 UTF-8 让
+                # BufferedWriter.flush 零进度死循环并占死共享锁。现在新通道
+                # 换的是新锁 + 新 CONOUT$ 句柄，旧实例卡死也拖不住新写线程。
                 if _stall >= 60.0 \
                         and (time.monotonic() - last_writer_reset_ts[0]) > 60:
                     last_writer_reset_ts[0] = time.monotonic()
-                    _emit_local("[pty] 写卡滞 %.0fs，自动切换写线程: %s\n"
-                                % (_stall, reset_out_writer()))
+                    # 换新通道（新锁 + 新 CONOUT$ 句柄）才真正有效；次数
+                    # 封顶防止"换了也没用"的极端场景无限堆线程。
+                    if _WRITER_RESETS >= _AUTO_RESET_MAX:
+                        _emit_local("[pty] 写卡滞 %.0fs，自愈已尝试 %d 次，"
+                                    "停止自动换通道（需人工介入）\n"
+                                    % (_stall, _WRITER_RESETS))
+                    else:
+                        _r = reset_out_writer()
+                        _emit_local("[pty] 写卡滞 %.0fs，自动换输出通道: "
+                                    "ok=%s resets=%s零进度=%s\n"
+                                    % (_stall, _r.get("ok"),
+                                       _r.get("resets"),
+                                       (_r.get("old") or {}).get("sink")))
                 if pty.end_reason is not None:
                     _hard_exit(
                         console, 0,
