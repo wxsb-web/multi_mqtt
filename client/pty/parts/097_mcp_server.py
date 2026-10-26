@@ -335,9 +335,17 @@ def _mcp_build_asgi(server, prefer: str, host: str):
     if prefer != "sse" and hasattr(server, "streamable_http_app"):
         try:
             try:
-                app = server.streamable_http_app(host=str(host))
-            except TypeError:
-                app = server.streamable_http_app()
+                # 无状态模式：每请求新建 transport，不校验 Mcp-Session-Id。
+                # 有状态会话只存在进程内存里，pty 重启即整体失效；客户端断线后
+                # 往往只重连 SSE、不重新 initialize，会持续拿旧 session id 请求
+                # 并被 404 "Session not found" 拒绝，表现为「list tools failed」。
+                # 无状态下旧 id 直接忽略，重启不再断链。
+                app = server.streamable_http_app(host=str(host), stateless_http=True)
+            except TypeError:  # 旧版 SDK 不认 stateless_http：退回有状态模式
+                try:
+                    app = server.streamable_http_app(host=str(host))
+                except TypeError:
+                    app = server.streamable_http_app()
             base = str(getattr(getattr(server, "settings", None),
                                "streamable_http_path", None) or "/mcp").rstrip("/")
             return app, {base, base + "/"}
