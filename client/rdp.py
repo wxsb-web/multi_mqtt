@@ -669,7 +669,7 @@ if (window.ResizeObserver) { new ResizeObserver(slideButtons).observe(bar);
                              new ResizeObserver(slideButtons).observe(cspace);
                              new ResizeObserver(slideButtons).observe(panelInner); }   // 内容高度变化后重算占位
 slideButtons();
-let lastX = null, lastY = null, busy = false, refreshTimer = null;
+let lastX = null, lastY = null, busy = false, refreshTimer = null, snapPending = false;
 let lastSx = null, lastSy = null;           // 锚点在截图内的显示像素坐标
 const dragrect = document.getElementById('dragrect');
 
@@ -701,7 +701,7 @@ function fmtRate(bytesPerSec) {
     return Math.round(bytesPerSec) + 'B/s';
 }
 function refresh(snap) {
-    if (busy) return;
+    if (busy) { if (snap) snapPending = true; return; }   // 忙时记下待同步,本次截图完成后再补
     busy = true;
     const t0 = performance.now();
     let tHead = 0;
@@ -718,7 +718,10 @@ function refresh(snap) {
             const old = shot.src;
             shot.src = url;
             if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
-            if (snap && lastCursor) snapDotTo(lastCursor);   // 仅手动刷新才把红点吸附到远端真实鼠标位置
+            if ((snap || snapPending) && lastCursor) {       // 手动刷新/操作后的刷新才把红点归位
+                snapPending = false;
+                snapDotTo(lastCursor);
+            }
             const total = tBody - t0;
             const report = () => {
                 const kb = blob.size / 1024;
@@ -751,7 +754,8 @@ function snapDotTo(cursor) {
     coordEl.textContent = '坐标: (' + cx + ', ' + cy + ')';
 }
 
-function scheduleRefresh() { clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 400); }
+// 操作后的刷新:click/drag/scroll/key/input 都会移动远端光标,统一按手动刷新处理把红点归位
+function scheduleRefresh() { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => refresh(true), 400); }
 
 shot.addEventListener('load', () => { infoEl.textContent = shot.naturalWidth + 'x' + shot.naturalHeight; sizeDot(); });
 
@@ -941,7 +945,7 @@ function onKey(code, btn) {
 
 setInterval(() => { if (autoEl.checked) refresh(); }, 2000);
 log('页面就绪,加载截图中…');
-refresh();
+refresh(true);                              // 首次加载也归位红点,直接看到远端真实光标
 </script>
 </body>
 </html>'''
