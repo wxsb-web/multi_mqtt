@@ -3,29 +3,37 @@
 启动 RPC 服务(默认端口 1144):
     python server_http.py
 
-浏览器访问(URL 即代码,等价于执行 ``import rdp;rdp.html(response)``):
-    http://127.0.0.1:1144/import%20rdp;rdp.html(response)
+浏览器访问(URL 即代码,等价于执行 ``import rdp;rdp.html(p)``):
+    http://127.0.0.1:1144/import%20rdp;rdp.html(p)
+改完本文件想立即生效(不重启服务)可加一段 reload:
+    http://127.0.0.1:1144/from%20client%20import%20rdp;import%20importlib;rdp=importlib.reload(rdp);rdp.html(p)
 
-RPC 入口(p 为 server_http 注入的请求级 response 对象):
-    rdp.html(p)                       内嵌控制页(默认彩色、不自动刷新)
-    rdp.html(p, bw=True)              打开即黑白模式;页面内亦可随时勾选切换
-    rdp.screen(p)                     主屏截图 JPEG(含当前光标位置红圈)
-    rdp.screen(p, 1)                  黑白(灰度)截图,显著省流量
-    rdp.info(p)                       返回 "宽x高"
-    rdp.move(p, x, y)                 移动光标
-    rdp.click(p, x, y, 'left')        移动并点击;left / right
-    rdp.drag(p, x1, y1, x2, y2)       按住拖动(选择模式松手时调用)
-    rdp.scroll(p, x, y, n)            移动到选定坐标滚动滚轮,n 正=向上、负=向下
-    rdp.input(p, 'text')              文本逐字符敲入远端前台窗口(Unicode 键,不动剪贴板)
-    rdp.clipboard(p)                  读取远端剪贴板文本
-    rdp.setclip(p, 'text')            把文本写入远端剪贴板
-    rdp.key(p, 'ctrl+shift+esc')      按键 / 组合键,加号连接
+RPC 入口(仅 html/screen 需要 server_http 注入的请求级 response 对象 p):
+    html(p)                           内嵌控制页(默认彩色、不自动刷新)
+    html(p, bw=True)                  打开即黑白模式;页面内亦可随时勾选切换
+    screen(p)                         主屏截图 JPEG(含当前光标位置红圈)
+    screen(p, 1)                      黑白(灰度)截图,显著省流量
+    info()                            返回 "宽x高"
+    move(x, y)                        移动光标
+    click(x, y, 'left')               移动并点击;left / right
+    drag(x1, y1, x2, y2)              按住拖动(选择模式松手时调用)
+    scroll(x, y, n)                   移动到选定坐标滚动滚轮,n 正=向上、负=向下
+    input('text')                     文本逐字符敲入远端前台窗口(Unicode 键,不动剪贴板)
+    clipboard()                       读取远端剪贴板文本
+    setclip('text')                   把文本写入远端剪贴板
+    key('ctrl+shift+esc')             按键 / 组合键,加号连接
+
+除 html/screen 外都只用返回值回传结果,不需要 p;页面里的 RPC 表达式
+一律按本模块真实导入身份生成(见 _mod_expr),所以 ``import rdp``、
+``from client import rdp``、``importlib.reload(client.rdp)`` 等各种导入
+形式下,页面都能正常调用。
 
 仅适配 Windows:user32 的 keybd_event / mouse_event / SetCursorPos,
 截图用 Pillow 的 ImageGrab(主屏,坐标系与 SetCursorPos 一致)。
 """
 import ctypes
 import io
+import json
 import time
 from ctypes import wintypes
 
@@ -308,11 +316,27 @@ def press(combo):
 # ------------------------------------------------------------------ #
 # HTTP RPC 入口:p / response 由 server_http.handle_rpc 注入
 # ------------------------------------------------------------------ #
+def _mod_expr():
+    """按本模块真实导入身份,生成页面里调用自己的表达式。
+
+    进程里模块可能是顶层 ``rdp``(__name__ == 'rdp'),也可能是
+    ``client.rdp``;后者用 ``import client.rdp`` 导入时命名空间只绑定
+    ``client``,用 ``from client import rdp`` 导入时只绑定 ``rdp``,
+    写死任何一种前缀都会在另一种情况下 NameError。__import__ 带
+    fromlist 直接返回子模块,不依赖任何外部绑定,一次请求内开销也
+    只是 sys.modules 查表。
+    """
+    if '.' in __name__:
+        return "__import__('%s',fromlist=['*'])" % __name__
+    return __name__
+
+
 def html(p, bw=False):
     """控制页;bw=True 时页面默认进入黑白模式(截图走灰度,省流量)。"""
     p.set_header('Content-Type', 'text/html; charset=utf-8')
     p.set_header('Cache-Control', 'no-store')
-    p.set_data(PAGE.replace('__BW__', 'true' if bw else 'false'))
+    page = PAGE.replace('__BW__', 'true' if bw else 'false')
+    p.set_data(page.replace('__MOD__', json.dumps(_mod_expr())))
 
 
 def screen(p, bw=False):
@@ -323,40 +347,40 @@ def screen(p, bw=False):
     p.set_data(screenshot(bw=bool(bw)))
 
 
-def info(p):
+def info():
     width, height = screen_size()
     return f'{width}x{height}'
 
 
-def move(p, x, y):
+def move(x, y):
     return move_to(x, y)
 
 
-def click(p, x, y, button='left'):
+def click(x, y, button='left'):
     return click_at(x, y, button)
 
 
-def drag(p, x1, y1, x2, y2, button='left'):
+def drag(x1, y1, x2, y2, button='left'):
     return drag_at(x1, y1, x2, y2, button)
 
 
-def scroll(p, x, y, clicks=1):
+def scroll(x, y, clicks=1):
     return scroll_at(x, y, clicks)
 
 
-def input(p, text):
+def input(text):
     return type_text(text)
 
 
-def clipboard(p):
+def clipboard():
     return get_clipboard_text()
 
 
-def setclip(p, text):
+def setclip(text):
     return set_clipboard_text(text)
 
 
-def key(p, combo):
+def key(combo):
     return press(combo)
 
 
@@ -491,6 +515,9 @@ body.textfocus #inputzone { order: 1; }
 
 <script>
 const BASE = location.pathname.split(';')[0] + ';';   // /import%20rdp;
+// 本模块在后端命名空间里的访问表达式,由 rdp.html() 按真实导入名注入
+// (client.rdp / rdp 自动适配),页面所有请求都拼在它后面
+const MOD = __MOD__;
 const shot = document.getElementById('shot');
 const dot = document.getElementById('dot');
 const coordEl = document.getElementById('coord');
@@ -505,7 +532,7 @@ autoEl.checked = savedAuto === null ? false : savedAuto === '1';
 autoEl.onchange = () => saveSetting('rdp_auto', autoEl.checked ? '1' : '0');
 const savedBw = localStorage.getItem('rdp_bw');   // 无存档时才用 URL 参数 rdp.html(p, bw=True) 注入值
 bwEl.checked = savedBw === null ? __BW__ : savedBw === '1';
-function screenExpr() { return bwEl.checked ? 'rdp.screen(p,1)' : 'rdp.screen(p)'; }
+function screenExpr() { return bwEl.checked ? MOD + '.screen(p,1)' : MOD + '.screen(p)'; }
 bwEl.onchange = () => { saveSetting('rdp_bw', bwEl.checked ? '1' : '0');
                         log('黑白模式: ' + (bwEl.checked ? '开' : '关'), 'act'); refresh(); };
 const revEl = document.getElementById('rev');    // 滚轮取反:默认开,上拖=向下滚(手机自然方向)
@@ -568,7 +595,7 @@ renderHist();
 function sendText() {
     const text = textin.value;
     if (!text) { log('输入框为空,未发送', 'err'); return; }
-    rpc("rdp.input(p,'" + pyQuote(text) + "')")
+    rpc(MOD + ".input('" + pyQuote(text) + "')")
         .then(() => {                        // 发送成功:清空输入,截图刷新确认远端已上屏
             textin.value = '';
             autoGrow();
@@ -583,10 +610,10 @@ textin.addEventListener('keydown', e => {
 document.getElementById('btn-send').onclick = sendText;
 document.getElementById('btn-setclip').onclick = () => {
     if (!textin.value) { log('输入框为空,未写入剪贴板', 'err'); return; }
-    rpc("rdp.setclip(p,'" + pyQuote(textin.value) + "')").then(scheduleRefresh).catch(() => {});
+    rpc(MOD + ".setclip('" + pyQuote(textin.value) + "')").then(scheduleRefresh).catch(() => {});
 };
 document.getElementById('btn-getclip').onclick = () => {
-    rpc('rdp.clipboard(p)').then(t => {
+    rpc(MOD + '.clipboard()').then(t => {
         textin.value = t;
         autoGrow();
         log('远程剪贴板 ' + t.length + ' 字符: ' + (t.slice(0, 80).replace(/\s+/g, ' ') || '空'), 'act');
@@ -673,7 +700,7 @@ function fmtRate(bytesPerSec) {
     if (bytesPerSec >= 1024) return (bytesPerSec / 1024).toFixed(0) + 'KB/s';
     return Math.round(bytesPerSec) + 'B/s';
 }
-function refresh() {
+function refresh(snap) {
     if (busy) return;
     busy = true;
     const t0 = performance.now();
@@ -691,7 +718,7 @@ function refresh() {
             const old = shot.src;
             shot.src = url;
             if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
-            if (lastCursor) snapDotTo(lastCursor);   // 红点吸附到远端真实鼠标位置(与空心圈重合)
+            if (snap && lastCursor) snapDotTo(lastCursor);   // 仅手动刷新才把红点吸附到远端真实鼠标位置
             const total = tBody - t0;
             const report = () => {
                 const kb = blob.size / 1024;
@@ -756,7 +783,7 @@ shot.addEventListener('click', e => {
 
 function sendClick(button) {
     if (lastX === null) { log('请先点击上方截图选择坐标', 'err'); return; }
-    rpc("rdp.click(p," + lastX + "," + lastY + ",'" + button + "')").then(scheduleRefresh).catch(() => {});
+    rpc(MOD + '.click(' + lastX + "," + lastY + ",'" + button + "')").then(scheduleRefresh).catch(() => {});
 }
 document.getElementById('btn-right').onclick = () => sendClick('right');
 
@@ -794,7 +821,7 @@ function finishLeftDrag(send) {
     if (send && st.moved && st.ex !== null) {
         const ex = Math.round(st.ex / shot.clientWidth * shot.naturalWidth);
         const ey = Math.round(st.ey / shot.clientHeight * shot.naturalHeight);
-        rpc("rdp.drag(p," + lastX + "," + lastY + "," + ex + "," + ey + ")").then(scheduleRefresh).catch(() => {});
+        rpc(MOD + '.drag(' + lastX + "," + lastY + "," + ex + "," + ey + ")").then(scheduleRefresh).catch(() => {});
     }
 }
 btnLeft.addEventListener('pointerup', e => {
@@ -848,7 +875,7 @@ btnRefresh.addEventListener('pointermove', e => {
     scrollState.sy += notches * notchPx();     // 只消费整格位移,余量留给后续移动
     const clicks = revEl.checked ? notches : -notches;   // 默认取反:上拖(负)=向下滚
     showWheelDir(clicks);                      // 本地箭头先行,不等远端截图
-    rpc("rdp.scroll(p," + lastX + "," + lastY + "," + clicks + ")").then(scheduleRefresh).catch(() => {});
+    rpc(MOD + '.scroll(' + lastX + "," + lastY + "," + clicks + ")").then(scheduleRefresh).catch(() => {});
 });
 function finishRefreshScroll() {
     const st = scrollState; scrollState = null;
@@ -859,7 +886,7 @@ btnRefresh.addEventListener('pointerup', finishRefreshScroll);
 btnRefresh.addEventListener('pointercancel', finishRefreshScroll);
 btnRefresh.addEventListener('click', () => {
     if (suppressRefreshClick) { suppressRefreshClick = false; return; }
-    refresh();
+    refresh(true);                             // 手动刷新:同时把红点同步到远端光标
 });
 
 // 屏蔽按钮/按键上的长按复制粘贴与右键菜单(移动端)
@@ -909,7 +936,7 @@ function onKey(code, btn) {
         held.clear();
         document.querySelectorAll('.key.mod.held').forEach(el => el.classList.remove('held'));
     }
-    rpc("rdp.key(p,'" + combo + "')").then(scheduleRefresh).catch(() => {});
+    rpc(MOD + ".key('" + combo + "')").then(scheduleRefresh).catch(() => {});
 }
 
 setInterval(() => { if (autoEl.checked) refresh(); }, 2000);
