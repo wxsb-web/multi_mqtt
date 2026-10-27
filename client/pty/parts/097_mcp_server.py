@@ -26,6 +26,125 @@
 # 但仍要 MCP 的场景）；--no-mcp 完全关闭。
 
 import asyncio
+import functools
+import inspect
+import logging
+import time
+
+_MCP_LOG_ARG_MAX = 400  # 开始行单个参数原始值最多保留的字符数
+_MCP_DONE_ARG_MAX = 60  # 完成行单个参数值最多保留的字符数
+_MCP_DONE_INDENT = "   "  # 完成行整行左缩进，视觉上从属于同 id 的开始行
+_MCP_CALL_PARAMS_MAX = 200  # 在途调用参数缓存上限，防止异常中断的调用无限堆积
+_MCP_CALL_PARAMS = globals().setdefault('_MCP_CALL_PARAMS', {})  # call_id -> 原始参数；跨 reload 保活，旧 wrapper 的完成行仍能取到
+
+
+def _mcp_short_arg(value) -> str:
+    text = repr(value)
+    if len(text) > _MCP_LOG_ARG_MAX:
+        return "%s…（共 %d 字符）" % (text[:_MCP_LOG_ARG_MAX], len(text))
+    return text
+
+
+def _mcp_done_arg(value) -> str:
+    """完成行的参数值：只留前 60 字符，保证整行紧凑。"""
+    text = repr(value)
+    if len(text) <= _MCP_DONE_ARG_MAX:
+        return text
+    clipped = text[:_MCP_DONE_ARG_MAX]
+    quote = text[0] if text[:1] in ("'", '"') else ""
+    if quote and text.endswith(quote) and not clipped.endswith(quote):
+        clipped = clipped[:-1] + "…" + quote  # 补回引号，避免截断值看起来没收尾
+    else:
+        clipped += "…"
+    return clipped
+
+
+def _mcp_log_begin(name, params) -> str:
+    """工具调用一开始就落一条完整参数的日志，返回本次调用 id。
+
+    id 由 os.urandom(3).hex() 生成，6 位十六进制，只用于把完成行和开始行
+    关联起来；两行各自都带工具名与参数，可独立阅读：
+        [MCP] 926fff 开始 fs_grep pattern='sherpa' path='/root/...' head_limit=30
+           [MCP] 926fff 完成 fs_grep pattern='sherpa' path='/root/...' ok 0.21s
+    记录的是客户端传进来的原始参数，不等远端返回；远端卡死/超时也能从
+    日志台看出这次调用要做什么。
+    """
+    call_id = os.urandom(3).hex()
+    try:
+        _MCP_CALL_PARAMS[call_id] = dict(params or {})
+        if len(_MCP_CALL_PARAMS) > _MCP_CALL_PARAMS_MAX:
+            # dict 保序：批量丢弃最早登记的在途调用，避免缓存无限增长
+            for stale in list(_MCP_CALL_PARAMS)[:_MCP_CALL_PARAMS_MAX // 2]:
+                _MCP_CALL_PARAMS.pop(stale, None)
+        parts = " ".join("%s=%s" % (key, _mcp_short_arg(value))
+                         for key, value in (params or {}).items())
+        _emit_local("[MCP] %s 开始 %s%s\n"
+                    % (call_id, name, (" " + parts) if parts else ""))
+    except Exception:
+        pass
+    return call_id
+
+
+def _mcp_log_end(call_id, name, elapsed, result=None, exc=None) -> None:
+    """与开始行同 id 的完成行：整行缩进，带参数短摘要、状态与耗时。"""
+    params = _MCP_CALL_PARAMS.pop(call_id, None)
+    try:
+        if exc is not None:
+            status = "FAIL %s: %s" % (type(exc).__name__, str(exc)[:200])
+        elif isinstance(result, dict) and result.get("ok") is False:
+            status = "FAIL %s" % str(result.get("error", ""))[:200]
+        else:
+            status = "ok"
+        args = " ".join("%s=%s" % (key, _mcp_done_arg(value))
+                        for key, value in (params or {}).items())
+        _emit_local("%s[MCP] %s 完成 %s%s %s %.2fs\n"
+                    % (_MCP_DONE_INDENT, call_id, name,
+                       (" " + args) if args else "", status, elapsed))
+    except Exception:
+        pass
+
+
+def _mcp_tool(fn):
+    """给工具函数包一层「收到即记 + 同 id 收尾」的结构化日志。
+
+    functools.wraps 保留 __wrapped__/__annotations__，FastMCP 仍能按原签名
+    生成 schema；日志发生在调用线程、进入 ai_bridge 之前，所以不受远端耗时影响。
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        sig = None
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        params = {}
+        if sig is not None:
+            try:
+                params = dict(sig.bind_partial(*args, **kwargs).arguments)
+            except Exception:
+                params = dict(kwargs)
+        call_id = _mcp_log_begin(fn.__name__, params)
+        started = time.monotonic()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            _mcp_log_end(call_id, fn.__name__, time.monotonic() - started, exc=exc)
+            raise
+        _mcp_log_end(call_id, fn.__name__, time.monotonic() - started, result=result)
+        return result
+
+    return wrapper
+
+
+def _mcp_quiet_sdk_logs() -> None:
+    """压掉无状态 streamable-http 的 INFO 噪音。
+
+    stateless 模式每请求新建一个临时 session，SDK 在拆 session 时打
+    "Terminating session: None"，既没有 id 也没法跟工具调用对应，只会把
+    真正的日志冲散。只降这一条 logger 的级别，WARNING 以上照常输出。
+    """
+    logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
+
 
 _MCP_SERVER = globals().setdefault('_MCP_SERVER', None)  # 启动/挂载成功后保存 MCP server 实例（诊断/测试用）；setdefault 防 reload 重绑丢引用
 _MCP_ASGI_APP = globals().setdefault('_MCP_ASGI_APP', None)  # 挂 1188 口模式下的 ASGI 应用。最要命的一个：已打进 RPCRequestHandler 的前置分发 wrapper 运行期按模块全局名查本变量，reload 把名字重绑回 None 后 /mcp 请求静默回落成普通 RPC 执行——setdefault 让旧钩子跨 reload 继续拿到活应用
@@ -37,7 +156,11 @@ _MCP_INSTRUCTIONS = (
     "远端服务器的常驻交互 PTY。pty_run 跑非交互命令并回收 rc/输出；"
     "交互提示（密码/y/n）用 pty_send 喂键；pty_status 看会话与 broker "
     "状态；pty_log 看本地诊断日志；画面冻结时 pty_redraw 自愈。"
-    "同一 shell 串行执行，重叠调用返回 busy。")
+    "同一 shell 串行执行，重叠调用返回 busy。"
+    "文件工具经 MQTT RPC 在远端 server 进程里执行，路径语义是远端机器的"
+    "路径（不是 pty 客户端本机），默认允许任意路径：fs_read/fs_ls/"
+    "fs_glob/fs_grep 只读；fs_write/fs_edit/fs_mkdir/fs_move/fs_delete 可写，"
+    "仅 --fs-read-only 时整体禁用写操作。")
 
 
 def _mcp_pick_transport(server, prefer: str) -> str:
@@ -82,21 +205,43 @@ def _new_mcp_server(host=None, port=None):
 
 
 def _mcp_register_tools(server) -> None:
-    """注册五个 MCP 工具（直通进程内 ai_bridge，与 HTTP RPC 口同源同锁）。"""
+    """注册 MCP 工具：6 个 PTY 工具（直通 ai_bridge）+ 9 个文件工具（远端执行）。"""
+    _mcp_quiet_sdk_logs()
 
     @server.tool()
-    def pty_run(cmd: str, timeout: float = 60.0, acquire_timeout: float = 2.0) -> dict:
+    @_mcp_tool
+    def pty_run(cmd: str, timeout: float = 60.0, acquire_timeout: float = 2.0,
+                pane: str = "") -> dict:
         """在常驻远程 shell 里跑一条命令，等结束标记并回收输出与退出码。
 
-        返回 {"ok", "rc", "out", "timed_out", ...}；命令串行执行，上一条
-        未结束时立刻返回 {"ok": False, "busy": True}（可加大 acquire_timeout
-        或稍后重试）。超时只停止回收，远端命令继续跑，可用 pty_send 干预
-        或再 pty_run 收尾。
+        返回 {"ok", "rc", "out", "timed_out", "pane", "channel", ...}；
+        命令串行执行，上一条未结束时立刻返回 {"ok": False, "busy": True}
+        （可加大 acquire_timeout 或稍后重试）。超时只停止回收，远端命令继续
+        跑，可用 pty_send 干预或再 pty_run 收尾。
+
+        投递窗口：默认用会话启动时固化的 tmux 窗口（session 内 window_index
+        最小的窗口，可用 pty_pane 或 --ai-pane 改）；pane 传 "%2"/"0:2"/窗口名
+        可临时改本次目标。tmux 不可用时自动回落为直写本 PTY。
         """
         return ai_bridge.run(str(cmd), timeout=float(timeout),
-                             acquire_timeout=float(acquire_timeout))
+                             acquire_timeout=float(acquire_timeout),
+                             pane=(str(pane) if pane else None))
 
     @server.tool()
+    @_mcp_tool
+    def pty_pane(pane: str = "") -> dict:
+        """查询或设置 AI 命令的默认 tmux 窗口。
+
+        pane 留空 = 只查询当前值；"auto" = 清空固化值并按「index 最小的窗口」
+        重新解析；其他值 = 固化为该 target（%2 最稳，也接受 0:2 / 窗口名）。
+        返回 {"ok", "pane", "pane_source", "tmux_ok", "encoding"}。
+        """
+        if not str(pane or "").strip():
+            return ai_bridge.get_pane()
+        return ai_bridge.set_pane(pane)
+
+    @server.tool()
+    @_mcp_tool
     def pty_send(data: str) -> dict:
         """向常驻 PTY 原样喂键，不回收输出：回答密码/y/n、发 Ctrl-C 等。
 
@@ -105,17 +250,20 @@ def _mcp_register_tools(server) -> None:
         return ai_bridge.send(data)
 
     @server.tool()
+    @_mcp_tool
     def pty_status() -> dict:
         """查询常驻会话状态：是否 attached/已结束、是否忙、broker 在线数、
         终端写线程卡滞秒数（>2 建议 pty_redraw）等。"""
         return ai_bridge.status()
 
     @server.tool()
+    @_mcp_tool
     def pty_log(n: int = 100) -> str:
         """读最近 n 行本地诊断日志（broker 连接/RPC 请求/告警），n 夹在 1~500。"""
         return get_log(max(1, min(int(n), 500)))
 
     @server.tool()
+    @_mcp_tool
     def pty_redraw() -> dict:
         """终端写线程卡滞自愈：必要时切换本地写线程，并通知远端整屏重绘。"""
         steps = []
@@ -131,6 +279,9 @@ def _mcp_register_tools(server) -> None:
             return {"ok": False, "steps": steps}
         steps.append({"redraw": True})
         return {"ok": True, "steps": steps}
+
+    # 文件工具（098_mcp_files）：经 transport.request 在远端执行，不经过 PTY shell
+    _mcp_register_fs_tools(server)
 
 
 def _mcp_loop_main(loop):
@@ -325,7 +476,8 @@ def mount_mcp_on_rpc(prefer: str = "", host: str = "0.0.0.0") -> dict:
     _MCP_HTTP_PATHS = frozenset(paths)
     _MCP_ASGI_APP = app
     _emit_local("[pty][MCP] MCP 工具服务已挂到 RPC 口：路径 %s（与 RPC/日志台同口复用）"
-                "  工具：pty_run/pty_send/pty_status/pty_log/pty_redraw\n"
+                "  工具：pty_run/pty_send/pty_status/pty_log/pty_redraw + "
+                "fs_read/fs_write/fs_edit/fs_glob/fs_grep/fs_ls/fs_mkdir/fs_move/fs_delete\n"
                 % "、".join(sorted(paths)))
     return {"ok": True, "paths": sorted(paths)}
 
@@ -398,7 +550,7 @@ def start_mcp_server(port, host="0.0.0.0", prefer: str = "") -> dict:
     threading.Thread(target=_serve, name="pty-mcp", daemon=True).start()
     path = "/mcp" if transport == "streamable-http" else "/sse"
     _emit_local("[pty][MCP] MCP 工具服务已开启（%s 独立端口）：http://%s:%d%s  "
-                "工具：pty_run/pty_send/pty_status/pty_log/pty_redraw\n"
+                "工具：pty_run/pty_send/pty_status/pty_log/pty_redraw + 9 个 fs_* 文件工具\n"
                 % (transport, host, port, path))
     return {"ok": True, "transport": transport, "port": port, "path": path}
 

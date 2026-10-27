@@ -49,9 +49,26 @@ pip install "mcp[cli]" 后，常驻 PTY 自动以标准 MCP 工具形式持续�
 
 工具集：pty_run 跑命令回收 rc/输出、pty_send 喂交互键、pty_status 会话
 与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏重绘；
-与 HTTP RPC 口同源同锁。--no-mcp 关闭；--mcp-port>0 改为另起独立端口
-（--port 0 关闭 RPC 口时仍要 MCP 的场景）。未装 mcp 包只记日志，PTY
-照常工作。
+另有 9 个远端文件工具：fs_read/fs_ls/fs_glob/fs_grep 只读，
+fs_write/fs_edit/fs_mkdir/fs_move/fs_delete 默认允许写任意路径
+（pty_run 本就能执行任意代码，写入根限制没有实际意义；--fs-read-only 可
+整体禁写）。文件工具走 ai_bridge.transport.request 把 Python 源码发到
+远端 server_mqtt.py 进程里 exec，作用于**远端机器**的文件系统（路径语义
+是远端的，如 /root/...），既不经过交互 shell、也不占 busy 锁，与
+client_mqtt.rpc 同一条通道。pty_* 与 HTTP RPC 口同源同锁。
+--no-mcp 关闭；--mcp-port>0 改为另起独立端口（--port 0 关闭 RPC 口时仍
+要 MCP 的场景）。未装 mcp 包只记日志，PTY 照常工作。
+
+每次 MCP 工具调用都会分配一个 6 位调用 id（os.urandom(3).hex()），开始行
+带完整参数，完成行整行缩进、带参数短摘要 + 状态 + 耗时，两行各自可独立
+阅读，并发交错也不影响归属：
+    [MCP] 3f9a2b 开始 fs_read file_path='/tmp/a.txt' offset=0 limit=2000
+       [MCP] 3f9a2b 完成 fs_read file_path='/tmp/a.txt' offset=0 limit=2000 ok 0.36s
+业务失败是 FAIL + 原因，异常是 FAIL + 异常类型；参数按 repr 转义成单行、
+开始行单值超 400 字符截断、完成行单值只留前 60 字符。不用等远端返回，
+远端卡死/超时时也能从日志台看出是哪个调用没收尾。/mcp 的 2xx HTTP 访问行
+（每次调用伴随多条 POST、既无工具名也无参数）已被过滤，只保留 4xx/5xx；
+无状态 SDK 的 "Terminating session: None" INFO 已压到 WARNING，避免冲散日志。
 
 本地诊断日志与 PTY 画面彻底分离
 ====================================
@@ -105,6 +122,7 @@ import logging
 import os
 import queue
 import re
+import shlex
 import shutil
 import socket
 import sys
@@ -131,7 +149,7 @@ from .cmd_client_mqtt import (              # noqa: E402
     MqttTransport, add_connection_args,
 )
 from .remote_cmd import (                   # noqa: E402
-    RemotePty, RemoteError, DEFAULT_PTY_TTL,
+    RemotePty, RemoteShell, RemoteError, DEFAULT_PTY_TTL,
 )
 
 from multi_mqtt import stime, BROKER_LIST

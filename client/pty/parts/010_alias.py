@@ -25,6 +25,12 @@ alias_rpc_host     = ('host', 'rpc_host')
 alias_mcp_port     = ('mcp_port', 'mcp')
 alias_mcp_transport= ('mcp_transport', 'mcptrans')
 alias_no_mcp       = ('no_mcp', 'nomcp')
+# MCP 文件工具的全局只读开关（默认关闭，写家族作用于任意路径）
+alias_fs_read_only = ('fs_read_only', 'fsro')
+# AI 目标窗口：默认「session 内 window_index 最小的窗口」，可 CLI/RPC 指定
+alias_ai_pane     = ('ai_pane', 'aipane', 'aip')
+# AI 命令编码：raw=窗口里直接看到命令原文（默认）；base64=旧严格编码兜底
+alias_ai_encoding = ('ai_encoding', 'aienc')
 alias_command      = ('command', 'cmd')
 # 本地命令栏查看诊断日志（只读，不碰会话参数）
 alias_log          = ('log', 'logs')

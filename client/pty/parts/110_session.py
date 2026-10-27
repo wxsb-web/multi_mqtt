@@ -4,6 +4,12 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
     # 挂到 AI 桥：外部经本地 HTTP RPC 调用 ai_bridge 即复用本 PTY，
     # attach 放在 open 之前，保证最早的握手回显也能被 feed 分流到。
     ai_bridge.attach(pty, transport)
+    # 注入 AI 投递配置：--ai-pane 为空时保持 auto——这里**不能**立刻解析默认
+    # 窗口，因为 attach 发生在 pty.open 之前，远端 tmux 还没被前置命令
+    # （如 "tmux at"）启动；首次 run() 时才解析并按需固化。
+    # --ai-encoding 默认 raw：命令原文直接在窗口里可见。
+    ai_bridge.configure(getattr(args, "ai_pane", ""),
+                        getattr(args, "ai_encoding", "raw"))
     outq: "queue.Queue[bytes]" = queue.Queue()
     stop_ev = threading.Event()
     term = args.term or os.environ.get("TERM") or "xterm-256color"

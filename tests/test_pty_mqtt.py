@@ -484,8 +484,9 @@ class PtyCliPreCommandTests(unittest.TestCase):
 
 
 class AIBridgeRunEncodingTests(unittest.TestCase):
-    """run() 必须把命令用 base64 严格编码进「双引号 sh -c」行，
-    任何特殊字符（单双引号/$/反引号/裸换行/中文）都不能让外层 shell 破裂。"""
+    """run() 的 base64 编码分支必须把命令严格编码进「双引号 sh -c」行，
+    任何特殊字符（单双引号/$/反引号/裸换行/中文）都不能让外层 shell 破裂；
+    raw 分支（默认）把命令原文交给 shlex.quote 包一层单引号。"""
 
     def _extract_b64(self, line):
         m = re.search(r"printf '%s' ([A-Za-z0-9+/=]*) \|", line)
@@ -493,10 +494,12 @@ class AIBridgeRunEncodingTests(unittest.TestCase):
         return m.group(1)
 
     def test_line_shape_double_quoted_sh_c(self):
-        line = pcm._build_ai_run_line("echo hi", "B", "E")
+        line = pcm._build_ai_run_line_b64("echo hi", "B", "E")
         self.assertTrue(line.startswith("echo B; sh -c \"$(printf '%s' "))
-        self.assertIn(")\"; __ai_rc=$?; echo E:$__ai_rc\r", line)
-        self.assertTrue(line.endswith("\r"))
+        self.assertIn(")\"; __ai_rc=$?; echo E:$__ai_rc", line)
+        # 回车不再拼在行尾：raw/base64 两种行都由投递方（PTY 写 / send-keys
+        # Enter）单独发送，避免行内出现 TTY 控制字符。
+        self.assertNotIn("\r", line)
         # 解码器三级回退（固定字面量，不含用户字节）
         self.assertIn("base64 -d 2>/dev/null", line)
         self.assertIn("openssl enc -d -base64 -A 2>/dev/null", line)
@@ -516,23 +519,32 @@ class AIBridgeRunEncodingTests(unittest.TestCase):
             "nested quotes: '\"'\"'\"'\"' deep",
         ]
         for cmd in cases:
-            line = pcm._build_ai_run_line(cmd, "BB", "EE")
+            line = pcm._build_ai_run_line_b64(cmd, "BB", "EE")
             token = self._extract_b64(line)
             self.assertEqual(base64.b64decode(token).decode("utf-8"), cmd,
                              "命令往返不一致: %r" % cmd)
 
     def test_line_is_tty_safe_printable_ascii(self):
-        # 除结尾回车外，整行必须是纯可打印 ASCII：不能再有裸换行/控制字节，
-        # 否则敲进 ICANON PTY 会被当成回车/Ctrl-C 提前提交。
+        # 整行必须是纯可打印 ASCII：不能有裸换行/控制字节，否则敲进 ICANON
+        # PTY 会被当成回车/Ctrl-C 提前提交。
         cmd = "printf 'a\\nb\\n'\necho \"$x\""
-        line = pcm._build_ai_run_line(cmd, "B", "E")
-        raw = line.encode("utf-8")
-        self.assertTrue(raw.endswith(b"\r"))
-        body = raw[:-1]
-        body.decode("ascii")  # 非 ASCII 字符（如中文）也必须不出现
-        self.assertNotIn(b"\n", body)
-        self.assertTrue(all(0x20 <= b < 0x7F for b in body),
+        line = pcm._build_ai_run_line_b64(cmd, "B", "E")
+        line.encode("utf-8").decode("ascii")  # 非 ASCII 字符（如中文）也必须不出现
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\r", line)
+        self.assertTrue(all(0x20 <= ord(ch) < 0x7F for ch in line),
                         "行内出现 TTY 控制字符")
+
+    def test_raw_line_quotes_cmd_and_leaves_cr_to_sender(self):
+        # raw 模式：人能在窗口里看到命令原文，特殊字符由 shlex.quote 单引号兜住。
+        cmd = "echo it's; echo $HOME; echo '中文'"
+        line = pcm._build_ai_run_line_raw(cmd, "B", "E")
+        self.assertEqual(
+            line,
+            "echo B; sh -c %s; __ai_rc=$?; echo E:$__ai_rc"
+            % __import__("shlex").quote(cmd))
+        self.assertNotIn("\r", line)
+        self.assertIn("'\"'\"'", line)  # 内层单引号已被正确转义
 
     def test_decoder_python_literal_has_no_quote_chars(self):
         s = pcm._AI_B64_DECODER_PY
@@ -565,11 +577,64 @@ class AIBridgeRunEncodingTests(unittest.TestCase):
                 % (begin, end_tag)).encode())
         t.join(3)
         self.assertFalse(t.is_alive())
-        self.assertTrue(sent[0].startswith(b"echo __AI_BEGIN_"))
-        self.assertIn(b'sh -c "$(printf \'%s\' ', sent[0])
+        # transport=None → tmux 探测失败 → 回落原生 PTY（raw 模式）
+        self.assertEqual(result["channel"], "pty")
+        expected = pcm._build_ai_run_line_raw("printf 'x\\n'", begin, end_tag)
+        self.assertEqual(sent[0].decode(), expected + "\r")
         self.assertEqual(result["rc"], 0)
         self.assertTrue(result["ok"])
         self.assertEqual(result["out"], "STDOUT")
+
+
+
+class AIBridgePaneSelectTests(unittest.TestCase):
+    """_resolve_pane 必须取 session 内 window_index 最小窗口的 active pane，
+    且固化 pane_id（%N）而不是会漂移的 0:0 索引。"""
+
+    def _bridge(self, panes):
+        b = pcm.AIBridge()
+
+        class R:
+            rc = 0
+            stdout = b""
+
+        def fake_tmux(args):
+            r = R()
+            if args[0] == "list-sessions":
+                r.stdout = b"main|2|1700000009\nother|0|1600000000\n"
+            else:
+                r.stdout = panes
+            return r
+
+        b._tmux = fake_tmux
+        return b
+
+    def test_picks_min_window_index_active_pane(self):
+        # 窗口 1 的 active pane 是 %3；窗口 3 更靠后不应被选中
+        b = self._bridge(b"3|0|%5|1\n1|0|%2|0\n1|1|%3|1\n3|1|%6|0\n")
+        self.assertEqual(b._resolve_pane(), "%3")
+        self.assertEqual(b._pane_source, "auto")
+        self.assertTrue(b._tmux_ok)
+        # 固化后再次取用不再解析
+        b._tmux = lambda args: (_ for _ in ()).throw(AssertionError("不应重解析"))
+        self.assertEqual(b._pick_pane(None), "%3")
+
+    def test_no_tmux_returns_none(self):
+        b = pcm.AIBridge()
+        b._tmux = lambda args: None
+        self.assertIsNone(b._resolve_pane())
+        self.assertFalse(b._tmux_ok)
+
+    def test_tmux_output_without_rows_returns_none(self):
+        b = self._bridge(b"")
+        self.assertIsNone(b._resolve_pane())
+        self.assertFalse(b._tmux_ok)
+
+    def test_pick_encoding_degrades_on_control_bytes(self):
+        b = pcm.AIBridge()
+        self.assertEqual(b._pick_encoding("echo hi", None), "raw")
+        self.assertEqual(b._pick_encoding("echo a\nb", None), "base64")
+        self.assertEqual(b._pick_encoding("echo hi", "base64"), "base64")
 
 
 class BinaryStdoutGuardTests(unittest.TestCase):

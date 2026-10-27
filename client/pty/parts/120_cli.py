@@ -64,6 +64,20 @@ def build_parser() -> argparse.ArgumentParser:
                    default="",
                    help="MCP 传输类型：留空自动（优先 streamable-http，旧版 mcp 包 "
                         "退回 sse），可显式 streamable-http / sse")
+    p.add_argument(*_cm._cli_opts(*alias_fs_read_only), dest="fs_read_only",
+                   action="store_true",
+                   help="MCP 文件工具全只读：禁用 fs_write/fs_edit/fs_mkdir/"
+                        "fs_move/fs_delete（默认关闭，允许写任意路径）")
+    p.add_argument(*_cm._cli_opts(*alias_ai_pane), dest="ai_pane",
+                   default="",
+                   help="AI 命令默认投递到哪个 tmux 窗口：留空 = 自动按「session "
+                        "内 window_index 最小的窗口」解析并固化；也可传 pane_id "
+                        "（百分号前缀，如 2）或 0:2 / 窗口名（RPC 的 pty_pane 可运行时改）")
+    p.add_argument(*_cm._cli_opts(*alias_ai_encoding), dest="ai_encoding",
+                   default="raw",
+                   help="AI 命令编码：raw = 窗口里直接看到命令原文（默认）；"
+                        "base64 = 严格编码，任意特殊字符不破裂（含裸换行/控制"
+                        "字节时自动切到它）")
     # SSH 式可选位置参数：连接成功后自动敲进常驻 shell 的前置命令，如
     # ``pty_client_mqtt.py -t q -k *** "tmux at"``；REMAINDER 保证命令自身
     # 的 -x 选项（tmux attach -d）不会被本客户端解析。命令结束后会话继续，
@@ -139,6 +153,10 @@ def main(argv=None) -> int:
         lan = _lan_ip()
         _info(f"本地 AI 控制口已开启：http://{lan}:{args.port}/"
               f"根路径自动跳转 /log_html(p)")
+
+    # MCP 文件工具权限：默认读写任意路径，--fs-read-only 才全禁写。
+    # 必须在挂载 MCP 前配置好。
+    _fs_configure(getattr(args, "fs_read_only", False))
 
     # MCP 工具服务：默认复用 --port 的 HTTP 口（路径 /mcp，与 RPC/日志台
     # 同口并存，不新开端口）；--mcp-port>0 才另起独立端口（--port 0 时仍要
