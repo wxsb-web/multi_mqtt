@@ -47,9 +47,10 @@ pip install "mcp[cli]" 后，常驻 PTY 自动以标准 MCP 工具形式持续�
 
     claude mcp add --transport http pty http://192.168.1.3:1188/mcp
 
-工具集：pty_run 跑命令回收 rc/输出、pty_send 喂交互键、pty_status 会话
-与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏重绘；
-另有 9 个远端文件工具：fs_read/fs_ls/fs_glob/fs_grep 只读，
+工具集：pty_run 跑命令回收 rc/输出、pty_tail 查长命令实时进度、
+pty_send 喂交互键、pty_pane 查询/设置 AI 命令的 tmux 窗口、pty_status
+会话与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏
+重绘；另有 9 个远端文件工具：fs_read/fs_ls/fs_glob/fs_grep 只读，
 fs_write/fs_edit/fs_mkdir/fs_move/fs_delete 默认允许写任意路径
 （pty_run 本就能执行任意代码，写入根限制没有实际意义；--fs-read-only 可
 整体禁写）。文件工具走 ai_bridge.transport.request 把 Python 源码发到
@@ -58,6 +59,14 @@ fs_write/fs_edit/fs_mkdir/fs_move/fs_delete 默认允许写任意路径
 client_mqtt.rpc 同一条通道。pty_* 与 HTTP RPC 口同源同锁。
 --no-mcp 关闭；--mcp-port>0 改为另起独立端口（--port 0 关闭 RPC 口时仍
 要 MCP 的场景）。未装 mcp 包只记日志，PTY 照常工作。
+
+AI 命令的三条投递通道（run() 自动选择，逐级回落）
+==================================================
+① tmux 推送（默认）：客户端一次 RPC 让远端装 pipe-pane + send-keys，
+远端起后台线程本地增量读输出并逐帧 publish，客户端只订阅收流——没有
+"每读一次一往返"，长命令输出可以边产生边到达（pty_tail 即看这份实时
+缓冲）。② tmux 轮询：远端不认识推送 op（旧版本）时退回客户端按 offset
+增量读。③ 原生 PTY：tmux 不可用时直写本 PTY，行为与改造前一致。
 
 每次 MCP 工具调用都会分配一个 6 位调用 id（os.urandom(3).hex()），开始行
 带完整参数，完成行整行缩进、带参数短摘要 + 状态 + 耗时，两行各自可独立
@@ -150,6 +159,7 @@ from .cmd_client_mqtt import (              # noqa: E402
 )
 from .remote_cmd import (                   # noqa: E402
     RemotePty, RemoteShell, RemoteError, DEFAULT_PTY_TTL,
+    RemoteOpError, _PtyReorderBuffer,
 )
 
 from multi_mqtt import stime, BROKER_LIST

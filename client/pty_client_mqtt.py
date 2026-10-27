@@ -47,9 +47,10 @@ pip install "mcp[cli]" 后，常驻 PTY 自动以标准 MCP 工具形式持续�
 
     claude mcp add --transport http pty http://192.168.1.3:1188/mcp
 
-工具集：pty_run 跑命令回收 rc/输出、pty_send 喂交互键、pty_status 会话
-与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏重绘；
-另有 9 个远端文件工具：fs_read/fs_ls/fs_glob/fs_grep 只读，
+工具集：pty_run 跑命令回收 rc/输出、pty_tail 查长命令实时进度、
+pty_send 喂交互键、pty_pane 查询/设置 AI 命令的 tmux 窗口、pty_status
+会话与 broker 状态、pty_log 本地诊断日志、pty_redraw 写卡滞自愈+整屏
+重绘；另有 9 个远端文件工具：fs_read/fs_ls/fs_glob/fs_grep 只读，
 fs_write/fs_edit/fs_mkdir/fs_move/fs_delete 默认允许写任意路径
 （pty_run 本就能执行任意代码，写入根限制没有实际意义；--fs-read-only 可
 整体禁写）。文件工具走 ai_bridge.transport.request 把 Python 源码发到
@@ -58,6 +59,14 @@ fs_write/fs_edit/fs_mkdir/fs_move/fs_delete 默认允许写任意路径
 client_mqtt.rpc 同一条通道。pty_* 与 HTTP RPC 口同源同锁。
 --no-mcp 关闭；--mcp-port>0 改为另起独立端口（--port 0 关闭 RPC 口时仍
 要 MCP 的场景）。未装 mcp 包只记日志，PTY 照常工作。
+
+AI 命令的三条投递通道（run() 自动选择，逐级回落）
+==================================================
+① tmux 推送（默认）：客户端一次 RPC 让远端装 pipe-pane + send-keys，
+远端起后台线程本地增量读输出并逐帧 publish，客户端只订阅收流——没有
+"每读一次一往返"，长命令输出可以边产生边到达（pty_tail 即看这份实时
+缓冲）。② tmux 轮询：远端不认识推送 op（旧版本）时退回客户端按 offset
+增量读。③ 原生 PTY：tmux 不可用时直写本 PTY，行为与改造前一致。
 
 每次 MCP 工具调用都会分配一个 6 位调用 id（os.urandom(3).hex()），开始行
 带完整参数，完成行整行缩进、带参数短摘要 + 状态 + 耗时，两行各自可独立
@@ -150,6 +159,7 @@ from .cmd_client_mqtt import (              # noqa: E402
 )
 from .remote_cmd import (                   # noqa: E402
     RemotePty, RemoteShell, RemoteError, DEFAULT_PTY_TTL,
+    RemoteOpError, _PtyReorderBuffer,
 )
 
 from multi_mqtt import stime, BROKER_LIST
@@ -1756,7 +1766,7 @@ def _strip_ansi(b: bytes) -> str:
 
 # ---- tmux 管道收流的运行参数 ----
 # 远端 pipe 文件目录：tmux 的 pipe-pane 是远端 shell 执行的，路径必须是远端路径；
-# 每次 run 用随机 tag 独立命名，run 结束即删（避免长会话把 /tmp 写满）。
+# 每次 run 用启动时间 tag 独立命名，run 结束即删（避免长会话把 /tmp 写满）。
 _AI_PIPE_DIR = "/tmp"
 # 单次增量读取上限（128 KiB，等于 RemoteShell 的 WIRE_BUDGET）：防止一条超大
 # 输出把一次 MQTT 往返撑爆，轮询循环里会继续补齐剩余部分。取 128 KiB 而不是
@@ -1772,6 +1782,14 @@ _AI_POLL = 0.12
 # 返回并标记 interrupted=True。判据限定"行首"，避免匹配命令输出正文里的 ^C。
 _AI_INTERRUPT_RE = re.compile(rb"(?:^|\r?\n)\^C\r?\n")
 _AI_INTERRUPT_GRACE = 1.0
+
+# ---- 服务端主动推送（流式响应）参数 ----
+# 每个会话一条独立 topic（随机后缀），避免与 RemoteShell.stream 的周期汇报
+# 或另一台客户端的命令流相互串帧；订阅在会话期内只做一次（见 _push_ready），
+# 之后每 run 只是远端起一个推送 worker，客户端零额外订阅往返。
+_AI_STREAM_TOPIC_PREFIX = "sys/device/ai"
+# 实时预览缓冲上限：tail() 只回最后这么多原始字节，够看长命令进度又不吃内存。
+_AI_LIVE_MAX = 65536
 
 
 def _tmux_rows(data: bytes, n: int):
@@ -1892,7 +1910,7 @@ class AIBridge:
         ai_bridge.send("y\\n")      # 给交互提示喂键（密码/y/n）
         ai_bridge.status()          # 会话存活 / broker 在线数 / 是否忙
 
-    run() 把命令包在一对随机标记之间写入同一个常驻 shell，回收两个标记
+    run() 把命令包在一对带启动时间的标记之间写入同一个常驻 shell，回收两个标记
     之间的输出与退出码；输入回显和输出照样实时渲染在监控窗口。PTY 只有
     一个 shell，命令用锁串行化，重叠调用立刻拿到 busy 而不是互相串台。
     """
@@ -1916,6 +1934,16 @@ class AIBridge:
         self._shell = None          # 延迟创建的 RemoteShell（只在 tmux 路径才需要）
         # AI 命令编码：raw=命令原文直接可见（默认）；base64=旧严格编码兜底
         self._encoding = "raw"
+        # ---- 服务端主动推送（流式）状态 ----
+        self._push_topic = None     # 本会话订阅的命令流 topic（首次 push 时创建）
+        self._push_runs = {}        # sid -> 该次 run 的收帧回调（网络线程读）
+        # 正在执行 AI 命令的 pane：命令跨窗口运行时（人不在该窗口）按键不能
+        # 写本 PTY，必须用 tmux send-keys 才能落到同一条前台作业上。
+        self._active_pane = None
+        # 实时预览：当前/最近一次命令已产出的输出（tail() 用，不占 busy 锁）
+        self._live = {"cmd": None, "buf": bytearray(), "start": None,
+                      "channel": None}
+        self._live_lock = threading.Lock()
 
     # ---- 会话侧调用（run_session 内挂载） ----
 
@@ -1928,6 +1956,13 @@ class AIBridge:
         self._tmux_ok = None
         self._pane_id = None
         self._pane_source = ""
+        # 推送订阅属于 transport（新会话 = 新 transport），一并作废重订。
+        self._push_topic = None
+        self._push_runs = {}
+        self._active_pane = None
+        with self._live_lock:
+            self._live = {"cmd": None, "buf": bytearray(), "start": None,
+                          "channel": None}
 
     def configure(self, pane="", encoding="") -> None:
         """会话启动时注入 CLI 配置（--ai-pane / --ai-encoding）。
@@ -1972,6 +2007,9 @@ class AIBridge:
             "ai_pane_source": self._pane_source or "auto",
             "ai_encoding": self._encoding,
             "tmux_ok": self._tmux_ok,
+            # 最近一次命令实际走的通道：pty / tmux（轮询）/ tmux+push（推送）
+            "ai_channel": self._live["channel"],
+            "ai_stream_topic": self._push_topic,
             # 终端写线程卡滞秒数（窗口冻结的直接信号）；>2 建议 redraw
             "writer_stall": round(_OUT_WRITER.stall_seconds(), 2)
             if _OUT_WRITER is not None else 0.0,
@@ -1985,27 +2023,40 @@ class AIBridge:
                     "error": "pty 未连接或已结束: %s" % getattr(pty, "end_reason", None)}
         if isinstance(data, str):
             data = data.encode("utf-8")
+        # AI 命令正在**另一个 tmux 窗口**里执行时，Ctrl-C 只有送进那个 pane
+        # 才能打断前台作业；写本 PTY 只会把 ^C 打到人自己的 shell 上。
+        if b"\x03" in data and self._active_pane:
+            r = self._tmux(["send-keys", "-t", self._active_pane, "C-c"])
+            return {"ok": r is not None and r.rc == 0, "sent": len(data),
+                    "pane": self._active_pane, "interrupt": True}
         pty.send(bytes(data))
         return {"ok": True, "sent": len(data)}
 
     def run(self, cmd, timeout: float = 60.0, acquire_timeout: float = 2.0,
-            pane=None, encoding=None) -> dict:
+            pane=None, encoding=None, stream=None, on_output=None) -> dict:
         """在常驻 shell / 指定 tmux 窗口里跑一条命令，返回 rc 与输出。
 
-        两条投递通道，同一套随机 marker：
+        三条投递通道，同一套时间戳 marker：
 
-        1. **tmux 通道（tmux 可用时的默认）**：命令行经 ``send-keys`` 投递到
-           固化的目标 pane，输出由 ``pipe-pane`` 落盘后按 offset 增量读。
-           命令原文直接在窗口里可见、人切到该窗口能实时围观、能按键打断；
-           且 pipe-pane 拿的是 pane 应用层字节，不含 tmux 客户端整屏重绘的
-           回放，从根上消除了旧实现"输出里夹带历史与旧 marker"的污染。
-        2. **原生 PTY 通道（tmux 不可用时的回落）**：老逻辑，命令行直接写入
-           本 PTY 的 shell，输出从 feed 分流队列回收，行为与改造前一致。
+        1. **tmux 推送通道（默认，tmux 可用时）**：命令行经远端 ``tmux_stream``
+           一次下发，服务端把 pane 输出 pipe-pane 落盘后**本地增量读、逐帧
+           主动 publish**；客户端只订阅收流，不再"每读一次 = 一次完整 RPC"。
+           首字节延迟与总耗时都不随输出体积线性增长（大包 fetch 的节流跳变
+           被彻底绕开）。
+        2. **tmux 轮询通道（推送不可用时的回落）**：服务端不认识 ``tmux_stream``
+           （旧版本）或推送启动失败时，退回"客户端按 offset 轮询增量读"。
+        3. **原生 PTY 通道（tmux 不可用时的回落）**：命令行直接写入本 PTY 的
+           shell，输出从 feed 分流队列回收，行为与改造前一致。
 
         参数 ``pane``：目标窗口；``None``/空 = 用固化的默认窗口（连接后首次
         run 解析「index 最小的窗口」并固化），非空 = 本次临时指定，不改默认。
         参数 ``encoding``：``raw``（默认，命令原文可见）或 ``base64``（严格
         编码，任意特殊字符不破裂；含裸换行/控制字节时自动降级到它）。
+        参数 ``stream``：``auto``（默认，按上面的三级回落）或 ``off``（强制
+        走轮询通道，便于对比/排障）。
+        参数 ``on_output``：可选回调 ``fn(chunk: bytes)``，命令执行过程中**边
+        产生边回调**（推送通道下在网络线程里调用，回调要足够快）；配合
+        :meth:`tail` 可让外部进程实时看到长命令进度，而不用等整条返回。
 
         - 超时只停止回收，不杀远端命令（输出继续在窗口里刷，可用 send 干预）；
         - 退出码取自命令尾部 ``echo END:$?``（tmux 没有能取 pane 内子命令
@@ -2020,22 +2071,68 @@ class AIBridge:
             return {"ok": False, "busy": True,
                     "error": "busy：上一条 AI 命令尚未结束"}
 
-        tag = os.urandom(4).hex()
+        # 标记带**客户端本地时间**（精确到毫秒）而不是随机串：
+        # `__AI_BEGIN_20261028_141530_123__` 在窗口/日志/历史回看时能一眼看出
+        # 这条命令是什么时候开始跑的；毫秒级且命令串行执行，天然不重复。
+        _now = time.time()
+        tag = (time.strftime("%Y%m%d_%H%M%S", time.localtime(_now))
+               + "_%03d" % int((_now % 1) * 1000))
         begin = "__AI_BEGIN_%s__" % tag
         end = "__AI_END_%s__" % tag
+        with self._live_lock:
+            self._live = {"cmd": str(cmd), "buf": bytearray(),
+                          "start": time.monotonic(), "channel": None}
         try:
             target = self._pick_pane(pane)
+            self._active_pane = target
             enc = self._pick_encoding(cmd, encoding)
             if target is None:
-                return self._run_via_pty(str(cmd), float(timeout), begin, end, enc)
+                return self._run_via_pty(str(cmd), float(timeout), begin, end, enc,
+                                         on_output)
+            if str(stream if stream is not None else "auto").lower() != "off":
+                res = self._run_via_tmux_push(target, str(cmd), float(timeout),
+                                              begin, end, enc, tag, on_output)
+                if res is not None:
+                    return res
             return self._run_via_tmux(target, str(cmd), float(timeout),
-                                      begin, end, enc, tag)
+                                      begin, end, enc, tag, on_output)
         finally:
+            self._active_pane = None
             self._busy.release()
+
+    # ---- 实时预览：不占 busy 锁，命令执行期间随时可查 ----
+
+    def _live_add(self, chunk: bytes) -> None:
+        with self._live_lock:
+            buf = self._live["buf"]
+            buf += chunk
+            if len(buf) > _AI_LIVE_MAX:
+                del buf[:-_AI_LIVE_MAX]
+
+    def _live_channel(self, name: str) -> None:
+        with self._live_lock:
+            self._live["channel"] = name
+
+    def tail(self, max_bytes: int = 8000) -> dict:
+        """看**当前正在跑**（或刚跑完）命令的最新输出，不需要等它结束。
+
+        与 ``run`` 共用一份实时缓冲，但不占 busy 锁，所以长命令执行期间外部
+        可以并发轮询本方法观察进度（MCP 侧由 ``pty_tail`` 暴露）。
+        """
+        n = max(1, min(int(max_bytes or 8000), _AI_LIVE_MAX))
+        with self._live_lock:
+            buf = bytes(self._live["buf"])
+            elapsed = (round(time.monotonic() - self._live["start"], 2)
+                       if self._live["start"] else None)
+            info = {"cmd": self._live["cmd"],
+                    "channel": self._live["channel"],
+                    "elapsed": elapsed, "total": len(buf)}
+        info.update({"ok": True, "tail": _strip_ansi(buf[-n:])})
+        return info
 
     # ---- 投递通道：原生 PTY（tmux 不可用时的回落，等价改造前行为） ----
 
-    def _run_via_pty(self, cmd, timeout, begin, end, enc) -> dict:
+    def _run_via_pty(self, cmd, timeout, begin, end, enc, on_output=None) -> dict:
         pty = self.pty
         q = self._add_listener()
         line = self._build_line(cmd, begin, end, enc)
@@ -2043,6 +2140,7 @@ class AIBridge:
         timed_out = False
         m_end = None
         end_re = re.compile(re.escape(end.encode()) + rb":(\d+)")
+        self._live_channel("pty")
         try:
             pty.send((line + "\r").encode("utf-8"))
             deadline = time.monotonic() + timeout
@@ -2058,6 +2156,12 @@ class AIBridge:
                 except queue.Empty:
                     continue
                 buf += chunk
+                self._live_add(chunk)
+                if on_output is not None:
+                    try:
+                        on_output(chunk)
+                    except Exception:
+                        pass
                 m_end = end_re.search(buf)
                 if m_end:
                     break
@@ -2069,7 +2173,8 @@ class AIBridge:
 
     # ---- 投递通道：tmux（send-keys 投递 + pipe-pane 增量收流） ----
 
-    def _run_via_tmux(self, target, cmd, timeout, begin, end, enc, tag) -> dict:
+    def _run_via_tmux(self, target, cmd, timeout, begin, end, enc, tag,
+                      on_output=None) -> dict:
         path = "%s/.pty_ai_%s.log" % (_AI_PIPE_DIR, tag)
         end_re = re.compile(re.escape(end.encode()) + rb":(\d+)")
         buf = b""
@@ -2082,6 +2187,7 @@ class AIBridge:
         # 顺序必须是「先挂管道，再敲命令」：pipe-pane 只捕获挂载之后该 pane
         # 产生的输出，反过来的话 BEGIN 附近的最早几行会丢。
         started = self._pipe_start(target, path)
+        self._live_channel("tmux")
         try:
             if not started:
                 return {"ok": False, "pane": target, "channel": "tmux",
@@ -2103,6 +2209,12 @@ class AIBridge:
                 chunk, off = self._pipe_read(path, off)
                 if chunk:
                     buf += chunk
+                    self._live_add(chunk)
+                    if on_output is not None:
+                        try:
+                            on_output(chunk)
+                        except Exception:
+                            pass
                     m_end = end_re.search(buf)
                     if m_end:
                         break
@@ -2116,6 +2228,7 @@ class AIBridge:
             # 命中 END 时最后一段可能还在管道缓冲里，再补读一次。
             chunk, off = self._pipe_read(path, off)
             buf += chunk
+            self._live_add(chunk)
             m_end = m_end or end_re.search(buf)
         finally:
             if started:
@@ -2126,6 +2239,181 @@ class AIBridge:
                                   "encoding": enc,
                                   "interrupted": interrupted,
                                   "end_reason": self.pty.end_reason})
+
+    # ---- 投递通道：tmux 服务端主动推送（流式响应，客户端零往返收流） ----
+
+    # 推送启动回包异常时，等一小段确认远端是否其实已在推流（回包丢/超时）。
+    _PUSH_START_WAIT = 1.5
+
+    def _push_ready(self) -> bool:
+        """确保本会话已在命令流 topic 上挂好分发。返回是否具备推送能力。"""
+        if self._push_topic:
+            return True
+        tr = self.transport
+        if tr is None or not callable(getattr(tr, "stream_subscribe", None)) \
+                or not callable(getattr(tr, "stream_unsubscribe", None)):
+            return False
+        topic = "%s/%s" % (_AI_STREAM_TOPIC_PREFIX, os.urandom(4).hex())
+        try:
+            tr.stream_subscribe(topic, self._on_push_frame)
+        except Exception:
+            return False
+        self._push_topic = topic
+        return True
+
+    def _on_push_frame(self, data) -> None:
+        """网络线程入口：按 sid 把帧转给对应 run 的收帧回调。"""
+        if not isinstance(data, dict):
+            return
+        sid = data.get("stream")
+        if not sid:
+            return
+        cb = self._push_runs.get(sid)
+        if cb is None:
+            return
+        try:
+            cb(data)
+        except Exception:
+            pass
+
+    def _run_via_tmux_push(self, target, cmd, timeout, begin, end, enc, tag,
+                           on_output=None):
+        """服务端主动推送通道；返回 None 表示**未执行命令**、可安全回落轮询。
+
+        安全性：只有"远端不认识本 op（旧版本）"才回落——此时没有任何副作用。
+        一旦命令可能已被敲进 pane（op 成功，或回包丢失但帧已到），本方法要么
+        继续收流，要么把错误结果返回给调用方，**绝不复用轮询再投一次**，
+        避免同一条命令被执行两遍。
+        """
+        if not self._push_ready():
+            return None
+        sid = "ai-%s" % tag
+        path = "%s/.pty_ai_%s.log" % (_AI_PIPE_DIR, tag)
+        end_re = re.compile(re.escape(end.encode()) + rb":(\d+)")
+        st = {"buf": bytearray(), "end": None, "rc": None, "frames": 0}
+        lock = threading.Lock()
+        wake = threading.Event()
+        bufs = []
+
+        def _on_chunks(chunks):
+            with lock:
+                bufs.extend(chunks)
+            wake.set()
+
+        # 复用 PTY 通道同一套重排器：同一帧会经每个 broker 各到一份，且路径
+        # 抖动会让后发的帧先到；输出必须按 seq 连续拼装才不串字。
+        reorder = _PtyReorderBuffer(_on_chunks)
+
+        def _on_frame(data):
+            if data.get("end"):
+                st["end"] = str(data.get("reason") or "end")
+                st["rc"] = data.get("rc")
+                wake.set()
+                return
+            chunk = data.get("d")
+            if isinstance(chunk, str):
+                chunk = chunk.encode("latin-1")
+            elif not isinstance(chunk, (bytes, bytearray)):
+                return
+            if not chunk:
+                return
+            st["frames"] += 1
+            try:
+                reorder.add(int(data.get("seq", 0)), bytes(chunk))
+            except (TypeError, ValueError):
+                reorder.add(0, bytes(chunk))
+
+        sh = self._shell_obj()
+        if sh is None:
+            return None
+        self._push_runs[sid] = _on_frame
+        self._live_channel("tmux+push")
+        started = False
+        try:
+            sh.tmux_stream(
+                sid=sid, pane=target,
+                line=self._build_line(cmd, begin, end, enc),
+                path=path, end_marker=end, topic=self._push_topic,
+                ttl=min(max(10.0, timeout + 30.0), 7200.0))
+            started = True
+        except Exception as e:
+            # 回包可能只是丢了（远端其实已在推流）：等一小段确认是否真有帧。
+            wait_until = time.monotonic() + self._PUSH_START_WAIT
+            while (time.monotonic() < wait_until and st["end"] is None
+                   and st["frames"] == 0):
+                wake.wait(0.1)
+                wake.clear()
+            if st["frames"] == 0 and st["end"] is None:
+                self._push_runs.pop(sid, None)
+                reorder.close()
+                try:
+                    sh.tmux_stream_stop(sid, req_timeout=5.0)
+                except Exception:
+                    pass
+                if isinstance(e, RemoteOpError) and "unknown op" in str(e):
+                    return None      # 旧服务端：无副作用，安全回落轮询
+                return {"ok": False, "pane": target, "channel": "tmux+push",
+                        "error": "推送通道启动失败: %s" % (e,),
+                        "encoding": enc}
+            started = True           # 帧已到：worker 活着，走正常收流
+
+        timed_out = False
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                if self.pty.end_reason:
+                    break
+                with lock:
+                    fresh = b"".join(bufs)
+                    del bufs[:]
+                if fresh:
+                    st["buf"] += fresh
+                    self._live_add(fresh)
+                    if on_output is not None:
+                        try:
+                            on_output(fresh)
+                        except Exception:
+                            pass
+                    if end_re.search(st["buf"]):
+                        break
+                if st["end"] is not None:
+                    # 结束帧可能先于乱序数据帧到达：短暂收尾，避免吃掉尾巴。
+                    wake.wait(0.25)
+                    wake.clear()
+                    with lock:
+                        fresh = b"".join(bufs)
+                        del bufs[:]
+                    if fresh:
+                        st["buf"] += fresh
+                        self._live_add(fresh)
+                        if on_output is not None:
+                            try:
+                                on_output(fresh)
+                            except Exception:
+                                pass
+                    break
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    timed_out = True
+                    break
+                wake.wait(min(0.1, remain))
+                wake.clear()
+        finally:
+            reorder.close()
+            self._push_runs.pop(sid, None)
+            # 命中 END（本地标记或远端结束帧）时服务端 worker 已自行退出并
+            # 清理管道，再发一次 stop 只是白白多一轮 RPC（实测约 0.4s）。
+            if started and st["end"] is None \
+                    and not end_re.search(bytes(st["buf"])):
+                sh.tmux_stream_stop(sid, req_timeout=5.0)
+        m_end = end_re.search(bytes(st["buf"]))
+        return self._pack_result(
+            bytes(st["buf"]), m_end, begin, end, timed_out,
+            {"pane": target, "channel": "tmux+push", "encoding": enc,
+             "frames": st["frames"],
+             "interrupted": st["end"] == "interrupted",
+             "stream_end": st["end"],
+             "end_reason": self.pty.end_reason})
 
     # ---- 目标窗口解析 ----
 
@@ -2627,7 +2915,7 @@ def _new_mcp_server(host=None, port=None):
 
 
 def _mcp_register_tools(server) -> None:
-    """注册 MCP 工具：6 个 PTY 工具（直通 ai_bridge）+ 9 个文件工具（远端执行）。"""
+    """注册 MCP 工具：7 个 PTY 工具（直通 ai_bridge）+ 9 个文件工具（远端执行）。"""
     _mcp_quiet_sdk_logs()
 
     @server.tool()
@@ -2661,6 +2949,17 @@ def _mcp_register_tools(server) -> None:
         if not str(pane or "").strip():
             return ai_bridge.get_pane()
         return ai_bridge.set_pane(pane)
+
+    @server.tool()
+    @_mcp_tool
+    def pty_tail(max_bytes: int = 8000) -> dict:
+        """查看**正在跑**的长命令已产出的输出（不占 busy 锁，可与 pty_run 并发）。
+
+        pty_run 要等命令结束才返回；长任务期间用本工具反复调用即可看到最新
+        进度（服务端推送通道边产生边累积）。返回 {"ok", "tail", "cmd",
+        "channel", "elapsed", "total"}；channel 为 pty / tmux / tmux+push。
+        """
+        return ai_bridge.tail(max_bytes=int(max_bytes))
 
     @server.tool()
     @_mcp_tool

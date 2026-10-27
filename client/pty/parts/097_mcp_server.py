@@ -205,7 +205,7 @@ def _new_mcp_server(host=None, port=None):
 
 
 def _mcp_register_tools(server) -> None:
-    """注册 MCP 工具：6 个 PTY 工具（直通 ai_bridge）+ 9 个文件工具（远端执行）。"""
+    """注册 MCP 工具：7 个 PTY 工具（直通 ai_bridge）+ 9 个文件工具（远端执行）。"""
     _mcp_quiet_sdk_logs()
 
     @server.tool()
@@ -239,6 +239,17 @@ def _mcp_register_tools(server) -> None:
         if not str(pane or "").strip():
             return ai_bridge.get_pane()
         return ai_bridge.set_pane(pane)
+
+    @server.tool()
+    @_mcp_tool
+    def pty_tail(max_bytes: int = 8000) -> dict:
+        """查看**正在跑**的长命令已产出的输出（不占 busy 锁，可与 pty_run 并发）。
+
+        pty_run 要等命令结束才返回；长任务期间用本工具反复调用即可看到最新
+        进度（服务端推送通道边产生边累积）。返回 {"ok", "tail", "cmd",
+        "channel", "elapsed", "total"}；channel 为 pty / tmux / tmux+push。
+        """
+        return ai_bridge.tail(max_bytes=int(max_bytes))
 
     @server.tool()
     @_mcp_tool

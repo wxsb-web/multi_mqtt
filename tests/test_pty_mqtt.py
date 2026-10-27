@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """pty_client_mqtt / RemotePty / _PTY_START_TEMPLATE 的详细测试。
 
@@ -570,7 +570,7 @@ class AIBridgeRunEncodingTests(unittest.TestCase):
         while not bridge._listeners and time.time() < deadline:
             time.sleep(0.01)
         q = bridge._listeners[0]
-        begin = re.search(rb"__AI_BEGIN_[0-9a-f]+__", sent[0]).group(0).decode()
+        begin = re.search(rb"__AI_BEGIN_[\w]+__", sent[0]).group(0).decode()
         end_tag = begin.replace("BEGIN", "END")
         # 模拟远端交互 shell 回显 + 输出 + 结束标记
         q.put(("%s\r\nSTDOUT\r\n%s:0\r\nprompt# "
@@ -585,6 +585,211 @@ class AIBridgeRunEncodingTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["out"], "STDOUT")
 
+
+
+class AIBridgePushChannelTests(unittest.TestCase):
+    """服务端主动推送通道：按 seq 重排去重拼装、rc/打断来自结束帧，
+    只在「旧服务端不认识 op」时回落轮询（绝不重复投递命令）。"""
+
+    class FakePty:
+        end_reason = None
+
+    class FakeShell:
+        """替身 RemoteShell：把 tmux_stream 调用变成按脚本发推送帧。"""
+
+        def __init__(self, transport, script=None, error=None):
+            self.tr = transport
+            self.script = script
+            self.error = error
+            self.calls = []
+            self.stopped = []
+            self.topic = None
+
+        def tmux_stream(self, sid, pane, line, path, end_marker, topic,
+                        ttl=120.0, frame_max=None, poll=None, grace=None,
+                        req_timeout=30.0):
+            self.calls.append(dict(sid=sid, pane=pane, line=line, path=path,
+                                   end=end_marker, topic=topic, ttl=ttl))
+            self.topic = topic
+            if self.error is not None:
+                raise self.error
+            if self.script is not None:
+                self.script(self, sid, line, end_marker)
+            return {"ok": True, "sid": sid}
+
+        def tmux_stream_stop(self, sid, req_timeout=10.0):
+            self.stopped.append(sid)
+            return {"ok": True, "sid": sid, "was_active": True}
+
+    def _bridge(self, shell):
+        b = pcm.AIBridge()
+        tr = FakeTransport()
+        b.attach(self.FakePty(), tr)
+        b._shell = shell
+        b._PUSH_START_WAIT = 0.05
+        b._pick_pane = lambda pane=None: "%1"
+        return b, tr
+
+    @staticmethod
+    def _emit(tr, shell, sid):
+        def frame(d, seq=None, **ka):
+            payload = dict(ka)
+            payload["stream"] = sid
+            if seq is not None:
+                payload["seq"] = seq
+                payload["d"] = d
+            tr.emit(shell.topic, payload)
+        return frame
+
+    def test_stream_reorders_dedups_and_returns_rc(self):
+        holder = {}
+
+        def script(shell, sid, line, end_marker):
+            begin = re.search(r"__AI_BEGIN_[\w]+__", line).group(0)
+            emit = self._emit(shell.tr, shell, sid)
+            # 乱序 + 重复：同一帧经多个 broker 各到一份，且后发的可能先到。
+            emit("STDOUT\r\n", seq=1)
+            emit("STDOUT\r\n", seq=1)
+            emit("%s\r\n" % begin, seq=0)
+            emit("%s:0\r\nprompt# " % end_marker, seq=2)
+            emit(None, end=True, reason="done", frames=3, rc=0)
+
+        holder["shell"] = self.FakeShell(None, script=script)
+        b, tr = self._bridge(holder["shell"])
+        holder["shell"].tr = tr
+        self.assertTrue(b._push_ready())
+        res = b.run("true", timeout=3)
+        self.assertEqual(res["channel"], "tmux+push")
+        self.assertEqual(res["rc"], 0)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["out"], "STDOUT")
+        # frames 统计收到的数据帧（含重复副本）；重复不影响输出本身
+        self.assertGreaterEqual(res["frames"], 3)
+        self.assertEqual(res["pane"], "%1")
+        # 结束帧已到 = 服务端 worker 已自行退出并清理管道，客户端不再多发
+        # 一轮 tmux_stream_stop（实测约 0.4s）；只在超时/提前退出时才补停。
+        self.assertFalse(holder["shell"].stopped)
+
+    def test_timeout_stops_remote_worker(self):
+        def script(shell, sid, line, end_marker):
+            begin = re.search(r"__AI_BEGIN_[\w]+__", line).group(0)
+            self._emit(shell.tr, shell, sid)("%s\r\n" % begin, seq=0)
+
+        shell = self.FakeShell(None, script=script)
+        shell.tr = None
+        b, tr = self._bridge(shell)
+        shell.tr = tr
+        res = b.run("sleep 99", timeout=0.4)
+        self.assertTrue(res["timed_out"])
+        # 未命中 END：远端 worker 仍在推流，必须显式停掉避免泄漏
+        self.assertTrue(shell.stopped)
+
+    def test_ctrl_c_routes_to_active_pane(self):
+        sent, calls = [], []
+
+        class P:
+            end_reason = None
+
+            def send(self, data):
+                sent.append(data)
+
+        class R:
+            rc = 0
+            stdout = b""
+
+        b = pcm.AIBridge()
+        b.attach(P(), FakeTransport())
+        b._shell = self.FakeShell(None)
+        b._active_pane = "%7"
+        b._tmux = lambda args: calls.append(list(args)) or R()
+        r = b.send("\x03")
+        self.assertTrue(r.get("interrupt"))
+        self.assertEqual(calls, [["send-keys", "-t", "%7", "C-c"]])
+        self.assertEqual(sent, [])
+        # 没有 AI 命令在跑时，Ctrl-C 仍按原语义写本 PTY
+        b._active_pane = None
+        b.send("\x03")
+        self.assertEqual(sent, [b"\x03"])
+
+    def test_interrupt_end_frame_marks_interrupted(self):
+        def script(shell, sid, line, end_marker):
+            begin = re.search(r"__AI_BEGIN_[\w]+__", line).group(0)
+            emit = self._emit(shell.tr, shell, sid)
+            emit("%s\r\n" % begin, seq=0)
+            emit("partial\r\n^C\r\n", seq=1)
+            emit(None, end=True, reason="interrupted", frames=2, rc=None)
+
+        shell = self.FakeShell(None, script=script)
+        b, tr = self._bridge(shell)
+        shell.tr = tr
+        res = b.run("sleep 99", timeout=3)
+        self.assertEqual(res["channel"], "tmux+push")
+        self.assertTrue(res["interrupted"])
+        self.assertIsNone(res["rc"])
+        self.assertFalse(res["ok"])
+        self.assertIn("partial", res["out"])
+
+    def test_unknown_op_falls_back_to_polling(self):
+        shell = self.FakeShell(None, error=pcm.RemoteOpError("unknown op: 'tmux_stream'"))
+        b, tr = self._bridge(shell)
+        called = {}
+
+        def fake_poll(target, cmd, timeout, begin, end, enc, tag, on_output=None):
+            called.update(target=target, cmd=cmd)
+            return {"ok": True, "channel": "tmux", "rc": 0, "out": "poll"}
+
+        b._run_via_tmux = fake_poll
+        res = b.run("echo hi", timeout=3)
+        self.assertEqual(res["channel"], "tmux")
+        self.assertEqual(called["target"], "%1")
+        self.assertEqual(called["cmd"], "echo hi")
+
+    def test_start_failure_without_op_error_returns_error_not_duplicate(self):
+        shell = self.FakeShell(None, error=pcm.RemoteError("pipe-pane failed"))
+        b, tr = self._bridge(shell)
+        called = []
+        b._run_via_tmux = lambda *a, **k: called.append(1) or {"channel": "tmux"}
+        res = b.run("echo hi", timeout=3)
+        self.assertEqual(res["channel"], "tmux+push")
+        self.assertFalse(res["ok"])
+        self.assertIn("启动失败", res["error"])
+        self.assertEqual(called, [])   # 绝不重复投递同一条命令
+
+    def test_tail_exposes_live_output_while_running(self):
+        release = threading.Event()
+
+        def script(shell, sid, line, end_marker):
+            begin = re.search(r"__AI_BEGIN_[\w]+__", line).group(0)
+            emit = self._emit(shell.tr, shell, sid)
+            emit("%s\r\n" % begin, seq=0)
+            emit("step1\r\n", seq=1)
+            # 模拟长命令：前两帧到齐后挂住，等主线程查完 tail 再收尾
+            threading.Thread(target=lambda: (release.wait(2),
+                                             emit("%s:0\r\n" % end_marker, seq=2)),
+                             daemon=True).start()
+
+        shell = self.FakeShell(None, script=script)
+        b, tr = self._bridge(shell)
+        shell.tr = tr
+        result = {}
+        t = threading.Thread(target=lambda: result.update(b.run("sleep 1", timeout=5)))
+        t.start()
+        self.assertTrue(_wait_until(lambda: b.tail()["total"] > 0, timeout=2))
+        live = b.tail()
+        self.assertEqual(live["channel"], "tmux+push")
+        self.assertIn("step1", live["tail"])
+        release.set()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["rc"], 0)
+
+    def test_transport_without_subscribe_uses_polling(self):
+        b = pcm.AIBridge()
+        b.attach(self.FakePty(), None)
+        b._pick_pane = lambda pane=None: "%1"
+        self.assertFalse(b._push_ready())
+        b._run_via_tmux = lambda *a, **k: {"ok": True, "channel": "tmux"}
+        self.assertEqual(b.run("x", timeout=2)["channel"], "tmux")
 
 
 class AIBridgePaneSelectTests(unittest.TestCase):
@@ -2262,3 +2467,4 @@ class LogConsoleEndToEndTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
