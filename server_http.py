@@ -261,8 +261,23 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
         return value or 'basic auth disabled'
 
     def log_message(self, format, *args):
+        try:
+            text = format % args
+        except Exception:
+            text = str(format)
+        # /mcp 的一次工具调用在 HTTP 层会伴随 initialize/notifications/tool
+        # call 多条 POST，2xx 访问行既无工具名也无参数，只会把日志冲散；
+        # 真正的调用轨迹由 pty 侧 [MCP] <id> ┌/└ 首尾配对承担。这里只在
+        # 4xx/5xx 保留访问行，便于排查协议层失败。
+        if '/mcp' in text:
+            try:
+                code = int(text.rsplit('"', 1)[-1].split()[0])
+            except Exception:
+                code = 0
+            if 200 <= code < 400:
+                return
         line = (f"[RPC] {stime()[12:]}  {self.client_address[0]}:"
-                f"{self.client_address[1]} {format % args}")
+                f"{self.client_address[1]} {text}")
         sink = _conf(self, 'log_sink')
         if sink is not None:
             try:

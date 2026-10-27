@@ -22,6 +22,7 @@ pty/
 │   ├── 090_aibridge.py       # AI 桥：_strip_ansi、base64 严格编码、AIBridge、ai_bridge
 │   ├── 095_aicallers.py      # AI 桥调用方便捷函数（local_rpc / ai_pty_run / …）
 │   ├── 097_mcp_server.py     # MCP 服务：pty_run/pty_send/pty_status/pty_log/pty_redraw
+│   ├── 098_mcp_files.py      # MCP 文件工具：fs_read/write/edit/glob/grep/ls/mkdir/move/delete
 │   ├── 100_magic.py          # 本地命令栏（魔术命令 _run_magic / 参数规格表）
 │   ├── 105_exit.py           # _hard_exit 硬退出、_join_pre_command
 │   ├── 110_session.py        # run_session 会话主循环
@@ -65,6 +66,40 @@ claude mcp add --transport http pty http://192.168.1.3:1188/mcp
 （会话/broker 状态）、`pty_log`（本地诊断日志）、`pty_redraw`（写卡滞自愈
 +整屏重绘）。与 1188 HTTP RPC 口同源同锁，三路调用状态一致。`--no-mcp` 关闭；
 `--mcp-port N`（N>0）改为另起独立端口（`--port 0` 关闭 RPC 口时仍要 MCP 用）。
+
+文件工具（098 分片）**作用于远端机器**：客户端把实现层源码打包，经
+`ai_bridge.transport.request`（与 `client_mqtt.rpc` 同一条 MQTT RPC 通道）
+发到远端 `server_mqtt.py` 进程里 `exec`，因此 `/root/...` 这类路径解析的是
+远端文件系统；不经过常驻 PTY shell，也不占 `ai_bridge` 的 busy 锁。
+
+| 工具 | 参数 | 说明 |
+| --- | --- | --- |
+| `fs_read` | `file_path, offset=0, limit=2000` | 带行号读取 UTF-8 文本，二进制拒绝 |
+| `fs_write` | `file_path, content` | 整文件覆盖写（父目录需已存在） |
+| `fs_edit` | `file_path, old_string, new_string, replace_all=false` | 精确替换，多命中默认报错；CRLF 自动保持 |
+| `fs_glob` | `pattern, path=".", max_results=200` | glob 查文件，按 mtime 倒序 |
+| `fs_grep` | `pattern, path=".", glob, ignore_case, output_mode, context, head_limit, offset` | 正则搜索，自动跳过 .git/二进制 |
+| `fs_ls` | `path=".", show_hidden=true` | 列目录条目 |
+| `fs_mkdir` | `path, parents=true` | 创建目录 |
+| `fs_move` | `src, dst, overwrite=false` | 移动/重命名 |
+| `fs_delete` | `path, recursive=false` | 删除文件或目录（目录需 recursive=true） |
+
+权限：读写工具默认都可作用于任意路径——`pty_run` 本就能执行任意代码，
+给写操作加根限制没有实际意义。仅 `--fs-read-only`（默认关闭）会禁用写家族。
+单次读写上限 5MB，grep 有 2 万文件 / 5 秒上限。
+
+每次工具调用分配 6 位调用 id（`os.urandom(3).hex()`）：开始行带完整参数，
+完成行整行缩进、带参数短摘要 + 状态 + 耗时，两行各自可独立阅读，并发交错
+也不影响归属：
+`[MCP] 3f9a2b 开始 fs_grep pattern='sherpa' path='/root/...'` 与
+`   [MCP] 3f9a2b 完成 fs_grep pattern='sherpa' path='/root/...' ok 0.21s`
+（业务失败为 FAIL + 原因，异常为 FAIL + 异常类型）。参数按 repr 转义成单行，
+开始行单值超 400 字符截断、完成行单值只留前 60 字符，不等远端返回。
+`/mcp` 的 2xx HTTP 访问行已过滤（每次调用伴随多条 POST、不含工具名与参数），
+只保留 4xx/5xx；SDK 的 `Terminating session: None` INFO 已压到 WARNING。
+
+> 注：文件操作作用于**远端 server_mqtt.py 所在机器**（与 `pty_run` 的目标同一台），
+> 不是运行 pty 客户端的本机；`--fs-read-only` 只禁写，读仍可用。
 
 ## 规则
 
