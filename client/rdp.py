@@ -945,7 +945,7 @@ function onKey(code, btn) {
 
 setInterval(() => { if (autoEl.checked) refresh(); }, 2000);
 log('页面就绪,加载截图中…');
-refresh(true);                              // 首次加载也归位红点,直接看到远端真实光标
+refresh();                              // 首次加载不归位红点,只有一个空心红圈指示远程光标
 </script>
 </body>
 </html>'''
