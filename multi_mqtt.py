@@ -1522,8 +1522,8 @@ class MultiMQTTManager:
             if c.is_connected():
                 c.unsubscribe(topic, **ka)
 
-    def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None, **ka):
-        """广播传输消息并返回成功入队的 Broker 数；QoS 等参数透传给 paho。"""
+    def _prepare_broadcast_payload(self, payload_dict: dict, client_private_key_bytes=None) -> str:
+        """签名并加密待发报文；publish_broadcast 与其确认版共用同一套预处理。"""
         out_payload = payload_dict.copy()
         if client_private_key_bytes:
             try:
@@ -1551,16 +1551,52 @@ class MultiMQTTManager:
             sign_msg = f"{base_req_id}|{code_str}|{ts_str}".encode('utf-8')
             signature = sk.sign(sign_msg, hashfunc=hashlib.sha256)
             out_payload["req_id"] = f"{base_req_id}|{signature.hex()}"
-        payload_str = process_cipher(out_payload, decrypt=False, enabled=self.enable_crypto)
+        return process_cipher(out_payload, decrypt=False, enabled=self.enable_crypto)
+
+    def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None, **ka):
+        """广播传输消息并返回成功入队的 Broker 数；QoS 等参数透传给 paho。"""
+        payload_str = self._prepare_broadcast_payload(payload_dict, client_private_key_bytes)
+        published = 0
         with self.lock:
             clients_snapshot = list(self.clients.items())
-        published = 0
         for host, c in clients_snapshot:
             if c.is_connected():
                 info = c.publish(topic, payload_str, **ka)
                 if info.rc == mqtt_client.MQTT_ERR_SUCCESS:
                     published += 1
         return published
+
+    def publish_broadcast_confirmed(self, topic: str, payload_dict: dict, client_private_key_bytes=None, confirm_timeout: float = 2.0, **ka) -> dict:
+        """广播并等待 QoS1 发布确认，返回 queued/acked/timeout 统计。
+
+        阻塞至多 confirm_timeout 秒（所有 broker 共享同一截止时间），只能在
+        后台线程调用；acked 只统计真正收到 PUBACK 的连接，入队但未确认不计。
+        """
+        payload_str = self._prepare_broadcast_payload(payload_dict, client_private_key_bytes)
+        with self.lock:
+            clients_snapshot = list(self.clients.items())
+        queued_infos = []
+        for host, c in clients_snapshot:
+            if c.is_connected():
+                info = c.publish(topic, payload_str, **ka)
+                if info.rc == mqtt_client.MQTT_ERR_SUCCESS:
+                    queued_infos.append((host, info))
+        deadline = time.monotonic() + max(0.0, float(confirm_timeout or 0.0))
+        acked = 0
+        for host, info in queued_infos:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    info.wait_for_publish(timeout=remaining)
+                except Exception:  # 旧版 paho 超时抛 ValueError、新版抛 RuntimeError
+                    logger.debug("等待发布确认未完成: broker=%s", host, exc_info=True)
+            if info.is_published():
+                acked += 1
+        return {
+            "queued": len(queued_infos),
+            "acked": acked,
+            "timeout": acked < len(queued_infos),
+        }
 
     def stop(self):
         self._stop_event.set()

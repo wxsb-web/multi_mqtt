@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from multi_mqtt import BROKER_LIST, ConnectionQualityStats
+from multi_mqtt import BROKER_LIST, ConnectionQualityStats, MultiMQTTManager
 from server_mqtt import DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL, MQTTServer
 from rpc_executor import utc_ms
 
@@ -41,6 +41,10 @@ def make_stub_server(**kw):
     calls = []
     s.mqtt_net.publish_broadcast = lambda topic, payload, **ka: calls.append((topic, payload, ka))
     s.calls = calls
+    remote = []
+    # 远端 topics 追加走真实 HTTPS 会受 qmm 证书过期影响，这里整体打桩避免测试联网。
+    s._append_global_topic_list_remote = lambda payload: remote.append(payload)
+    s.remote_appends = remote
     return s
 
 
@@ -151,6 +155,137 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
         s._unregister_global_topic_list_tick()
         self.assertIsNone(s.mqtt_net._periodic_fn)
         self.assertEqual(threading.active_count(), before)   # 注册/清除不创建线程
+
+    def test_publish_now_skips_remote_and_returns_ack_status(self):
+        """立即发布接口：自定义 reason、等待 QoS1 确认、默认不追加远端 topics。"""
+        s = make_stub_server()
+        confirmed = []
+        s.mqtt_net.publish_broadcast_confirmed = lambda topic, payload, **ka: (
+            confirmed.append((topic, payload, ka))
+            or {"queued": 2, "acked": 1, "timeout": True}
+        )
+        remote = s.remote_appends                 # fixture 默认已打桩远端追加
+        before = time.time()
+        status = s.publish_global_topic_list_now(reason="ime_feedback")
+        self.assertEqual(confirmed[0][0], "global_topic_list")
+        self.assertEqual(confirmed[0][1]["reason"], "ime_feedback")
+        self.assertEqual(confirmed[0][1]["request_topic"], s.request_topic)
+        self.assertEqual(confirmed[0][2]["qos"], 1)
+        self.assertEqual(confirmed[0][2]["retain"], True)
+        self.assertEqual(confirmed[0][2]["confirm_timeout"], 2.0)
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["queued"], 2)
+        self.assertEqual(status["acked"], 1)
+        self.assertTrue(status["sent"])          # 至少一个 broker 收到 PUBACK
+        self.assertTrue(status["timeout"])       # 仍有 broker 未确认
+        self.assertEqual(remote, [])             # 交互路径默认跳过 9 秒远端追加
+        self.assertGreaterEqual(s._last_gtl_publish_ts, before)
+
+    def test_publish_now_without_confirm_falls_back_to_queued_count(self):
+        """confirm_timeout=0 走普通广播，sent 以入队数为准，acked 保持 None。"""
+        s = make_stub_server()
+        s.mqtt_net.publish_broadcast = lambda topic, payload, **ka: 3
+        status = s.publish_global_topic_list_now(reason="ime_feedback", confirm_timeout=0)
+        self.assertEqual(status["queued"], 3)
+        self.assertIsNone(status["acked"])
+        self.assertTrue(status["sent"])
+        self.assertFalse(status["timeout"])
+
+    def test_publish_now_no_ack_marks_unsent(self):
+        """入队但无 PUBACK 时必须返回未成功，供调用方挂重试任务。"""
+        s = make_stub_server()
+        s.mqtt_net.publish_broadcast_confirmed = lambda *a, **ka: {
+            "queued": 1, "acked": 0, "timeout": True,
+        }
+        status = s.publish_global_topic_list_now(reason="ime_feedback")
+        self.assertFalse(status["sent"])
+        self.assertTrue(status["timeout"])
+
+    def test_publish_now_custom_payload_not_dict_returns_error(self):
+        s = make_stub_server(global_topic_list_payload_fn=lambda sv: ["bad"])
+        status = s.publish_global_topic_list_now(reason="ime_feedback")
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["error"], "payload_not_dict")
+        self.assertFalse(status["sent"])
+
+    def test_tick_still_appends_remote_by_default(self):
+        """周期 tick 行为不变：仍追加远端 topics，仅交互接口默认跳过。"""
+        s = make_stub_server()
+        stub_snapshot(s, {"brokerA": True})
+        s.global_topic_list_tick()
+        self.assertEqual(len(s.remote_appends), 1)
+
+
+class BroadcastConfirmedTests(unittest.TestCase):
+    """publish_broadcast_confirmed：QoS1 ACK 统计与超时语义（不连真实 broker）。"""
+
+    class _FakeInfo:
+        def __init__(self, rc=0, raise_timeout=False):
+            self.rc = rc
+            self._published = False
+            self._raise_timeout = raise_timeout
+
+        def wait_for_publish(self, timeout=None):
+            if self._raise_timeout:      # 旧版 paho 超时抛 ValueError
+                raise ValueError("timed out")
+            self._published = True
+
+        def is_published(self):
+            return self._published
+
+    class _FakeClient:
+        def __init__(self, info, connected=True):
+            self.info = info
+            self.connected = connected
+            self.published = []
+
+        def is_connected(self):
+            return self.connected
+
+        def publish(self, topic, payload, **ka):
+            self.published.append((topic, payload, ka))
+            return self.info
+
+    @staticmethod
+    def _manager(clients):
+        manager = object.__new__(MultiMQTTManager)
+        manager.clients = clients
+        manager.lock = threading.RLock()
+        manager.enable_crypto = False
+        manager.client_sk = None
+        return manager
+
+    def test_counts_only_acked_brokers(self):
+        ack_client = self._FakeClient(self._FakeInfo())
+        slow_client = self._FakeClient(self._FakeInfo(raise_timeout=True))
+        manager = self._manager({"a": ack_client, "b": slow_client})
+        result = manager.publish_broadcast_confirmed(
+            "t", {"reason": "ime_feedback"}, confirm_timeout=0.05, qos=1
+        )
+        self.assertEqual(result["queued"], 2)
+        self.assertEqual(result["acked"], 1)
+        self.assertTrue(result["timeout"])
+
+    def test_skips_disconnected_and_failed_publish(self):
+        failed = self._FakeClient(self._FakeInfo(rc=1))
+        offline = self._FakeClient(self._FakeInfo(), connected=False)
+        manager = self._manager({"a": failed, "b": offline})
+        result = manager.publish_broadcast_confirmed(
+            "t", {"reason": "x"}, confirm_timeout=0.01
+        )
+        self.assertEqual(result, {"queued": 0, "acked": 0, "timeout": False})
+
+    def test_same_payload_and_kwargs_as_broadcast(self):
+        client = self._FakeClient(self._FakeInfo())
+        manager = self._manager({"a": client})
+        manager.publish_broadcast_confirmed(
+            "t", {"reason": "x"}, confirm_timeout=0.01, qos=1, retain=True
+        )
+        topic, payload_str, ka = client.published[0]
+        self.assertEqual(topic, "t")
+        self.assertEqual(ka, {"qos": 1, "retain": True})
+        self.assertIsInstance(payload_str, str)
+        self.assertIn("x", payload_str)
 
 
 def _wait_until(cond, timeout, interval=0.2):

@@ -28,7 +28,7 @@ DEFAULT_PUB_KEY='ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHA
 
 RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
 _RPC_CONFIG_LOCK = globals().setdefault('_RPC_CONFIG_LOCK', threading.RLock())  # reload 会重造新锁对象：正攥旧锁写 rpc.json 的线程与拿新锁的线程同时进临界区，setdefault 保住同一把锁跨 reload
-_ACTIVE_SERVER = globals().setdefault('_ACTIVE_SERVER', None)  # 实例在构造时自注册（_ACTIVE_SERVER = self），reload 重执行把名字重绑回 None——rpc_config()/apply 热配置路径（324-352 行）静默失效直到下次实例化；setdefault 让 reload 后仍指向活着的实例
+gms = globals().setdefault('gms', None)  # 当前活着的服务端实例（构造/启动时自注册 gms = self），reload 重执行把名字重绑回 None——rpc_config()/apply 热配置路径（324-352 行）静默失效直到下次实例化；setdefault 让 reload 后仍指向活着的实例
 
 # --- [global_topic_list 监听 topic 定期报告] 默认配置 ---
 # 命名说明：stats.get_report 是网络连接质量报告；本组是"监听 topic 列表"报告，
@@ -321,12 +321,12 @@ def _resolve_request_topic(request_topic=None, stored=None):
 
 def rpc_config(**updates):
     """持久化并立即应用设置，例如 rpc_config(request_topic='sys/new/request')。"""
-    global _ACTIVE_SERVER
+    global gms
     if not updates:
         return rpc_config_get()
     with _RPC_CONFIG_LOCK:
-        if _ACTIVE_SERVER is not None:
-            current = _ACTIVE_SERVER.get_rpc_config()
+        if gms is not None:
+            current = gms.get_rpc_config()
         else:
             current = _normalize_rpc_config(_read_rpc_config_document())
         current["broker_list"] = current["_broker_list_base"]
@@ -334,13 +334,13 @@ def rpc_config(**updates):
             current["_broker_list_base"] = updates["broker_list"]
         candidate = _normalize_rpc_config({**current, **updates})
         previous = _normalize_rpc_config(current)
-        if _ACTIVE_SERVER is not None:
-            _ACTIVE_SERVER.apply_rpc_config(candidate)
+        if gms is not None:
+            gms.apply_rpc_config(candidate)
         try:
             _write_rpc_config_updates(updates)
         except Exception:
-            if _ACTIVE_SERVER is not None:
-                _ACTIVE_SERVER.apply_rpc_config(previous)
+            if gms is not None:
+                gms.apply_rpc_config(previous)
             raise
         return rpc_config_get()
 
@@ -348,8 +348,8 @@ def rpc_config(**updates):
 def rpc_config_get():
     """返回服务当前实际生效的设置；服务未启动时返回 rpc.json 合并默认值。"""
     with _RPC_CONFIG_LOCK:
-        if _ACTIVE_SERVER is not None:
-            return _json_rpc_config(_ACTIVE_SERVER.get_rpc_config())
+        if gms is not None:
+            return _json_rpc_config(gms.get_rpc_config())
         return _json_rpc_config(load_rpc_config())
 get_config=get_rpc=get_rpc_config=rpc_get_config=rpc_config_get  
 
@@ -534,7 +534,7 @@ class MQTTServer:
         global_topic_list 报告参数（间隔/阈值/tick 粒度/开关）随之热生效：
         check_interval 变更或开关翻转时在当前 manager 上重注册/注销周期任务。
         """
-        global _ACTIVE_SERVER
+        global gms
         candidate = _normalize_rpc_config(config)
         with self._rpc_config_lock:
             previous = self._rpc_config
@@ -589,7 +589,7 @@ class MQTTServer:
                     self._register_global_topic_list_tick()   # set_periodic_task 覆盖式注册
                 elif gtl_was_enabled and not self.enable_global_topic_list:
                     self._unregister_global_topic_list_tick()
-            _ACTIVE_SERVER = self
+            gms = self
 
     def _apply_global_topic_list_settings(self, candidate):
         """把候选配置的 global_topic_list 报告参数热更新到实例字段。"""
@@ -787,18 +787,18 @@ class MQTTServer:
             "stime": stime(),
         }
 
-    def _publish_global_topic_list(self, reason: str):
-        """发布监听 topic 报告；qos/retain 经 **ka 透传到 paho-mqtt；并用标准库把本次报告追加到远端 topics（超时 9s）。"""
-        if self.global_topic_list_payload_fn is not None:  # 自定义报告函数优先
+    def _resolve_global_topic_list_payload(self, reason: str):
+        """自定义报告函数优先；返回 None 表示本次放弃发布。"""
+        if self.global_topic_list_payload_fn is not None:
             payload = self.global_topic_list_payload_fn(self)
-            if not isinstance(payload, dict):  # 类型不符则放弃本次
+            if not isinstance(payload, dict):
                 logger.warning("global_topic_list_payload_fn 返回非 dict(%s)，忽略本次发布", type(payload))
-                return
-        else:
-            payload = self._build_global_topic_list_payload(reason)  # 默认报告：监听 topic 列表
-        self.mqtt_net.publish_broadcast(self.global_topic_list, payload, **self.global_topic_list_publish_kwargs)  # MQTT 广播，QoS1+Retain 经 **ka 透传
-        self._last_gtl_publish_ts = time.time()  # 时间戳防抖，断网恢复自然续上
-        
+                return None
+            return payload
+        return self._build_global_topic_list_payload(reason)
+
+    def _append_global_topic_list_remote(self, payload: dict):
+        """把本次报告追加到远端 topics 文件（标准库，超时 9s）；失败只记日志。"""
         try:  # 远端上报：仅用标准库，失败不影响 MQTT 发布
             import urllib.parse, urllib.request,json  # 局部导入，避免顶层强依赖
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))  # 紧凑 JSON，保留中文
@@ -810,9 +810,67 @@ class MQTTServer:
             with urllib.request.urlopen(req, timeout=9) as resp:  # 超时=9s
                 resp.read()  # 读空响应体，及时释放连接
         except Exception as qmm_e:
-            logger.exception(f" {qmm_e} global_topic_list_payload_fn 追加到qmm失败（不影响 MQTT 发布）")  # 网络/超时/500 均只记日志
-        
-        logger.info("📨 [%s] 已发布监听 topic 报告 -> %s (reason=%s, publish=%s, topics=%s)", stime(), self.global_topic_list, reason, self.global_topic_list_publish_kwargs, payload.get("listen_topics"))  # 本地日志
+            # 证书过期/网络抖动属预期失败，只记一行警告，避免每轮 tick 刷整段 traceback
+            logger.warning("远端 topics 追加失败（不影响 MQTT 发布）：%s", qmm_e)
+
+    def _publish_global_topic_list(self, reason: str, confirm_timeout=None, remote=True) -> dict:
+        """发布监听 topic 报告并返回发布状态。
+
+        confirm_timeout>0 时等待 QoS1 PUBACK，阻塞至多该秒数，仅限后台线程；
+        remote=False 跳过远端 topics 追加，供交互场景避免最长 9 秒阻塞。
+        返回 ok/reason/topic/queued/acked/sent/timeout/payload，可直接作为
+        RPC 响应交给调用方判断是否真的发成功。
+        """
+        payload = self._resolve_global_topic_list_payload(reason)
+        if payload is None:
+            return {
+                "ok": False, "reason": reason, "sent": False,
+                "queued": 0, "acked": 0, "timeout": False,
+                "error": "payload_not_dict",
+            }
+        if confirm_timeout and float(confirm_timeout) > 0:
+            stats = self.mqtt_net.publish_broadcast_confirmed(
+                self.global_topic_list,
+                payload,
+                confirm_timeout=float(confirm_timeout),
+                **self.global_topic_list_publish_kwargs,
+            )
+        else:
+            queued = self.mqtt_net.publish_broadcast(
+                self.global_topic_list, payload, **self.global_topic_list_publish_kwargs
+            )
+            stats = {"queued": queued, "acked": None, "timeout": False}
+        self._last_gtl_publish_ts = time.time()  # 时间戳防抖，断网恢复自然续上
+        if remote:
+            self._append_global_topic_list_remote(payload)
+        acked = stats.get("acked")
+        status = {
+            "ok": True,
+            "reason": reason,
+            "topic": self.global_topic_list,
+            "queued": stats.get("queued"),
+            "acked": acked,
+            "sent": bool(acked) if acked is not None else bool(stats.get("queued")),
+            "timeout": bool(stats.get("timeout")),
+            "payload": payload,
+        }
+        logger.info(
+            "📨 [%s] 已发布监听 topic 报告 -> %s (reason=%s, queued=%s, acked=%s, topics=%s)",
+            stime(), self.global_topic_list, reason,
+            status["queued"], status["acked"], payload.get("listen_topics"),
+        )  # 本地日志
+        return status
+
+    def publish_global_topic_list_now(self, reason="manual", confirm_timeout=2.0, remote=False) -> dict:
+        """立即发布一次监听 topic 报告，可指定与周期报告不同的 reason。
+
+        与 tick 共用同一份 payload 与发布参数；默认等待 QoS1 PUBACK 并跳过
+        远端 topics 追加，适合设备端交互立即触发。阻塞至多 confirm_timeout
+        秒，必须在后台线程调用。
+        """
+        return self._publish_global_topic_list(
+            reason, confirm_timeout=confirm_timeout, remote=remote
+        )
             
     def global_topic_list_tick(self, now=None):
         """周期 tick：由 _dispatch_loop 驱动（也可手动调用）。
@@ -867,8 +925,8 @@ class MQTTServer:
                          "（可能是旧分发线程未退出）。")
             return None
 
-        global _ACTIVE_SERVER
-        _ACTIVE_SERVER = self
+        global gms
+        gms = self
         self.mqtt_net.subscribe(self.request_topic)
         # 不写死 sleep：首个 broker 一连上就宣布就绪；迟到的 broker 会在
         # on_connect 时按 subscribed_topics 自动补订阅，不会漏消息。

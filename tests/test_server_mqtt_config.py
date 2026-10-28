@@ -63,7 +63,7 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.path_patch.start()
         self.manager_patch = mock.patch.object(server_mqtt, "MultiMQTTManager", FakeMQTTManager)
         self.manager_patch.start()
-        self.previous_active_server = server_mqtt._ACTIVE_SERVER
+        self.previous_gms = server_mqtt.gms
         FakeMQTTManager.instances.clear()
         self.server = server_mqtt.MQTTServer(
             brokers=[("old-broker.example", 1883)],
@@ -73,10 +73,10 @@ class ServerMqttConfigTests(unittest.TestCase):
         )
         self.server.mqtt_net.start()
         self.server.mqtt_net.subscribe(self.server.request_topic)
-        server_mqtt._ACTIVE_SERVER = self.server
+        server_mqtt.gms = self.server
 
     def tearDown(self):
-        server_mqtt._ACTIVE_SERVER = self.previous_active_server
+        server_mqtt.gms = self.previous_gms
         self.manager_patch.stop()
         self.path_patch.stop()
         self.temp_dir.cleanup()
