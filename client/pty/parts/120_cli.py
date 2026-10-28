@@ -75,9 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "（百分号前缀，如 2）或 0:2 / 窗口名（RPC 的 pty_pane 可运行时改）")
     p.add_argument(*_cm._cli_opts(*alias_ai_encoding), dest="ai_encoding",
                    default="raw",
-                   help="AI 命令编码：raw = 窗口里直接看到命令原文（默认）；"
-                        "base64 = 严格编码，任意特殊字符不破裂（含裸换行/控制"
-                        "字节时自动切到它）")
+                   help="AI 命令编码：raw = 自动（默认，无控制字符原文直发；有裸"
+                        "换行且 shell 为 bash/zsh 时用 $'...' 保持可读；否则 "
+                        "base64）；dollar = 强制 ANSI-C 引用；base64 = 强制严格"
+                        "编码")
     # SSH 式可选位置参数：连接成功后自动敲进常驻 shell 的前置命令，如
     # ``pty_client_mqtt.py -t q -k *** "tmux at"``；REMAINDER 保证命令自身
     # 的 -x 选项（tmux attach -d）不会被本客户端解析。命令结束后会话继续，

@@ -1008,8 +1008,39 @@ def _cmq_pty_start():
         import os as _o, time as _t, threading as _th, traceback as _tb
         if _o.name != "posix":
             raise RuntimeError("PTY 只能在 POSIX 服务端建立，当前系统: %s" % _o.name)
-        import pty as _pty, fcntl as _fc, termios as _te, struct as _st
+        import fcntl as _fc, termios as _te, struct as _st
         import select as _sel, subprocess as _sp, signal as _sg, queue as _qe
+
+        def _pty_openpty():
+            # Android/Chaquopy 的 os 没有 openpty，stdlib pty.py 会退到
+            # 扫 /dev/ptyXY 的 BSD 老接口；Android 只有 Unix98 /dev/ptmx，
+            # 于是必然误报 "out of pty devices"。这里按能力逐级兜底：
+            # os.openpty -> libc openpty -> 直接操作 /dev/ptmx。
+            try:
+                return _o.openpty()
+            except (AttributeError, OSError):
+                pass
+            try:
+                import ctypes as _ct
+                _libc = _ct.CDLL("libc.so", use_errno=True)
+                _pm, _ps = _ct.c_int(), _ct.c_int()
+                if _libc.openpty(_ct.byref(_pm), _ct.byref(_ps),
+                                 None, None, None) == 0:
+                    return _pm.value, _ps.value
+            except Exception:
+                pass
+            # 数值 ioctl：Android 的 termios 模块没有 TIOCSPTLCK/TIOCGPTN
+            _m2 = _o.open("/dev/ptmx", _o.O_RDWR | _o.O_NOCTTY)
+            try:
+                _fc.ioctl(_m2, 0x40045431, _st.pack("i", 0))   # unlockpt
+                _nb = _fc.ioctl(_m2, 0x80045430, _st.pack("I", 0))
+                _sn = _st.unpack("I", _nb)[0]
+                _s2 = _o.open("/dev/pts/%d" % _sn,
+                              _o.O_RDWR | _o.O_NOCTTY)
+            except Exception:
+                _o.close(_m2)
+                raise
+            return _m2, _s2
 
         # 本服务端进程的稳定身份（executor 全局命名空间跨握手持久，同一进程
         # 每次握手拿到同一个 uid）。多个持相同 key 的 server_mqtt 进程（旧
@@ -1092,7 +1123,7 @@ def _cmq_pty_start():
             if not _o.path.isdir(_cwd):
                 _cwd = "/"
 
-        _mfd, _sfd = _pty.openpty()
+        _mfd, _sfd = _pty_openpty()
         _fc.ioctl(_sfd, _te.TIOCSWINSZ, _st.pack("HHHH", _rows, _cols, 0, 0))
         _envv = dict(_o.environ)
         _envv["TERM"] = _term

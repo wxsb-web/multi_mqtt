@@ -64,6 +64,10 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                    on_responders=lambda rs: _emit_local(
                        _responders_warning(rs)))
 
+    # 会话启动时把远端登录 shell 记入 AI 桥：多行命令能否用可读的 $'...'
+    # 编码取决于它，探测不到（dash/未知）就由 _pick_encoding 退回 base64。
+    ai_bridge.set_shell(env.get("shell") if env else None)
+
     banner = (
         f"[{stime()}] connected shell={env['shell']} pid={env['pid']} "
         f"({env['rows']}x{env['cols']}, interval={env['flush_interval']})\t"

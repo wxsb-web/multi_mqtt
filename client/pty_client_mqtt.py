@@ -1897,6 +1897,59 @@ def _build_ai_run_line_raw(cmd: str, begin_tag: str, end_tag: str) -> str:
     )
 
 
+# 支持 ANSI-C 引用 $'...' 的交互 shell（按可执行文件名判断）。dash/POSIX sh
+# 不支持：在 dash 里 $'a\nb' 不会报错，而是退化成字面量，命令会静默跑错，
+# 所以「猜」是绝对不能做的——探测不到一律走 base64。
+_AI_DOLLAR_SHELLS = frozenset(("bash", "zsh", "ksh", "ksh93", "mksh", "ash"))
+
+
+def _shell_basename(path) -> str:
+    """从 shell 路径（/bin/bash、-bash）取可执行文件名，用于能力判断。"""
+    text = str(path or "").strip().replace("\\", "/")
+    return text.rsplit("/", 1)[-1].strip().lower().lstrip("-")
+
+
+def _dollar_quote(cmd: str) -> str:
+    """把任意文本转成 ``$'...'`` 形式：输出里不含任何裸控制字节。
+
+    ``$'...'`` 内部只解析反斜杠序列，``$``/反引号/``!`` 都是字面量。转义
+    规则：反斜杠和单引号各自加倍，换行/制表/回车写成 ``\\n``/``\\t``/
+    ``\\r``，其余 C0 与 DEL 写成 ``\\xHH``。NUL 无法表示，调用方应改用
+    base64。
+    """
+    out = []
+    for ch in str(cmd):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "'":
+            out.append("\\'")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 32 or ord(ch) == 127:
+            out.append("\\x%02x" % ord(ch))
+        else:
+            out.append(ch)
+    return "$'" + "".join(out) + "'"
+
+
+def _build_ai_run_line_dollar(cmd: str, begin_tag: str, end_tag: str) -> str:
+    """构造「多行命令仍可读」的命令行（**不含尾部回车**）。
+
+    ``$'...'`` 由交互 shell（bash/zsh）解析成一个字符串交给 ``sh -c``，所以
+    窗口里看到的是一条带 ``\\n`` 的可读单行，而不是 base64 密文；命令本体
+    不经过任何引号嵌套，特殊字符不会破裂。只对 :data:`_AI_DOLLAR_SHELLS`
+    里的 shell 使用（见 ``AIBridge._pick_encoding``）。
+    """
+    return (
+        "echo %s; sh -c %s; __ai_rc=$?; echo %s:$__ai_rc"
+        % (begin_tag, _dollar_quote(str(cmd)), end_tag)
+    )
+
+
 class AIBridge:
     """把这个常驻 PTY 暴露给 AI / 外部进程调用，命令全程可见。
 
@@ -1932,8 +1985,11 @@ class AIBridge:
         # _tmux_ok 三态：None=尚未探测；True=可用；False=不可用（回落原生 PTY 投递）
         self._tmux_ok = None
         self._shell = None          # 延迟创建的 RemoteShell（只在 tmux 路径才需要）
-        # AI 命令编码：raw=命令原文直接可见（默认）；base64=旧严格编码兜底
+        # AI 命令编码：raw=命令原文直接可见（默认）；base64=旧严格编码兜底；
+        # dollar=$'...'  ANSI-C 引用（仅会话 shell 支持时才自动启用）
         self._encoding = "raw"
+        # 会话启动时由 set_shell 从服务端登录 shell 推断，用于 $'...' 可用性判断
+        self._shell_name = ""
         # ---- 服务端主动推送（流式）状态 ----
         self._push_topic = None     # 本会话订阅的命令流 topic（首次 push 时创建）
         self._push_runs = {}        # sid -> 该次 run 的收帧回调（网络线程读）
@@ -1960,6 +2016,7 @@ class AIBridge:
         self._push_topic = None
         self._push_runs = {}
         self._active_pane = None
+        self._shell_name = ""  # 新会话的 shell 可能不同，等 set_shell 重新注入
         with self._live_lock:
             self._live = {"cmd": None, "buf": bytearray(), "start": None,
                           "channel": None}
@@ -1974,8 +2031,21 @@ class AIBridge:
             self._pane_id = str(pane).strip()
             self._pane_source = "cli"
         enc = str(encoding or "").strip().lower()
-        if enc in ("raw", "base64"):
+        if enc in ("raw", "base64", "dollar"):
             self._encoding = enc
+
+    def set_shell(self, shell) -> None:
+        """会话启动时记录远端登录 shell（pty.open 的 env['shell']）。
+
+        只用于判断 ``$'...'`` 是否可用：bash/zsh/ksh/mksh/ash 支持，dash 与
+        未知一律不猜（含控制字符的命令退回 base64）。在 attach 之后调用，
+        同一实例跨会话重连时由 attach 清空。
+        """
+        self._shell_name = _shell_basename(shell)
+
+    def _dollar_ok(self) -> bool:
+        """当前会话的交互 shell 是否支持 ANSI-C 引用 ``$'...'``。"""
+        return self._shell_name in _AI_DOLLAR_SHELLS
 
     def feed(self, chunk: bytes):
         """PTY 下行分流：主窗口渲染之外，给每个 run() 收集器一份副本。"""
@@ -2006,6 +2076,10 @@ class AIBridge:
             "ai_pane": self._pane_id,
             "ai_pane_source": self._pane_source or "auto",
             "ai_encoding": self._encoding,
+            # 会话 shell 名（bash/zsh/…）与 $'...' 可用性，便于排查为什么
+            # 多行命令走了 base64 而不是可读的 dollar 模式。
+            "ai_shell": self._shell_name,
+            "ai_dollar_ok": self._dollar_ok(),
             "tmux_ok": self._tmux_ok,
             # 最近一次命令实际走的通道：pty / tmux（轮询）/ tmux+push（推送）
             "ai_channel": self._live["channel"],
@@ -2050,8 +2124,10 @@ class AIBridge:
 
         参数 ``pane``：目标窗口；``None``/空 = 用固化的默认窗口（连接后首次
         run 解析「index 最小的窗口」并固化），非空 = 本次临时指定，不改默认。
-        参数 ``encoding``：``raw``（默认，命令原文可见）或 ``base64``（严格
-        编码，任意特殊字符不破裂；含裸换行/控制字节时自动降级到它）。
+        参数 ``encoding``：``raw``（默认自动：无控制字节原文直发；有裸换行且
+        会话 shell 为 bash/zsh 时用 ``$'...'`` 保持可读；否则 base64）、
+        ``dollar``（强制 ANSI-C 引用）、``base64``（强制严格编码）。
+        选择只看字符构成，与命令长度无关。
         参数 ``stream``：``auto``（默认，按上面的三级回落）或 ``off``（强制
         走轮询通道，便于对比/排障）。
         参数 ``on_output``：可选回调 ``fn(chunk: bytes)``，命令执行过程中**边
@@ -2483,19 +2559,38 @@ class AIBridge:
         return self._pane_id
 
     def _pick_encoding(self, cmd, encoding) -> str:
+        """选本次命令的编码：raw / dollar / base64。
+
+        - ``raw``（默认）：命令**没有**控制字节就原样直发（窗口可见）；
+          有裸换行/控制字节时：会话 shell 属于 :data:`_AI_DOLLAR_SHELLS`
+          才转 ``$'...'``（窗口仍可读），否则退回 base64。dash 里 ``$'...'``
+          会静默变成字面量，所以**绝不猜**。
+        - ``dollar``：显式要求 ANSI-C 引用；NUL 无法表示，只能退 base64。
+        - ``base64``：强制严格编码。
+
+        选择只看字符构成，与命令长度无关（长度受 pty 单行上限影响，见
+        ``_build_ai_run_line_raw`` 的已知边界）。
+        """
+        text = str(cmd)
         enc = str(encoding or self._encoding or "raw").strip().lower()
-        if enc not in ("raw", "base64"):
+        if enc not in ("raw", "base64", "dollar"):
             enc = "raw"
-        if enc == "raw" and any(ord(ch) < 32 for ch in str(cmd)):
-            # 裸换行/控制字节在交互 shell 里会被当成回车或 Ctrl-C，raw 模式
-            # 必然把一条命令拆成多行提交；这类命令自动降级到 base64。
+        if enc == "dollar":
+            return "base64" if "\x00" in text else "dollar"
+        if enc == "base64":
             return "base64"
-        return enc
+        if not any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+            return "raw"  # 没有需要转义的字符：保持原文可见，别做无谓编码
+        if "\x00" in text:
+            return "base64"
+        return "dollar" if self._dollar_ok() else "base64"
 
     @staticmethod
     def _build_line(cmd, begin, end, enc) -> str:
         if enc == "base64":
             return _build_ai_run_line_b64(cmd, begin, end)
+        if enc == "dollar":
+            return _build_ai_run_line_dollar(cmd, begin, end)
         return _build_ai_run_line_raw(cmd, begin, end)
 
     @staticmethod
@@ -2741,11 +2836,24 @@ import inspect
 import logging
 import time
 
+try:  # mcp 2.x：FastMCP 改名 MCPServer，Context 在同名包
+    from mcp.server.mcpserver import Context as _MCP_CTX
+except ImportError:  # mcp 1.x
+    try:
+        from mcp.server.fastmcp import Context as _MCP_CTX
+    except ImportError:  # 未安装 mcp：MCP 服务不会启动，工具也不会注册
+        _MCP_CTX = None
+
 _MCP_LOG_ARG_MAX = 400  # 开始行单个参数原始值最多保留的字符数
 _MCP_DONE_ARG_MAX = 60  # 完成行单个参数值最多保留的字符数
 _MCP_DONE_INDENT = "   "  # 完成行整行左缩进，视觉上从属于同 id 的开始行
 _MCP_CALL_PARAMS_MAX = 200  # 在途调用参数缓存上限，防止异常中断的调用无限堆积
 _MCP_CALL_PARAMS = globals().setdefault('_MCP_CALL_PARAMS', {})  # call_id -> 原始参数；跨 reload 保活，旧 wrapper 的完成行仍能取到
+_MCP_PROGRESS_TICK = 0.5  # 有 progressToken 时的进度上报间隔（秒）
+_MCP_PROGRESS_TAIL = 200  # 进度 message 里取实时缓冲尾部多少字节找最后一行
+_MCP_WAIT_START_GRACE = 0.2  # wait>=0 时给执行线程的启动宽限（秒），让 busy/未连接这类秒回错误先暴露
+_MCP_PARTIAL_OUT = 8000  # wait 到期提前返回时，out 取实时缓冲尾部多少字节
+
 
 
 def _mcp_short_arg(value) -> str:
@@ -2819,21 +2927,42 @@ def _mcp_tool(fn):
 
     functools.wraps 保留 __wrapped__/__annotations__，FastMCP 仍能按原签名
     生成 schema；日志发生在调用线程、进入 ai_bridge 之前，所以不受远端耗时影响。
+    同时支持同步与 async 工具：async 版本是新加的 pty_run 需要的（它要在等远端
+    命令期间 await 进度上报，不能把事件循环卡死）。
     """
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
         sig = None
 
+    def _bind(args, kwargs):
+        if sig is None:
+            return dict(kwargs)
+        try:
+            return dict(sig.bind_partial(*args, **kwargs).arguments)
+        except Exception:
+            return dict(kwargs)
+
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def async_wrapper(*args, **kwargs):
+            call_id = _mcp_log_begin(fn.__name__, _bind(args, kwargs))
+            started = time.monotonic()
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception as exc:
+                _mcp_log_end(call_id, fn.__name__,
+                             time.monotonic() - started, exc=exc)
+                raise
+            _mcp_log_end(call_id, fn.__name__,
+                         time.monotonic() - started, result=result)
+            return result
+
+        return async_wrapper
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        params = {}
-        if sig is not None:
-            try:
-                params = dict(sig.bind_partial(*args, **kwargs).arguments)
-            except Exception:
-                params = dict(kwargs)
-        call_id = _mcp_log_begin(fn.__name__, params)
+        call_id = _mcp_log_begin(fn.__name__, _bind(args, kwargs))
         started = time.monotonic()
         try:
             result = fn(*args, **kwargs)
@@ -2844,6 +2973,161 @@ def _mcp_tool(fn):
         return result
 
     return wrapper
+
+
+def _mcp_progress_token(ctx):
+    """本次调用请求里的 ``_meta.progressToken``：有 = 客户端愿收进度通知。
+
+    MCP 客户端能力（initialize.capabilities）里没有 progress 项，进度是**按
+    单次请求**协商的：只有请求带 progressToken，服务端才允许回
+    ``notifications/progress`` 并由 SDK 绑定到该 token；不带 token 时 SDK 的
+    ``report_progress`` 本身就是 no-op，这里直接判空可以连轮询都省掉。
+    """
+    if ctx is None:
+        return None
+    try:
+        meta = ctx.request_context.meta
+    except Exception:  # 没有请求上下文（本地直调）或 SDK 版本字段不同
+        return None
+    if meta is None:
+        return None
+    if isinstance(meta, dict):
+        # mcp 2.x 收进来的是 RequestParamsMeta（TypedDict），SDK 用
+        # RequestParams.model_validate(..., by_name=False) 归一化，线上键
+        # progressToken 落成 progress_token；1.x/裸 dict 则保持原样。
+        for key in ("progressToken", "progress_token"):
+            if key in meta:
+                return meta.get(key)
+        return None
+    return (getattr(meta, "progressToken", None)
+            or getattr(meta, "progress_token", None))
+
+
+def _mcp_last_line(text: str, limit: int = 80) -> str:
+    """进度 message 里附带的最后一行输出：取最后一段非空文本并截断。"""
+    lines = [ln.strip() for ln in (text or "").replace("\r", "\n").split("\n")]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return ""
+    return lines[-1][:limit]
+
+
+def _mcp_partial_result(st, wait) -> dict:
+    """``wait`` 到期但命令未结束时的返回：任何字段都不允许被误读成"跑完了"。
+
+    ``out`` 只是实时缓冲的最新一段，不是完整结果；``rc`` 必然是 None，
+    ``completed/partial/running/wait_exceeded`` 四个标志互相印证，再加
+    一条 ``next_action`` 指明唯一正确的后续动作（pty_tail 轮询到 END 标记）。
+    """
+    st = st or {}
+    out = st.get("tail") or ""
+    # 与完整结果的 _pack_result 对齐：从最后一条 BEGIN 标记行之后取正文，
+    # 否则 tmux 原始回显里的 "echo __AI_BEGIN__; ... __AI_END_...:$__ai_rc"
+    # 会留在 out 开头，容易被误读成"已有结束标记"。
+    idx = out.rfind("__AI_BEGIN_")
+    if idx >= 0:
+        nl = out.find("\n", idx)
+        if nl >= 0:
+            out = out[nl + 1:]
+    out = out.strip("\r\n")
+    return {
+        "ok": False,
+        "completed": False,
+        "partial": True,
+        "running": True,
+        "wait_exceeded": True,
+        "wait_seconds": wait,
+        "rc": None,
+        "out": out,
+        "elapsed": st.get("elapsed"),
+        "total": st.get("total"),
+        "channel": st.get("channel"),
+        "error": ("wait %gs 到期但命令未结束：out 只是不完整片段（%d 字节），"
+                  "rc 未知，命令仍在远端继续执行" % (wait, len(out))),
+        "next_action": ("用 pty_tail(max_bytes=4000) 反复轮询查看最新输出，"
+                        "直到 tail 中出现 __AI_END_<时间戳>__:<rc> 标记才表示命令结束；"
+                        "在此之前再调 pty_run 会返回 busy。"),
+    }
+
+
+def _mcp_run_orphan(fut) -> None:
+    """wait 提前返回后，执行线程还在跑：挂回调消费结果/异常，只落本地日志。
+
+    不消费的话 executor future 的异常会变成 "exception was never retrieved"
+    噪音；消费了还能在日志台看到这条命令最终跑成什么样。
+    """
+    def _done(f):
+        try:
+            res = f.result()
+        except Exception as exc:
+            _emit_local("[MCP] wait 提前返回的任务最终异常: %s: %s\n"
+                        % (type(exc).__name__, str(exc)[:200]))
+            return
+        if isinstance(res, dict):
+            _emit_local(
+                "[MCP] wait 提前返回的任务最终完成 rc=%s timed_out=%s out=%d 字节\n"
+                % (res.get("rc"), res.get("timed_out"),
+                   len(res.get("out") or "")))
+    try:
+        fut.add_done_callback(_done)
+    except Exception:
+        pass
+
+
+async def _mcp_await_run(fut, wait, token, ctx, tail_fn=None):
+    """等执行线程的 future，按 ``wait`` 决定最多等多久。
+
+    返回 ``(result, st)``：``result`` 非 None = 命令已结束（含 ai_bridge
+    自己的 timeout 到达，此时 result 里 ``timed_out=True``）；``result`` 为
+    None = ``wait`` 到期、命令仍在跑，``st`` 是 tail() 快照。
+
+    ``wait < 0``：等到 future 完成（原阻塞行为）；``wait = 0``：立即返回；
+    ``wait > 0``：最多等这么多秒。带 progressToken 时每 0.5s 上报一条进度。
+    """
+    wait = float(wait)
+    tail = tail_fn or ai_bridge.tail
+    loop = asyncio.get_running_loop()
+
+    async def _report():
+        st = tail(_MCP_PROGRESS_TAIL)
+        last = _mcp_last_line(st.get("tail") or "")
+        try:
+            await ctx.report_progress(
+                float(st.get("total") or 0), None,
+                "已运行 %ss，已收 %d 字节%s"
+                % (st.get("elapsed"), st.get("total") or 0,
+                   (": " + last) if last else ""))
+        except Exception:
+            pass  # 客户端断开/不支持时不影响命令本身
+
+    if wait < 0:
+        if token is None:
+            await asyncio.wait([fut])
+            return fut.result(), None
+        while True:
+            await asyncio.wait([fut], timeout=_MCP_PROGRESS_TICK)
+            if fut.done():
+                return fut.result(), None
+            await _report()
+
+    # wait>=0 也留一小段启动宽限：不然 busy / 未连接这类秒回错误会被当成
+    # "已启动并在跑"，白白返回一个空的不完整快照。
+    deadline = loop.time() + max(wait, _MCP_WAIT_START_GRACE)
+    while True:
+        remain = deadline - loop.time()
+        if remain <= 0:
+            break
+        step = min(_MCP_PROGRESS_TICK, remain) if token is not None else remain
+        await asyncio.wait([fut], timeout=step)
+        if fut.done():
+            return fut.result(), None
+        if token is not None:
+            await _report()
+    # 到点边界上刚好完成也算完成，避免把成功结果误报成不完整
+    if fut.done():
+        return fut.result(), None
+    return None, tail(_MCP_PARTIAL_OUT)
+
 
 
 def _mcp_quiet_sdk_logs() -> None:
@@ -2863,7 +3147,8 @@ _MCP_LOOP = globals().setdefault('_MCP_LOOP', None)  # ASGI 专用事件循环�
 _MCP_LOOP_LOCK = globals().setdefault('_MCP_LOOP_LOCK', threading.Lock())  # 循环线程启动互斥锁；reload 重造新锁 + _MCP_LOOP 名字回 None = 判空双起循环线程，锁必须与引用一起跨 reload 保活
 
 _MCP_INSTRUCTIONS = (
-    "远端服务器的常驻交互 PTY。pty_run 跑非交互命令并回收 rc/输出；"
+    "远端服务器的常驻交互 PTY。pty_run 跑非交互命令并回收 rc/输出"
+    "（wait>=0 会提前返回不完整结果，此时 completed=false，用 pty_tail 续看）；"
     "交互提示（密码/y/n）用 pty_send 喂键；pty_status 看会话与 broker "
     "状态；pty_log 看本地诊断日志；画面冻结时 pty_redraw 自愈。"
     "同一 shell 串行执行，重叠调用返回 busy。"
@@ -2920,8 +3205,10 @@ def _mcp_register_tools(server) -> None:
 
     @server.tool()
     @_mcp_tool
-    def pty_run(cmd: str, timeout: float = 60.0, acquire_timeout: float = 2.0,
-                pane: str = "") -> dict:
+    async def pty_run(cmd: str, timeout: float = 60.0,
+                      acquire_timeout: float = 2.0, pane: str = "",
+                      wait: float = -1.0, encoding: str = "",
+                      ctx: _MCP_CTX = None) -> dict:
         """在常驻远程 shell 里跑一条命令，等结束标记并回收输出与退出码。
 
         返回 {"ok", "rc", "out", "timed_out", "pane", "channel", ...}；
@@ -2929,13 +3216,45 @@ def _mcp_register_tools(server) -> None:
         （可加大 acquire_timeout 或稍后重试）。超时只停止回收，远端命令继续
         跑，可用 pty_send 干预或再 pty_run 收尾。
 
+        ``wait``：本次调用最多阻塞多久（秒）。默认 -1 = 一直等到命令结束或
+        ``timeout`` 上限（原行为）；0 = 启动后立即返回；正数 = 最多等这么久。
+        提前返回时**结果一定不完整**，返回里明确标注
+        ``completed=False / partial=True / running=True / wait_exceeded=True``
+        且 ``rc=None``，``out`` 只是最新一段输出；此时按 ``next_action`` 用
+        ``pty_tail`` 轮询到 ``__AI_END_<时间戳>__:<rc>`` 标记为止（这之前再调
+        pty_run 会 busy）。不要把它当成命令失败或已完成。
+
         投递窗口：默认用会话启动时固化的 tmux 窗口（session 内 window_index
         最小的窗口，可用 pty_pane 或 --ai-pane 改）；pane 传 "%2"/"0:2"/窗口名
         可临时改本次目标。tmux 不可用时自动回落为直写本 PTY。
+
+        ``encoding``：留空 = 自动（无控制字符原文直发；有裸换行且会话 shell
+        是 bash/zsh 时用 ``$'...'`` 保持窗口可读；否则 base64）；``dollar``
+        强制 ANSI-C 引用；``base64`` 强制严格编码。选择只看字符构成，与命令
+        长短无关；多行命令在 Windows/未知 shell 上会自动走 base64，窗口里
+        看到的是密文，这是预期行为。
+
+        进度上报：客户端在本次请求里带 ``_meta.progressToken`` 时，命令执行
+        期间每 0.5 秒回一条 notifications/progress，message 带已运行时长、
+        已收字节数和最后一行输出；没带 token 就完全不开轮询（零额外开销）。
+        注意进度只是**中途预览**，完整结果仍以本调用最终返回的 out/rc 为准。
         """
-        return ai_bridge.run(str(cmd), timeout=float(timeout),
-                             acquire_timeout=float(acquire_timeout),
-                             pane=(str(pane) if pane else None))
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(
+            None,
+            functools.partial(
+                ai_bridge.run, str(cmd), timeout=float(timeout),
+                acquire_timeout=float(acquire_timeout),
+                pane=(str(pane) if pane else None),
+                encoding=(str(encoding) if encoding else None)))
+        token = _mcp_progress_token(ctx)
+        result, st = await _mcp_await_run(fut, wait, token, ctx)
+        if result is None:
+            # 调用先返回，后台线程继续跑：挂回调消费结果/异常，避免
+            # "exception was never retrieved" 并且日志台仍能看到最终 rc。
+            _mcp_run_orphan(fut)
+            return _mcp_partial_result(st, float(wait))
+        return result
 
     @server.tool()
     @_mcp_tool
@@ -4217,6 +4536,10 @@ def run_session(transport: MqttTransport, args, rows: int, cols: int) -> int:
                    on_responders=lambda rs: _emit_local(
                        _responders_warning(rs)))
 
+    # 会话启动时把远端登录 shell 记入 AI 桥：多行命令能否用可读的 $'...'
+    # 编码取决于它，探测不到（dash/未知）就由 _pick_encoding 退回 base64。
+    ai_bridge.set_shell(env.get("shell") if env else None)
+
     banner = (
         f"[{stime()}] connected shell={env['shell']} pid={env['pid']} "
         f"({env['rows']}x{env['cols']}, interval={env['flush_interval']})\t"
@@ -4657,9 +4980,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "（百分号前缀，如 2）或 0:2 / 窗口名（RPC 的 pty_pane 可运行时改）")
     p.add_argument(*_cm._cli_opts(*alias_ai_encoding), dest="ai_encoding",
                    default="raw",
-                   help="AI 命令编码：raw = 窗口里直接看到命令原文（默认）；"
-                        "base64 = 严格编码，任意特殊字符不破裂（含裸换行/控制"
-                        "字节时自动切到它）")
+                   help="AI 命令编码：raw = 自动（默认，无控制字符原文直发；有裸"
+                        "换行且 shell 为 bash/zsh 时用 $'...' 保持可读；否则 "
+                        "base64）；dollar = 强制 ANSI-C 引用；base64 = 强制严格"
+                        "编码")
     # SSH 式可选位置参数：连接成功后自动敲进常驻 shell 的前置命令，如
     # ``pty_client_mqtt.py -t q -k *** "tmux at"``；REMAINDER 保证命令自身
     # 的 -x 选项（tmux attach -d）不会被本客户端解析。命令结束后会话继续，

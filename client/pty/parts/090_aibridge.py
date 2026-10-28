@@ -141,6 +141,59 @@ def _build_ai_run_line_raw(cmd: str, begin_tag: str, end_tag: str) -> str:
     )
 
 
+# 支持 ANSI-C 引用 $'...' 的交互 shell（按可执行文件名判断）。dash/POSIX sh
+# 不支持：在 dash 里 $'a\nb' 不会报错，而是退化成字面量，命令会静默跑错，
+# 所以「猜」是绝对不能做的——探测不到一律走 base64。
+_AI_DOLLAR_SHELLS = frozenset(("bash", "zsh", "ksh", "ksh93", "mksh", "ash"))
+
+
+def _shell_basename(path) -> str:
+    """从 shell 路径（/bin/bash、-bash）取可执行文件名，用于能力判断。"""
+    text = str(path or "").strip().replace("\\", "/")
+    return text.rsplit("/", 1)[-1].strip().lower().lstrip("-")
+
+
+def _dollar_quote(cmd: str) -> str:
+    """把任意文本转成 ``$'...'`` 形式：输出里不含任何裸控制字节。
+
+    ``$'...'`` 内部只解析反斜杠序列，``$``/反引号/``!`` 都是字面量。转义
+    规则：反斜杠和单引号各自加倍，换行/制表/回车写成 ``\\n``/``\\t``/
+    ``\\r``，其余 C0 与 DEL 写成 ``\\xHH``。NUL 无法表示，调用方应改用
+    base64。
+    """
+    out = []
+    for ch in str(cmd):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "'":
+            out.append("\\'")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 32 or ord(ch) == 127:
+            out.append("\\x%02x" % ord(ch))
+        else:
+            out.append(ch)
+    return "$'" + "".join(out) + "'"
+
+
+def _build_ai_run_line_dollar(cmd: str, begin_tag: str, end_tag: str) -> str:
+    """构造「多行命令仍可读」的命令行（**不含尾部回车**）。
+
+    ``$'...'`` 由交互 shell（bash/zsh）解析成一个字符串交给 ``sh -c``，所以
+    窗口里看到的是一条带 ``\\n`` 的可读单行，而不是 base64 密文；命令本体
+    不经过任何引号嵌套，特殊字符不会破裂。只对 :data:`_AI_DOLLAR_SHELLS`
+    里的 shell 使用（见 ``AIBridge._pick_encoding``）。
+    """
+    return (
+        "echo %s; sh -c %s; __ai_rc=$?; echo %s:$__ai_rc"
+        % (begin_tag, _dollar_quote(str(cmd)), end_tag)
+    )
+
+
 class AIBridge:
     """把这个常驻 PTY 暴露给 AI / 外部进程调用，命令全程可见。
 
@@ -176,8 +229,11 @@ class AIBridge:
         # _tmux_ok 三态：None=尚未探测；True=可用；False=不可用（回落原生 PTY 投递）
         self._tmux_ok = None
         self._shell = None          # 延迟创建的 RemoteShell（只在 tmux 路径才需要）
-        # AI 命令编码：raw=命令原文直接可见（默认）；base64=旧严格编码兜底
+        # AI 命令编码：raw=命令原文直接可见（默认）；base64=旧严格编码兜底；
+        # dollar=$'...'  ANSI-C 引用（仅会话 shell 支持时才自动启用）
         self._encoding = "raw"
+        # 会话启动时由 set_shell 从服务端登录 shell 推断，用于 $'...' 可用性判断
+        self._shell_name = ""
         # ---- 服务端主动推送（流式）状态 ----
         self._push_topic = None     # 本会话订阅的命令流 topic（首次 push 时创建）
         self._push_runs = {}        # sid -> 该次 run 的收帧回调（网络线程读）
@@ -204,6 +260,7 @@ class AIBridge:
         self._push_topic = None
         self._push_runs = {}
         self._active_pane = None
+        self._shell_name = ""  # 新会话的 shell 可能不同，等 set_shell 重新注入
         with self._live_lock:
             self._live = {"cmd": None, "buf": bytearray(), "start": None,
                           "channel": None}
@@ -218,8 +275,21 @@ class AIBridge:
             self._pane_id = str(pane).strip()
             self._pane_source = "cli"
         enc = str(encoding or "").strip().lower()
-        if enc in ("raw", "base64"):
+        if enc in ("raw", "base64", "dollar"):
             self._encoding = enc
+
+    def set_shell(self, shell) -> None:
+        """会话启动时记录远端登录 shell（pty.open 的 env['shell']）。
+
+        只用于判断 ``$'...'`` 是否可用：bash/zsh/ksh/mksh/ash 支持，dash 与
+        未知一律不猜（含控制字符的命令退回 base64）。在 attach 之后调用，
+        同一实例跨会话重连时由 attach 清空。
+        """
+        self._shell_name = _shell_basename(shell)
+
+    def _dollar_ok(self) -> bool:
+        """当前会话的交互 shell 是否支持 ANSI-C 引用 ``$'...'``。"""
+        return self._shell_name in _AI_DOLLAR_SHELLS
 
     def feed(self, chunk: bytes):
         """PTY 下行分流：主窗口渲染之外，给每个 run() 收集器一份副本。"""
@@ -250,6 +320,10 @@ class AIBridge:
             "ai_pane": self._pane_id,
             "ai_pane_source": self._pane_source or "auto",
             "ai_encoding": self._encoding,
+            # 会话 shell 名（bash/zsh/…）与 $'...' 可用性，便于排查为什么
+            # 多行命令走了 base64 而不是可读的 dollar 模式。
+            "ai_shell": self._shell_name,
+            "ai_dollar_ok": self._dollar_ok(),
             "tmux_ok": self._tmux_ok,
             # 最近一次命令实际走的通道：pty / tmux（轮询）/ tmux+push（推送）
             "ai_channel": self._live["channel"],
@@ -294,8 +368,10 @@ class AIBridge:
 
         参数 ``pane``：目标窗口；``None``/空 = 用固化的默认窗口（连接后首次
         run 解析「index 最小的窗口」并固化），非空 = 本次临时指定，不改默认。
-        参数 ``encoding``：``raw``（默认，命令原文可见）或 ``base64``（严格
-        编码，任意特殊字符不破裂；含裸换行/控制字节时自动降级到它）。
+        参数 ``encoding``：``raw``（默认自动：无控制字节原文直发；有裸换行且
+        会话 shell 为 bash/zsh 时用 ``$'...'`` 保持可读；否则 base64）、
+        ``dollar``（强制 ANSI-C 引用）、``base64``（强制严格编码）。
+        选择只看字符构成，与命令长度无关。
         参数 ``stream``：``auto``（默认，按上面的三级回落）或 ``off``（强制
         走轮询通道，便于对比/排障）。
         参数 ``on_output``：可选回调 ``fn(chunk: bytes)``，命令执行过程中**边
@@ -727,19 +803,38 @@ class AIBridge:
         return self._pane_id
 
     def _pick_encoding(self, cmd, encoding) -> str:
+        """选本次命令的编码：raw / dollar / base64。
+
+        - ``raw``（默认）：命令**没有**控制字节就原样直发（窗口可见）；
+          有裸换行/控制字节时：会话 shell 属于 :data:`_AI_DOLLAR_SHELLS`
+          才转 ``$'...'``（窗口仍可读），否则退回 base64。dash 里 ``$'...'``
+          会静默变成字面量，所以**绝不猜**。
+        - ``dollar``：显式要求 ANSI-C 引用；NUL 无法表示，只能退 base64。
+        - ``base64``：强制严格编码。
+
+        选择只看字符构成，与命令长度无关（长度受 pty 单行上限影响，见
+        ``_build_ai_run_line_raw`` 的已知边界）。
+        """
+        text = str(cmd)
         enc = str(encoding or self._encoding or "raw").strip().lower()
-        if enc not in ("raw", "base64"):
+        if enc not in ("raw", "base64", "dollar"):
             enc = "raw"
-        if enc == "raw" and any(ord(ch) < 32 for ch in str(cmd)):
-            # 裸换行/控制字节在交互 shell 里会被当成回车或 Ctrl-C，raw 模式
-            # 必然把一条命令拆成多行提交；这类命令自动降级到 base64。
+        if enc == "dollar":
+            return "base64" if "\x00" in text else "dollar"
+        if enc == "base64":
             return "base64"
-        return enc
+        if not any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+            return "raw"  # 没有需要转义的字符：保持原文可见，别做无谓编码
+        if "\x00" in text:
+            return "base64"
+        return "dollar" if self._dollar_ok() else "base64"
 
     @staticmethod
     def _build_line(cmd, begin, end, enc) -> str:
         if enc == "base64":
             return _build_ai_run_line_b64(cmd, begin, end)
+        if enc == "dollar":
+            return _build_ai_run_line_dollar(cmd, begin, end)
         return _build_ai_run_line_raw(cmd, begin, end)
 
     @staticmethod

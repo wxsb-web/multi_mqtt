@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """pty_client_mqtt / RemotePty / _PTY_START_TEMPLATE 的详细测试。
 
@@ -21,6 +21,7 @@
 运行：
     cd multi_mqtt && python -m unittest tests.test_pty_mqtt -v
 """
+import asyncio
 import base64
 import io
 import json
@@ -2463,6 +2464,173 @@ class LogConsoleEndToEndTests(unittest.TestCase):
             text = resp.read().decode("utf-8", "replace")
             self.assertIn("e2e-stdout-marker-91", text)
             self.assertIn("e2e-logging-marker-92", text)
+
+
+class McpProgressTokenTests(unittest.TestCase):
+    """MCP 进度是**按请求**协商的：只有 _meta.progressToken 存在才上报。"""
+
+    def test_no_ctx_means_no_progress(self):
+        self.assertIsNone(pcm._mcp_progress_token(None))
+
+    def test_dict_meta_token(self):
+        class Ctx:
+            class request_context:
+                meta = {"progressToken": "tok-abc"}
+
+        class CtxSnake:
+            class request_context:
+                # mcp 2.x 真实运行时就是这个形态：SDK 把 progressToken
+                # 归一化成 progress_token，只查驼峰会永远判无进度。
+                meta = {"progress_token": "tok-snake"}
+
+        class CtxIntToken:
+            class request_context:
+                meta = {"progress_token": 0}
+
+        self.assertEqual(pcm._mcp_progress_token(Ctx()), "tok-abc")
+        self.assertEqual(pcm._mcp_progress_token(CtxSnake()), "tok-snake")
+        # token 允许 int，0 是合法值，不能被 or 短路吞掉
+        self.assertEqual(pcm._mcp_progress_token(CtxIntToken()), 0)
+
+    def test_object_meta_token_and_missing(self):
+        class Meta:
+            progressToken = "tok-obj"
+
+        class Ctx:
+            request_context = type("RC", (), {"meta": Meta()})()
+
+        class CtxNoToken:
+            request_context = type("RC", (), {"meta": None})()
+
+        class CtxNoRequest:
+            @property
+            def request_context(self):
+                raise ValueError("Context is not available outside of a request")
+
+        self.assertEqual(pcm._mcp_progress_token(Ctx()), "tok-obj")
+        self.assertIsNone(pcm._mcp_progress_token(CtxNoToken()))
+        self.assertIsNone(pcm._mcp_progress_token(CtxNoRequest()))
+
+    def test_last_line_keeps_tail(self):
+        self.assertEqual(pcm._mcp_last_line("a\nT3\r\n"), "T3")
+        self.assertEqual(pcm._mcp_last_line(""), "")
+
+
+class DollarEncodingTests(unittest.TestCase):
+    """多行命令的可读编码：raw / $'...' / base64 的选择与转义。"""
+
+    def test_dollar_quote_escapes(self):
+        self.assertEqual(pcm._dollar_quote("a\nb"), "$'a\\nb'")
+        self.assertEqual(pcm._dollar_quote("a\tb"), "$'a\\tb'")
+        self.assertEqual(pcm._dollar_quote("it's"), "$'it\\'s'")
+        self.assertEqual(pcm._dollar_quote("a\\b"), "$'a\\\\b'")
+        self.assertEqual(pcm._dollar_quote("\x01"), "$'\\x01'")
+        # 产出的必须是单行，不能带任何裸控制字节
+        quoted = pcm._dollar_quote("a\nb\tc\r\x01")
+        self.assertNotIn("\n", quoted)
+        self.assertNotIn("\t", quoted)
+        self.assertNotIn("\r", quoted)
+
+    def test_pick_encoding_matrix(self):
+        br = pcm.AIBridge()
+        # 没有需要转义的字符：保持原文（与 shell 无关）
+        self.assertEqual(br._pick_encoding("echo hi", None), "raw")
+        # 有换行 + bash 家族 → dollar；dash/未知 → base64（绝不猜）
+        br.set_shell("/bin/bash")
+        self.assertEqual(br._pick_encoding("a\nb", None), "dollar")
+        self.assertEqual(br._pick_encoding("a\x01b", None), "dollar")
+        br.set_shell("/bin/dash")
+        self.assertEqual(br._pick_encoding("a\nb", None), "base64")
+        br.set_shell("")
+        self.assertEqual(br._pick_encoding("a\nb", None), "base64")
+        # 显式模式：dollar 强制生效，但 NUL 无法表示 → base64
+        self.assertEqual(br._pick_encoding("a\nb", "dollar"), "dollar")
+        self.assertEqual(br._pick_encoding("a\x00b", "dollar"), "base64")
+        self.assertEqual(br._pick_encoding("echo hi", "base64"), "base64")
+        br.set_shell("/usr/bin/zsh")
+        self.assertEqual(br._pick_encoding("a\nb", None), "dollar")
+
+    def test_build_line_dollar_is_single_readable_line(self):
+        line = pcm.AIBridge._build_line("echo 1\necho 2", "__B__", "__E__",
+                                        "dollar")
+        self.assertIn("$'echo 1\\necho 2'", line)
+        self.assertNotIn("\n", line)
+        self.assertTrue(line.startswith("echo __B__; sh -c $'"))
+
+    def test_shell_basename(self):
+        self.assertEqual(pcm._shell_basename("/bin/bash"), "bash")
+        self.assertEqual(pcm._shell_basename("-bash"), "bash")
+        self.assertEqual(pcm._shell_basename(""), "")
+
+
+class McpWaitTests(unittest.IsolatedAsyncioTestCase):
+    """pty_run(wait=...) 提前返回时必须让 AI 一眼看出"没跑完、结果不完整"。"""
+
+    def test_partial_result_flags(self):
+        st = {"tail": "T1\nT2", "elapsed": 3.1, "total": 7, "channel": "tmux+push"}
+        res = pcm._mcp_partial_result(st, 3.0)
+        self.assertIs(res["ok"], False)
+        self.assertIs(res["completed"], False)
+        self.assertIs(res["partial"], True)
+        self.assertIs(res["running"], True)
+        self.assertIs(res["wait_exceeded"], True)
+        self.assertIsNone(res["rc"])
+        self.assertEqual(res["out"], "T1\nT2")
+        self.assertEqual(res["wait_seconds"], 3.0)
+        self.assertIn("不完整", res["error"])
+        self.assertIn("pty_tail", res["next_action"])
+
+    def test_partial_result_trims_command_echo(self):
+        # tmux raw 回显里带字面量 END 标记，正文必须从 BEGIN 行之后开始
+        st = {"tail": "echo __AI_BEGIN_20261028_074840_930__; sh -c 'x'; "
+                      "echo __AI_END_20261028_074840_930__:$__ai_rc\n"
+                      "__AI_BEGIN_20261028_074840_930__\nT1\nT2\n",
+              "total": 100}
+        res = pcm._mcp_partial_result(st, 3.0)
+        self.assertEqual(res["out"], "T1\nT2")
+        self.assertNotIn("$__ai_rc", res["out"])
+
+    async def test_wait_zero_returns_running_snapshot(self):
+        fut = asyncio.get_running_loop().create_future()  # 永不完成，模拟长命令
+        st = {"tail": "TICK1", "elapsed": 0.1, "total": 6, "channel": "tmux+push"}
+        started = time.monotonic()
+        result, snap = await pcm._mcp_await_run(
+            fut, 0, None, None, tail_fn=lambda n: dict(st))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(result)
+        self.assertEqual(snap["tail"], "TICK1")
+        partial = pcm._mcp_partial_result(snap, 0)
+        self.assertIs(partial["completed"], False)
+
+    async def test_wait_positive_returns_result_when_finished(self):
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result({"ok": True, "rc": 0, "out": "done"})
+        result, snap = await pcm._mcp_await_run(
+            fut, 3, None, None, tail_fn=lambda n: {"tail": ""})
+        self.assertEqual(result, {"ok": True, "rc": 0, "out": "done"})
+        self.assertIsNone(snap)
+
+    async def test_default_wait_blocks_until_done(self):
+        fut = asyncio.get_running_loop().create_future()
+        fut.set_result({"ok": True, "rc": 1, "out": "boom"})
+        result, snap = await pcm._mcp_await_run(
+            fut, -1, None, None, tail_fn=lambda n: {"tail": ""})
+        self.assertEqual(result["rc"], 1)
+        self.assertIsNone(snap)
+
+    async def test_progress_reported_while_waiting(self):
+        fut = asyncio.get_running_loop().create_future()  # 永不完成
+        calls = []
+
+        class Ctx:
+            async def report_progress(self, progress, total=None, message=None):
+                calls.append((progress, total, message))
+
+        await pcm._mcp_await_run(
+            fut, 0, "tok-1", Ctx(),
+            tail_fn=lambda n: {"tail": "T1", "elapsed": 0.5, "total": 202})
+        self.assertGreaterEqual(len(calls), 1)
+        self.assertIn("T1", calls[0][2])
 
 
 if __name__ == "__main__":
