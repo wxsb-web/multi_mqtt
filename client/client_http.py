@@ -71,6 +71,9 @@ def rpc_set_file(local_file, remote_file=None, base='http://localhost:1144/',
         f"__p = {remote_file!r}",
         f"__expect_sha = {sha!r}",
         "try:",
+        # 相对路径按远端进程 cwd 展开，~ 也展开：返回的是真正落盘的全路径，
+        # 而不是调用方传进来的 'apk.html' 这种相对名
+        "    __p = os.path.abspath(os.path.expanduser(__p))",
         "    __d = os.path.dirname(__p)",
         "    if __d: os.makedirs(__d, exist_ok=True)",
         "    __f = open(__p, 'wb'); __f.write(__b); __f.close()",
