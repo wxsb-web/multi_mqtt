@@ -24,7 +24,7 @@ def _wsgi_environ(method, path):
     }
 
 
-def _call_wsgi(code):
+def _call_wsgi_path(path, method="GET"):
     """驱动一次 WSGI 请求，返回 (status_line, headers_dict, body_bytes)。"""
     captured = {}
 
@@ -33,9 +33,14 @@ def _call_wsgi(code):
         captured["headers"] = headers
 
     body = server_http_wsgi.application(
-        _wsgi_environ("GET", "/" + code), start_response)
+        _wsgi_environ(method, path), start_response)
     out = b"".join(body)
     return captured["status"], dict(captured["headers"]), out
+
+
+def _call_wsgi(code):
+    """按线上 URL 形态 /<key><code> 驱动一次 WSGI 请求。"""
+    return _call_wsgi_path("/" + server_http_wsgi.RPC_KEY + code)
 
 
 class WsgiApplicationTests(unittest.TestCase):
@@ -66,6 +71,18 @@ class WsgiApplicationTests(unittest.TestCase):
         status, _headers, out = _call_wsgi("r='你好'")
         self.assertTrue(status.startswith("200"), status)
         self.assertEqual(out, "你好".encode("utf-8"))
+
+    def test_path_without_key_prefix_is_forbidden(self):
+        status, _headers, out = _call_wsgi_path("/r=1")
+        self.assertTrue(status.startswith("403"), status)
+        self.assertIn(b"Forbidden", out)
+
+    def test_registered_alias_works_without_key_prefix(self):
+        # alias_url='raw'：线上 /add 免 key 前缀，等价 /-r=1+1
+        _call_wsgi("#alias add\nr=1+1")
+        status, _headers, out = _call_wsgi_path("/add")
+        self.assertTrue(status.startswith("200"), status)
+        self.assertEqual(out, b"2")
 
     def test_non_get_post_method_rejected(self):
         captured = {}

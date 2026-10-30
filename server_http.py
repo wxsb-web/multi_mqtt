@@ -228,8 +228,33 @@ def _conf(handler, name):
     return getattr(RPCRequestHandler, name)
 
 
+def _is_alias_url(handler, raw_path):
+    """alias_url='raw' 时，判断路径（去掉前导 /）是否正好是已注册别名。
+
+    只认执行器里真实存在的别名名（别名名必须是合法 Python 标识符），
+    因此不会把任意路径放进执行器；执行器 alias 总开关关闭时也不放行。
+    'keyed'（默认）不启用本分支：别名只能写在 /<key><code> 里，由执行器
+    自己对整段代码做别名展开——本仓库不改执行器，这里只是 HTTP URL 细节。
+    """
+    if _conf(handler, 'alias_url') != 'raw':
+        return False
+    executor = _conf(handler, 'executor')
+    if executor is None or not getattr(executor, 'alias', False):
+        return False
+    aliases = getattr(executor, 'aliases', None)
+    if not isinstance(aliases, dict) or not raw_path.startswith('/'):
+        return False
+    candidate = raw_path[1:]
+    if not getattr(handler, 'path_already_decoded', False):
+        candidate = urllib.parse.unquote(candidate)
+    return candidate in aliases
+
+
 class RPCRequestHandler(BaseHTTPRequestHandler):
     key = ''
+    # 别名 URL 的匹配对象：'keyed' 只认 key 处理后的代码，'raw' 额外允许
+    # 已注册别名名直接作 URL（/<别名>，不带 key 前缀）。见 _is_alias_url。
+    alias_url = 'keyed'
     # HTTP Basic 认证凭据 'user:password'；空串不启用认证
     basic_auth = ''
     # 复用一个持久化的执行器实例；请求级上下文通过 execute(globals=...) 注入。
@@ -412,11 +437,24 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             raw_path = self.path
             key = _conf(self, 'key')
             if key:
-                prefix = key + '/'
-                if not raw_path.startswith(prefix):
+                # key 是真正的 URL 前缀：代码紧跟在根斜杠之后，例如
+                # key='-' 时 /-r=1+1 执行 r=1+1。旧实现拼 key + '/'，而
+                # self.path 必以 '/' 开头，只有 key 自带前导斜杠才可能命中，
+                # 实际上把带 key 的请求全部 403 了；这里同时保留
+                # /<key>/<code>，已有地址不必改写。
+                prefixed = '/' + key
+                legacy_prefix = prefixed + '/'
+                if raw_path.startswith(legacy_prefix):
+                    code_str = raw_path[len(legacy_prefix):]
+                elif raw_path.startswith(prefixed):
+                    code_str = raw_path[len(prefixed):]
+                elif _is_alias_url(self, raw_path):
+                    # alias_url='raw'：已注册的别名名可直接作 URL（/add），
+                    # 不必带 key 前缀。未注册路径仍 403，只对别名这一层放开。
+                    code_str = raw_path[1:]
+                else:
                     self.send_error(403, "Forbidden")
                     return
-                code_str = raw_path[len(prefix):]
             else:
                 if raw_path.startswith('/'):
                     raw_path = raw_path[1:]
@@ -569,9 +607,23 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
 def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None, daemon=True,
                      favicon_rgb=None, favicon_size=16, websocket_handler=None,
                      websocket_path='/ws', redirect_root=None, websocket_handlers=None,
-                     main_loop=None, listen=True, log_sink=None, basic_auth=''):
+                     main_loop=None, listen=True, log_sink=None, basic_auth='',
+                     alias_url='keyed'):
     if not key:
         key = ''
+    else:
+        # key 是路径里的字面前缀，统一去掉首尾斜杠：/<key><code> 与
+        # /<key>/<code> 由 handle_rpc 两种都认，key 写成 '/-' 或 '-/' 同义。
+        key = str(key).strip('/')
+    # 别名 URL 匹配对象。'keyed' 保持旧行为（别名必须写在 key 之后的代码里）；
+    # 'raw' 额外允许已注册别名名直接作 URL，如 key='-' 时 /add 等价 /-r=1+1。
+    alias_url = str(alias_url or 'keyed').strip().lower()
+    if alias_url in ('key', 'keyed', 'key-prefix', 'after-key'):
+        alias_url = 'keyed'
+    elif alias_url in ('raw', 'url', 'original', 'before-key'):
+        alias_url = 'raw'
+    else:
+        raise ValueError(f"alias_url 只支持 'keyed' 或 'raw'，收到 {alias_url!r}")
     # basic_auth 接受 'user:password' 或 (user, password)，统一成前者；空则不启用认证
     if isinstance(basic_auth, (tuple, list)):
         basic_auth = ':'.join(str(item) for item in basic_auth)
@@ -598,6 +650,7 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     # favicon / basic_auth 等整体抢走，且旧命名空间与别名静默蒸发。
     config = {
         'key': key,
+        'alias_url': alias_url,
         'basic_auth': basic_auth or '',
         # 每服务器一个 PythonExecutor；不在这里强写 __name__：执行器内部
         # 用 setdefault，模块字典自带 __name__ 不会被覆盖；自建空字典时
@@ -717,5 +770,23 @@ def qpsu(url="http://192.168.1.100/D%3A/test/qpsu.zip", write_to=''):
     return py, U, T, N, F
     
 if __name__ == '__main__':
-    start_rpc_server(port=1144, key='', globals=globals(), locals=locals())
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='启动 URL 即代码的 HTTP RPC 服务器',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # 同时接受 --key 与仓库里常见的 -key / -k 写法；key 值本身可以就是
+    # '-'（argparse 把单独的 '-' 当值而非选项），此时 URL 为 /-<code>。
+    parser.add_argument('--port', '-port', '-p', type=int, default=1144)
+    parser.add_argument('--ip', '--host', '-host', default='0.0.0.0')
+    parser.add_argument('--key', '-key', '-k', default='',
+                        help="URL 前缀，如 - 时 URL 为 /-<code>")
+    parser.add_argument('--alias-url', '-alias-url', dest='alias_url',
+                        choices=('keyed', 'raw'), default='keyed',
+                        help="raw 时已注册别名可直接作 URL（/<别名>），"
+                             "keyed 时别名必须写在 /<key><code> 里")
+    args = parser.parse_args()
+    start_rpc_server(port=args.port, ip=args.ip, key=args.key,
+                     alias_url=args.alias_url, globals=globals(), locals=locals())
     input("Press Ctrl+C or anykey to stop\n")

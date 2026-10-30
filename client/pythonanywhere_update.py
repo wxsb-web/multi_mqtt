@@ -4,9 +4,15 @@
 用法:
     python pythonanywhere_update.py                              # 默认同步到 .pythonanywhere.com
     python pythonanywhere_update.py https://ip:port/  /other/dir # 自定义 base 与远程目录
+    python pythonanywhere_update.py --key -                      # 线上已启用 key='-'，URL 形如 /-<code>
     python pythonanywhere_update.py --check                      # 只对比不上传
-    
-.pythonanywhere.com/r=RPCRequestHandler.executor.alias 查询是否alias
+
+地址形态（server_http 的 key，本脚本用 --key 传入）:
+    无 key:   https://<host>/1+1
+    key='-':  https://<host>/-1+1；已注册别名还可走 https://<host>/add
+    上传发生在重载之前，线上可能还是旧 key（典型是首次推 '-' 时线上仍为
+    空 key），所以脚本会先探测线上实际生效的 key，再决定同步用哪种 URL；
+    SIGHUP 之后则改用 --key 指定的新 key 轮询与验证。
 
 流程（全部走 HTTP RPC 通道，复用 client/client_http.py）:
     1. 收集本地源码文件（按扩展名/黑名单过滤，跳过 .git、__pycache__、*.db 等）
@@ -80,10 +86,11 @@ def collect_local(local_root):
     return files
 
 
-def sync_files(base, local_root, remote_dir, timeout, check_only=False):
+def sync_files(base, local_root, remote_dir, timeout, check_only=False, key=''):
     """对比并上传差异文件，返回 (已上传列表, 跳过列表, 失败列表)。"""
     local_files = collect_local(local_root)
-    remote_files = _rpc_list_dir(base, remote_dir, proxies=PROXIES, timeout=timeout)
+    remote_files = _rpc_list_dir(base, remote_dir, proxies=PROXIES,
+                                 timeout=timeout, key=key)
 
     to_upload, unchanged, failed = [], [], []
     for rel in sorted(local_files):
@@ -92,7 +99,8 @@ def sync_files(base, local_root, remote_dir, timeout, check_only=False):
         if rel in remote_files:
             if remote_files[rel] == size:
                 rsha = _rpc_sha256_remote(base, remote_path,
-                                          proxies=PROXIES, timeout=timeout)
+                                          proxies=PROXIES, timeout=timeout,
+                                          key=key)
                 if rsha == sha:
                     unchanged.append(rel)
                     continue
@@ -111,7 +119,7 @@ def sync_files(base, local_root, remote_dir, timeout, check_only=False):
             _upload_one_file(base, abs_p, remote_path, size,
                              chunk_size=1024 * 1024, show_speed=0,
                              speed_threshold=1024 * 1024, proxies=PROXIES,
-                             timeout=timeout, verify_file=1)
+                             timeout=timeout, verify_file=1, key=key)
             print(f"  [{i}/{len(to_upload)}] done: {rel}")
         except Exception as e:
             print(f"  [{i}/{len(to_upload)}] FAILED: {rel}: {e}")
@@ -119,7 +127,28 @@ def sync_files(base, local_root, remote_dir, timeout, check_only=False):
     return [r for r, _a, _s, _p in to_upload], unchanged, failed
 
 
-def syntax_check(base, remote_dir, timeout):
+def _probe_key(base, timeout, key):
+    """探测线上当前真正生效的 URL 前缀，返回 '' 或 key。
+
+    同步发生在重载之前：首次把 key 推上线时线上还是旧的无前缀地址，之后
+    再跑线上已是新 key。两种状态都要能上传，所以按线上实际响应探测而不是
+    写死。探测只发 1+1 这个无副作用表达式：走错形态只会拿到 403 或语法
+    错误（-1+1），不会产生任何副作用。
+    """
+    for candidate in ([key, ''] if key else ['']):
+        try:
+            resp = _rpc_call(base, '1+1', proxies=PROXIES, timeout=timeout,
+                             key=candidate)
+        except Exception:
+            continue
+        if resp.status_code == 200 and resp.text.strip() == '2':
+            return candidate
+    raise RuntimeError(
+        f"无法探测线上 key（{base}）：试过 {[key, ''] if key else ['']} 都失败；"
+        "线上已启用 key 时请用 --key 指定，例如 --key -")
+
+
+def syntax_check(base, remote_dir, timeout, key=''):
     """远程 py_compile 全量检查上传后的 .py，坏文件直接抛错不进入重载。"""
     code = (
         "import py_compile\n"
@@ -140,14 +169,18 @@ def syntax_check(base, remote_dir, timeout):
         "__result = __bad\n"
     )
     from client_http import _server_code
-    bad = _rpc_json(base, _server_code(code), proxies=PROXIES, timeout=timeout)
+    bad = _rpc_json(base, _server_code(code), proxies=PROXIES, timeout=timeout,
+                    key=key)
     if bad:
         raise RuntimeError(f"remote py_compile failed: {bad}")
     print("[check] remote py_compile all OK")
 
 
-def activate(base, timeout):
+def activate(base, timeout, live_key='', post_key=''):
     """向 uWSGI master 发 SIGHUP 触发整站优雅重载（等价控制台 Reload 按钮）。
+
+    live_key: 重载前线上生效的 key（发 SIGHUP 的请求本身还走旧地址）；
+    post_key: 重载后新代码的 key（轮询恢复必须用新地址，否则会一直 403/500）。
 
     pythonanywhere 的 worker 由 master fork：杀 worker 只会 fork 出继承旧
     模块的副本，磁盘新代码不会生效；必须重载 master。master 即容器 pid 1，
@@ -165,15 +198,19 @@ def activate(base, timeout):
     from client_http import _server_code
     try:
         print("[reload]", _rpc_json(base, _server_code(code),
-                                    proxies=PROXIES, timeout=timeout))
+                                    proxies=PROXIES, timeout=timeout,
+                                    key=live_key))
     except Exception as e:
         # master 重载会切断在途请求，连接中断属预期
         print(f"[reload] reload 请求中断（预期）: {type(e).__name__}")
     for i in range(60):
         time.sleep(2)
         try:
-            resp = _rpc_call(base, "1", proxies=PROXIES, timeout=15)
-            if resp.status_code == 200:
+            # 新代码可能换过 key，必须按新地址探测；'1+1' 而不是 '1'，
+            # 这样 key='-' 时 /-1+1 才执行 1+1 而不是把 -1 当表达式。
+            resp = _rpc_call(base, "1+1", proxies=PROXIES, timeout=15,
+                             key=post_key)
+            if resp.status_code == 200 and resp.text.strip() == "2":
                 print(f"[reload] web app back after {(i + 1) * 2}s")
                 return
         except Exception:
@@ -181,10 +218,10 @@ def activate(base, timeout):
     raise RuntimeError("reload 后 120s 内未恢复；请到 pythonanywhere 控制台手动点 Reload")
 
 
-def verify(base, timeout):
+def verify(base, timeout, key=''):
     """验证新代码在线上生效: r 回退 / 关键字 list / alias 全链路。"""
     def get(code):
-        resp = _rpc_call(base, code, proxies=PROXIES, timeout=timeout)
+        resp = _rpc_call(base, code, proxies=PROXIES, timeout=timeout, key=key)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
         return resp.text.strip()
@@ -217,18 +254,36 @@ def verify(base, timeout):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('-')]
-    check_only = '--check' in sys.argv
-    force_reload = '--force-reload' in sys.argv
-    base = args[0] if len(args) > 0 else DEFAULT_BASE
-    remote_dir = args[1] if len(args) > 1 else DEFAULT_REMOTE_DIR
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='同步本地 multi_mqtt 到 pythonanywhere 并通过 SIGHUP 热重载',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument('base', nargs='?', default=DEFAULT_BASE,
+                        help='站点根地址，如 https://suishou.pythonanywhere.com/')
+    parser.add_argument('remote_dir', nargs='?', default=DEFAULT_REMOTE_DIR,
+                        help='远程项目目录')
+    parser.add_argument('--key', '-key', '-k', default='',
+                        help="线上 URL 前缀（server_http 的 key），如 -")
+    parser.add_argument('--check', action='store_true', help='只对比不上传')
+    parser.add_argument('--force-reload', action='store_true',
+                        help='即使根目录 .py 无变化也强制重载')
+    args = parser.parse_args()
+    base, remote_dir = args.base, args.remote_dir
+    new_key = args.key
+    check_only = args.check
+    force_reload = args.force_reload
     local_root = _HERE
     timeout = 60
 
     print(f"{__file__} {local_root} -> {base}  remote_dir={remote_dir}"
-          f"{'  CHECK-ONLY' if check_only else ''}")
+          f"  key={new_key!r}{'  CHECK-ONLY' if check_only else ''}")
+    # 扫清 1+1 这类无副作用请求，判断线上此刻认哪种地址
+    live_key = _probe_key(base, timeout, new_key)
+    print(f"[sync] live key={live_key!r}  (上传后新 key={new_key!r})")
     uploaded, unchanged, failed = sync_files(base, local_root, remote_dir,
-                                             timeout, check_only=check_only)
+                                             timeout, check_only=check_only,
+                                             key=live_key)
     if check_only:
         return
     if failed:
@@ -237,7 +292,7 @@ def main():
     # 清理本脚本此前版本可能留下的探测文件
     try:
         _rpc_delete_file(base, remote_dir.rstrip('/') + '/.upload_test',
-                         proxies=PROXIES, timeout=timeout)
+                         proxies=PROXIES, timeout=timeout, key=live_key)
     except Exception:
         pass
 
@@ -247,14 +302,14 @@ def main():
         u.endswith('.py') and '/' not in u for u in uploaded)
     if not root_py_changed:
         print("[reload] 运行时代码无变化，跳过 worker 重启")
-        verify(base, timeout)
+        verify(base, timeout, key=live_key)
         print(f"{__file__} done")
         return
 
-    syntax_check(base, remote_dir, timeout)
-    activate(base, timeout)
+    syntax_check(base, remote_dir, timeout, key=live_key)
+    activate(base, timeout, live_key=live_key, post_key=new_key)
     time.sleep(1)
-    verify(base, timeout)
+    verify(base, timeout, key=new_key)
     print(f"{__file__} done (uWSGI master reloaded)")
 
 

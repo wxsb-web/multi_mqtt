@@ -44,6 +44,8 @@ def rpc_set_file(local_file, remote_file=None, base='http://localhost:1144/',
                  proxy=0, print_req=1, verify_file=1, timeout=9, debug=0, **ka):
     print_req = get_duplicated_kargs(ka, 'print_req', 'pr', 'p', default=print_req)
     proxy = get_duplicated_kargs(ka, 'proxy', 'proxies', 'x', default=proxy)
+    # 服务端 URL 前缀（server_http 的 key，如 '-'），URL 形如 {base}/-{code}
+    key = ka.pop('key', '')
 
     import os, hashlib, urllib.parse, requests
 
@@ -87,7 +89,7 @@ def rpc_set_file(local_file, remote_file=None, base='http://localhost:1144/',
         "    r = traceback.format_exc()",
     ]
     code = "\n".join(lines)
-    url = base.rstrip('/') + '/' + urllib.parse.quote(code, safe='')
+    url = base.rstrip('/') + '/' + urllib.parse.quote(str(key) + code, safe='')
 
     if proxy == 0:
         proxies = {'http': None, 'https': None}
@@ -122,10 +124,16 @@ _REQ_KEYS = {'params', 'headers', 'cookies', 'auth', 'allow_redirects',
              'hooks', 'stream', 'cert', 'json'}
 
 
-def _rpc_call(base, code, body=b'', proxies=None, timeout=9, debug=0, **ka):
+def _rpc_call(base, code, body=b'', proxies=None, timeout=9, debug=0,
+              key='', **ka):
+    """POST 代码到 RPC 服务端。
+
+    key: 服务端 URL 前缀（server_http 的 key，如 '-'）；空串表示无前缀。
+         传入后 URL 形如 {base}/-{code}，也就是 server_http 的 /<key><code>。
+    """
     import urllib.parse, requests
     ka = {k: v for k, v in ka.items() if k in _REQ_KEYS}
-    url = base.rstrip('/') + '/' + urllib.parse.quote(code, safe='')
+    url = base.rstrip('/') + '/' + urllib.parse.quote(str(key) + code, safe='')
     resp = requests.request('POST', url, data=body, files=None,
                             proxies=proxies or {}, verify=False,
                             timeout=timeout, **ka)
