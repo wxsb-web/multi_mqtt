@@ -260,8 +260,9 @@ class MQTTClientNode:
         # 连接的 broker，启动瞬间往往只有 1 个 broker 在线，之后几秒内其余
         # broker 才陆续连上——它们永远收不到首发请求，首包只能赌首发那条
         # 路径的当下延迟。按同一 req_id 补发是安全的：服务端 dedup_cache
-        # （30s TTL）丢弃重复副本，幂等请求（如 PTY 握手同 sid）还另有会话
-        # 注册表兜底；首包一到立即停发，健康链路下零额外开销。
+        # 的 TTL 覆盖整个重放窗口（默认 150s）并丢弃重复副本，幂等请求
+        # （如 PTY 握手同 sid）还另有会话注册表兜底；首包一到立即停发，
+        # 健康链路下零额外开销。
         repub_at = sorted(float(x) for x in (republish_delays or ()) if x > 0)
         repub_i = 0
         is_success = False

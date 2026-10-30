@@ -167,7 +167,7 @@ def process_cipher(data, decrypt=False, enabled=False, key=AES_KEY):
 
 class TTLCache:
     """轻量级内存去重缓存（[修复-容量上限] 新增 max_size，超限按 FIFO 淘汰）"""
-    # [修复] 默认 max_size=50000。原先无上限：30 秒 TTL 内的瞬时峰值可能被恶意
+    # [修复] 默认 max_size=50000。原先无上限：TTL 窗口内的瞬时峰值可能被恶意
     # 灌入海量不同 req_id（即使每条只有 512 字节上限），连发百万级也能顶爆内存。
     # 加上限后，超过时按 OrderedDict 插入顺序淘汰最老条目，保证内存有界。
     def __init__(self, ttl_seconds=30, max_size=50000):
@@ -923,11 +923,20 @@ class MultiMQTTManager:
             lock=self.lock,
         )
         # ------------------
-        self.dedup_cache = TTLCache(ttl_seconds=30, max_size=50000)
         # [重放窗口] 已验签消息的 timestamp 允许与本机时钟的最大偏差（秒）。
         # <=0 表示关闭校验（兼容调试/手动调时场景）。仅对"配置了公钥且验签
         # 通过"的消息生效，见 _on_message。
         self.timestamp_window = float(timestamp_window)
+        # [去重 TTL 覆盖重放窗口] 多 broker 广播必然产生重复副本，公网实测迟到
+        # 副本可达 86~230s（2026-10-30 broker.mqtt.cool 同一帧迟到 173s）。
+        # TTL 若固定 30s，落在 30s~window 之间的迟到副本会先躲过去重、又满足
+        # timestamp 新鲜度检查，导致同一 code 被二次执行；TTL 必须覆盖"窗口内
+        # 仍会被接受"的全部时间，再加 30s 余量。超窗副本仍由 _on_message 的
+        # timestamp 检查明确拒收（保留不静默的诊断语义）。
+        dedup_ttl = 30.0
+        if self.timestamp_window > 0:
+            dedup_ttl = max(dedup_ttl, self.timestamp_window + 30.0)
+        self.dedup_cache = TTLCache(ttl_seconds=dedup_ttl, max_size=50000)
         self.message_callback = None
         self.subscribed_topics = set()
         self._stop_event = threading.Event()
@@ -1425,11 +1434,14 @@ class MultiMQTTManager:
                         return
                     # [重放窗口] 验签只证明"签名者签过这条消息"，不证明它是新近
                     # 发出的。公共 broker 允许 # 通配订阅（见 BROKER_LIST 上方
-                    # 注释），合法签名帧可被被动嗅探；原先唯一防线是 30s 的
-                    # dedup TTLCache，TTL 过期后同一帧可原样重发并通过验签，
+                    # 注释），合法签名帧可被被动嗅探；原先唯一防线是 dedup
+                    # TTLCache，TTL 过期后同一帧可原样重发并通过验签，
                     # 对任意 code 执行通道等于重放 RCE。这里在验签通过后校验
                     # timestamp 与本机时钟的偏差，超窗即拒绝，使嗅探/重放的
                     # 旧帧天然失效（客户端签名时 timestamp 均取 utc_ms()）。
+                    # 注意去重 TTL 现在随窗口放大（见 __init__），窗口内的重复
+                    # 副本会先被静默去重，不会走到这里；走到这里的只有首次出现
+                    # 的旧帧/超窗副本。
                     if self.timestamp_window and self.timestamp_window > 0:
                         try:
                             _ts_ms = float(data.get("timestamp"))
