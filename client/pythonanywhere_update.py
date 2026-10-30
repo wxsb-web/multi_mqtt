@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""把本地 multi_mqtt 当前代码同步到 .pythonanywhere.com 并热重载。
+"""把本地 multi_mqtt 当前代码同步到 pythonanywhere 站点并热重载。
 
 用法:
-    python client/pythonanywhere_update.py https://suishou.pythonanywhere.com/ \
-        /home/suishou/multi_mqtt --key -                         # 同步整仓并热重载
+    python client/pythonanywhere_update.py https://<user>.pythonanywhere.com/ \
+        /home/<user>/multi_mqtt --key -                         # 同步整仓并热重载
     python client/pythonanywhere_update.py --check --key -       # 只对比不上传
     python client/pythonanywhere_update.py --local-root client \
         https://ip:port/ /other/dir                              # 只推 client 子树
@@ -267,7 +267,7 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('base', nargs='?', default=DEFAULT_BASE,
-                        help='站点根地址，如 https://suishou.pythonanywhere.com/')
+                        help='站点根地址，如 https://<user>.pythonanywhere.com/')
     parser.add_argument('remote_dir', nargs='?', default=DEFAULT_REMOTE_DIR,
                         help='远程项目目录')
     parser.add_argument('--key', '-key', '-k', default='',
