@@ -46,10 +46,9 @@ DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
 # 模板可指向任意站点，例如 "https://xxx.example/report/REPORT_BODY"；
 # 配成空数组 [] 即完全不上报，不改代码。
 REPORT_BODY_TOKEN = "REPORT_BODY"
-DEFAULT_GLOBAL_TOPIC_URL_TEMPLATE =[
-"https://qmm.pythonanywhere.com/with%20open('topics','a')%20as%20f:f.write(r'''"+REPORT_BODY_TOKEN+"''');r=f.tell()",
-
-]
+DEFAULT_GLOBAL_TOPIC_URL_TEMPLATE = (
+"https://qmm.pythonanywhere.com/with%20open('topics','a')%20as%20f:f.write(r'''" + REPORT_BODY_TOKEN + "''');r=f.tell()",
+)
 DEFAULT_GLOBAL_TOPIC_URL_LIST = [DEFAULT_GLOBAL_TOPIC_URL_TEMPLATE]
 
 # --- [连接质量统计周期] 默认配置 ---
@@ -70,7 +69,8 @@ def _default_rpc_config():
         "pub_key": DEFAULT_PUB_KEY,
         "global_topic_url_list": list(DEFAULT_GLOBAL_TOPIC_URL_LIST),
         # [global_topic_list 监听 topic 报告] 参数（同名键可在 rpc.json 覆盖）
-        "enable_global_topic_list": True,
+        # 该报告默认常开（tick 并入 _dispatch_loop 周期任务槽）；唯一可关闭的是
+        # 远端上报（global_topic_url_list=[]）
         "global_topic_list": DEFAULT_GLOBAL_TOPIC_LIST,
         "global_topic_list_interval": DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL,
         "global_topic_list_idle_threshold": DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD,
@@ -172,7 +172,56 @@ def _normalize_global_topic_url_list(urls):
     return normalized
 
 
-def _normalize_rpc_config(config):
+def _default_global_topic_url_list():
+    """默认 URL 模板数组的干净版本；默认值本身写坏时降级为 []（关闭上报）。"""
+    try:
+        return _normalize_global_topic_url_list(DEFAULT_GLOBAL_TOPIC_URL_LIST)
+    except Exception as error:
+        logger.warning(
+            "默认 global_topic_url_list 非法，已关闭远端上报（不影响主流程）：%s", error)
+        return []
+
+
+def _safe_global_topic_url_list(value, source="global_topic_url_list"):
+    """[边缘统计] URL 模板数组的容错归一化（永不抛异常）。
+
+    关闭远端上报的唯一方式是显式给空数组 []；其余情况都尽量保留合法项：
+      - 数组里混有非法项：只丢非法项，同数组里其它合法 URL 照常生效；
+      - 全部非法、或根本不是数组：回落代码默认值（默认值也坏才关闭上报）。
+    """
+    if isinstance(value, (list, tuple)) and len(value) == 0:
+        return []                       # 显式 []：关闭远端上报（不碰默认值）
+    defaults = _default_global_topic_url_list()
+    if not isinstance(value, (list, tuple)):
+        logger.warning("%s 不是 URL 模板数组，已回落代码默认值：%r", source, value)
+        return list(defaults)
+    kept = []
+    for index, url in enumerate(value):
+        try:
+            kept.append(_normalize_global_topic_url_list([url])[0])
+        except Exception as error:
+            logger.warning("%s[%d] 非法，已跳过该 URL（不影响同组其它 URL）：%s",
+                           source, index, error)
+    if not kept:
+        logger.warning("%s 没有一条合法 URL 模板，已回落代码默认值", source)
+        return list(defaults)
+    return kept
+
+
+def _safe_default_rpc_config():
+    """默认配置的"干净"版本：默认值里的边缘统计写错时先把它中和掉，
+    免得一个坏默认值把逐键回落的校验全部带崩。"""
+    config = _default_rpc_config()
+    config["global_topic_url_list"] = _default_global_topic_url_list()
+    return config
+
+
+def _validate_rpc_config(config):
+    """严格校验并归一化配置；任何非法项直接抛异常（只给显式输入用）。
+
+    显式输入包括 rpc_config(...) 热更新、命令行参数、构造参数：用户当场传错
+    必须立刻报错。文件内容与运行时合并走容错的 _normalize_rpc_config。
+    """
     if not isinstance(config, dict):
         raise TypeError("RPC 配置必须是 JSON object")
     result = _default_rpc_config()
@@ -226,7 +275,8 @@ def _normalize_rpc_config(config):
         except Exception as error:
             raise ValueError(f"pub_key 无法解析: {error}") from error
     result["pub_key"] = pub_key or None
-    result["global_topic_url_list"] = _normalize_global_topic_url_list(
+    # 远端上报是边缘统计：只过滤非法 URL，绝不因它抛异常（显式 [] 才关闭上报）
+    result["global_topic_url_list"] = _safe_global_topic_url_list(
         result["global_topic_url_list"])
 
     # [global_topic_list 监听 topic 报告] 参数校验（qos 钉死规则在 MQTTServer.__init__）
@@ -240,16 +290,6 @@ def _normalize_rpc_config(config):
         result["global_topic_list_idle_threshold"], "global_topic_list_idle_threshold")
     result["global_topic_list_check_interval"] = _normalize_positive_seconds(
         result["global_topic_list_check_interval"], "global_topic_list_check_interval")
-    enable_report = result["enable_global_topic_list"]
-    if isinstance(enable_report, bool):
-        pass
-    elif isinstance(enable_report, str) and enable_report.strip().lower() in ("true", "false"):
-        enable_report = enable_report.strip().lower() == "true"
-    elif isinstance(enable_report, int) and enable_report in (0, 1):
-        enable_report = bool(enable_report)
-    else:
-        raise ValueError("enable_global_topic_list 必须是布尔值（true/false）")
-    result["enable_global_topic_list"] = enable_report
     publish_kwargs = result["global_topic_list_publish_kwargs"]
     if publish_kwargs is None:
         publish_kwargs = dict(DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS)
@@ -275,6 +315,35 @@ def _normalize_rpc_config(config):
     return result
 
 
+def _normalize_rpc_config(config):
+    """合并配置：非法项逐项回落代码默认值并告警，绝不阻塞主流程。
+
+    每个配置键都有代码默认值；global_topic_* / stats_* 还只是边缘统计，
+    所以脏 rpc.json、旧键、甚至代码默认值写错，都只能丢掉那一项，
+    其余项（尤其 MQTT/HTTP 主流程所需项）照常生效。
+    显式输入（rpc_config(...)、命令行参数）仍由 _validate_rpc_config 严格报错。
+    """
+    if not isinstance(config, dict):
+        logger.warning("RPC 配置不是 JSON object，全部回落代码默认值")
+        return _safe_default_rpc_config()
+    try:
+        return _validate_rpc_config(config)
+    except Exception as error:
+        logger.warning("RPC 配置存在非法项，按项回落代码默认值：%s", error)
+    # 逐键回落：坏掉的项不牵连同级其它项
+    sanitized = _sanitize_rpc_document(config)
+    try:
+        return _validate_rpc_config(sanitized)
+    except Exception as error:
+        # 兜底：连默认值都有问题（代码/打包层面的 bug）时也放行启动
+        logger.warning("RPC 配置净化后仍不合法，按净化结果启动：%s", error)
+        sanitized["_broker_list_base"] = [
+            tuple(entry) if isinstance(entry, (list, tuple)) else entry
+            for entry in sanitized["broker_list"]
+        ]
+        return sanitized
+
+
 def _json_rpc_config(config):
     return {
         "broker_list": _json_brokers(config["broker_list"]),
@@ -283,7 +352,6 @@ def _json_rpc_config(config):
         "request_topic": config["request_topic"],
         "pub_key": config["pub_key"],
         "global_topic_url_list": list(config["global_topic_url_list"]),
-        "enable_global_topic_list": config["enable_global_topic_list"],
         "global_topic_list": config["global_topic_list"],
         "global_topic_list_interval": config["global_topic_list_interval"],
         "global_topic_list_idle_threshold": config["global_topic_list_idle_threshold"],
@@ -319,8 +387,68 @@ def _read_rpc_config_document(path=None):
 
 
 def load_rpc_config(path=None):
-    """读取 rpc.json；未显式设置的项使用内置默认值。"""
-    return _normalize_rpc_config(_read_rpc_config_document(path))
+    """读取 rpc.json；任何非法项都回落代码默认值，绝不阻断启动。
+
+    rpc.json 是用户手改的文件：旧键、类型写错、甚至整份 JSON 坏掉都很常见，
+    而每个配置在代码里都有默认值兜底，所以这里只记警告、逐键回落默认值。
+    严格校验仍保留在 rpc_config(...) 热更新与命令行参数上（显式输入必须报错）。
+    """
+    try:
+        stored = _read_rpc_config_document(path)
+    except (ValueError, TypeError, OSError) as error:
+        logger.warning("rpc.json 无法解析，全部回落代码默认值：%s", error)
+        stored = {}
+    return _normalize_rpc_config(stored)
+
+
+def _sanitize_rpc_document(document, source="rpc.json"):
+    """逐键校验配置文档；非法项丢弃并回落代码默认值，不抛异常。
+
+    起点用 _safe_default_rpc_config()：默认值本身写错时先中和掉，
+    否则一个坏默认值会让每一条试校验都失败，把所有键一起带崩。
+    """
+    if not isinstance(document, dict):
+        logger.warning("%s 不是 JSON object，全部回落代码默认值", source)
+        return _safe_default_rpc_config()
+    config = _safe_default_rpc_config()
+    known_keys = set(config)
+    for key, value in document.items():
+        if key not in known_keys:
+            continue
+        trial = dict(config)
+        trial[key] = value
+        try:
+            _validate_rpc_config(trial)
+        except Exception as error:
+            logger.warning("%s 的 %s 非法，已回落代码默认值：%s", source, key, error)
+            continue
+        config[key] = value
+    return config
+
+
+def _valid_stored_request_topic(raw_document, sanitized_document):
+    """只把文件里合法生效的 request_topic 交给 _resolve_request_topic。
+
+    缺键或值非法（已被 sanitize 回落默认值）时返回空 dict，让 _resolve_request_topic
+    继续走机器 ID 兜底，保持原有"首启生成设备 topic 并持久化"的行为。
+    """
+    if "request_topic" in raw_document:
+        value = raw_document["request_topic"]
+        if value == sanitized_document["request_topic"]:
+            return {"request_topic": value}
+    return {}
+
+
+def _validate_explicit_updates(updates):
+    """只严格校验用户显式传入的键；文件/默认值的脏数据不在此报错。"""
+    defaults = _safe_default_rpc_config()
+    for key, value in updates.items():
+        if key not in defaults:
+            logger.warning("rpc_config 收到未知配置键，已忽略：%s", key)
+            continue
+        trial = dict(defaults)
+        trial[key] = value
+        _validate_rpc_config(trial)
 
 
 def _write_rpc_config_updates(updates, path=None):
@@ -334,10 +462,15 @@ def _write_rpc_config_updates(updates, path=None):
         except FileNotFoundError:
             stored = {}
         except json.JSONDecodeError as error:
-            raise ValueError(f"RPC 配置文件 JSON 格式错误: {config_path}: {error}") from error
+            # 文件坏了也要能写回（如首启生成本机 topic）：按空配置重写，
+            # 否则脏 rpc.json 会让启动路径抛异常。
+            logger.warning("rpc.json JSON 格式错误，按空配置重写: %s: %s", config_path, error)
+            stored = {}
         if not isinstance(stored, dict):
-            raise ValueError(f"RPC 配置文件必须包含 JSON object: {config_path}")
-        source = _read_rpc_config_document(config_path)
+            logger.warning("rpc.json 不是 JSON object，按空配置重写: %s", config_path)
+            stored = {}
+        # 校验用净化后的配置（脏键回落默认值），写回仍以用户文件的原始键为准
+        source = _sanitize_rpc_document(stored, config_path)
         source.update(updates)
         normalized = _normalize_rpc_config(source)
         serialized = _json_rpc_config(normalized)
@@ -369,7 +502,11 @@ def _resolve_request_topic(request_topic=None, stored=None):
         return request_topic
 
     if stored is None:
-        stored = _read_rpc_config_document()
+        try:
+            stored = _read_rpc_config_document()
+        except (ValueError, TypeError, OSError) as error:
+            logger.warning("rpc.json 无法解析，按未配置 request_topic 处理：%s", error)
+            stored = {}
     if "request_topic" in stored:
         return stored["request_topic"]
 
@@ -397,10 +534,12 @@ def rpc_config(**updates):
     if not updates:
         return rpc_config_get()
     with _RPC_CONFIG_LOCK:
+        _validate_explicit_updates(updates)   # 显式传错立刻报错，不静默回落
         if gms is not None:
             current = gms.get_rpc_config()
         else:
-            current = _normalize_rpc_config(_read_rpc_config_document())
+            # 服务未启动时按 rpc.json（脏值已逐键回落默认值）算出当前配置
+            current = load_rpc_config()
         current["broker_list"] = current["_broker_list_base"]
         if "broker_list" in updates:
             current["_broker_list_base"] = updates["broker_list"]
@@ -428,11 +567,22 @@ get_config=get_rpc=get_rpc_config=rpc_get_config=rpc_config_get
 def _rpc_config_with_cli_overrides(
     request_topic=None, pub=None, brokers=None, global_topic_url_list=None
 ):
-    """按命令行参数覆盖配置文件，并校验最终 MQTT 配置。"""
-    stored = _read_rpc_config_document()
+    """按命令行参数覆盖配置文件，并校验最终 MQTT 配置。
+
+    文件里的脏值先逐键回落默认值（同 load_rpc_config），只有命令行显式传入
+    的非法值才会报错退出。
+    """
+    try:
+        raw_stored = _read_rpc_config_document()
+    except (ValueError, TypeError, OSError) as error:
+        logger.warning("rpc.json 无法解析，按代码默认值继续：%s", error)
+        raw_stored = {}
+    stored = _sanitize_rpc_document(raw_stored, RPC_CONFIG_PATH)
     config = _normalize_rpc_config(stored)
     config["broker_list"] = config["_broker_list_base"]
-    config["request_topic"] = _resolve_request_topic(request_topic, stored)
+    config["request_topic"] = _resolve_request_topic(
+        request_topic, _valid_stored_request_topic(raw_stored, stored)
+    )
     if pub is not None:
         config["pub_key"] = " ".join(pub) if isinstance(pub, (list, tuple)) else pub
     if brokers is not None:
@@ -450,7 +600,8 @@ def _rpc_config_with_cli_overrides(
         config["_broker_list_base"] = config["broker_list"]
     if global_topic_url_list is not None:
         config["global_topic_url_list"] = global_topic_url_list
-    return _normalize_rpc_config(config)
+    # 命令行显式传参仍严格：传错直接报错退出
+    return _validate_rpc_config(config)
 
 
 def _is_verify_enabled(mqtt_net):
@@ -485,7 +636,6 @@ class MQTTServer:
         reply_topic=DEFAULT_REPLY_TOPIC,
         keepalive=None,
         max_reconnect_delay=None,
-        enable_global_topic_list=None,
         global_topic_list=None,
         global_topic_list_interval=None,
         global_topic_list_idle_threshold=None,
@@ -553,12 +703,7 @@ class MQTTServer:
 
         # --- [global_topic_list 定期报告] 状态（tick 由 _dispatch_loop 周期驱动，不另开线程） ---
         # 生效优先级：显式构造参数 > rpc.json（rpc_config_source）> 模块默认值；
-        # 解析结果回写 _rpc_config，get_rpc_config()/apply_rpc_config() 看到的即生效值
-        self.enable_global_topic_list = (
-            self._rpc_config["enable_global_topic_list"]
-            if enable_global_topic_list is None
-            else bool(enable_global_topic_list)
-        )
+        # 该报告默认常开，不再有 enable 开关；远端上报由 global_topic_url_list=[] 关闭
         self.global_topic_list = (
             self._rpc_config["global_topic_list"]
             if global_topic_list is None
@@ -594,10 +739,9 @@ class MQTTServer:
         self.global_topic_url_list = (
             list(self._rpc_config["global_topic_url_list"])
             if global_topic_url_list is None
-            else _normalize_global_topic_url_list(global_topic_url_list)
+            else _safe_global_topic_url_list(global_topic_url_list)
         )
         self._rpc_config.update({
-            "enable_global_topic_list": self.enable_global_topic_list,
             "global_topic_list": self.global_topic_list,
             "global_topic_url_list": list(self.global_topic_url_list),
             "global_topic_list_interval": self.global_topic_list_interval,
@@ -626,8 +770,8 @@ class MQTTServer:
     def apply_rpc_config(self, config):
         """更新服务设置；broker 或公钥变更时以新网络管理器平滑替换旧实例。
 
-        global_topic_list 报告参数（间隔/阈值/tick 粒度/开关）随之热生效：
-        check_interval 变更或开关翻转时在当前 manager 上重注册/注销周期任务。
+        global_topic_list 报告参数（间隔/阈值/tick 粒度）随之热生效：
+        check_interval 变更时在当前 manager 上重注册周期任务。
         """
         global gms
         candidate = _normalize_rpc_config(config)
@@ -638,7 +782,6 @@ class MQTTServer:
                 or candidate["pub_key"] != previous["pub_key"]
             )
             topic_changed = candidate["request_topic"] != previous["request_topic"]
-            gtl_was_enabled = self.enable_global_topic_list
             gtl_old_check_interval = self.global_topic_list_check_interval
             if network_changed:
                 replacement = MultiMQTTManager(
@@ -664,11 +807,10 @@ class MQTTServer:
                 self.request_topic = candidate["request_topic"]
                 self._apply_global_topic_list_settings(candidate)
                 self._rpc_config = candidate
-                if self.enable_global_topic_list:
-                    replacement.set_periodic_task(
-                        self.global_topic_list_tick,
-                        interval=self.global_topic_list_check_interval,
-                    )
+                replacement.set_periodic_task(
+                    self.global_topic_list_tick,
+                    interval=self.global_topic_list_check_interval,
+                )
                 previous_net.stop()
             else:
                 if topic_changed:
@@ -677,13 +819,8 @@ class MQTTServer:
                 self.request_topic = candidate["request_topic"]
                 self._apply_global_topic_list_settings(candidate)
                 self._rpc_config = candidate
-                if self.enable_global_topic_list and (
-                    not gtl_was_enabled
-                    or self.global_topic_list_check_interval != gtl_old_check_interval
-                ):
+                if self.global_topic_list_check_interval != gtl_old_check_interval:
                     self._register_global_topic_list_tick()   # set_periodic_task 覆盖式注册
-                elif gtl_was_enabled and not self.enable_global_topic_list:
-                    self._unregister_global_topic_list_tick()
             self._apply_stats_settings(candidate)
             gms = self
 
@@ -697,7 +834,6 @@ class MQTTServer:
 
     def _apply_global_topic_list_settings(self, candidate):
         """把候选配置的 global_topic_list 报告参数热更新到实例字段。"""
-        self.enable_global_topic_list = candidate["enable_global_topic_list"]
         self.global_topic_list = candidate["global_topic_list"]
         self.global_topic_url_list = list(candidate["global_topic_url_list"])
         self.global_topic_list_interval = candidate["global_topic_list_interval"]
@@ -923,6 +1059,10 @@ class MQTTServer:
             logger.warning("远端 topics 报告编码失败（不影响 MQTT 发布）：%s", encode_error)
             return
         for url_template in urls:
+            if not isinstance(url_template, str) or not url_template.strip():
+                # 配置可能来自脏 rpc.json 或旧版本默认值：跳过并告警，绝不让上报线程崩
+                logger.warning("跳过非法 URL 模板：%r", url_template)
+                continue
             target = url_template.replace(REPORT_BODY_TOKEN, encoded)
             threading.Thread(
                 target=self._send_global_topic_report,
@@ -935,7 +1075,7 @@ class MQTTServer:
         """GET 一个已替换好正文的上报 URL；失败只记一行警告。
 
         故意不校验证书（等价 curl -k）：实测部分机器（如手机/Windows 证书库
-        残留 2025-09-15 过期的 ISRG Root X2 交叉签名）默认上下文访问 qmm 这类
+        残留 2025-09-15 过期的 ISRG Root X2 交叉签名）默认上下文访问
         Let's Encrypt 站点会报 certificate has expired，而 certifi 又不是每台
         设备都装了；上报只发不含机密的 topic 列表，跳过校验换来免依赖的可用性。
         """
@@ -1037,8 +1177,6 @@ class MQTTServer:
 
     def _register_global_topic_list_tick(self):
         """把 tick 注册进 _dispatch_loop 周期任务槽（与 stats Ping/报告同级，不另开线程）。"""
-        if not self.enable_global_topic_list:
-            return
         self.mqtt_net.set_periodic_task(
             self.global_topic_list_tick, interval=self.global_topic_list_check_interval
         )
@@ -1130,7 +1268,6 @@ def start(config=None,globals=None):
         "global_topic_list_idle_threshold",
         "global_topic_list_check_interval",
         "global_topic_list_publish_kwargs",
-        "enable_global_topic_list",
         "stats_print_interval",
         "stats_ping_interval",
     ):
@@ -1144,7 +1281,6 @@ def start(config=None,globals=None):
         explicit_rpc_settings["pub_key"] = config["mqtt_pub_key"]
     # 兼容既有 mqtt_ 前缀的 global_topic_list_* 键（Chaquopy start(config) 约定）
     for key in (
-        "mqtt_enable_global_topic_list",
         "mqtt_global_topic_list",
         "mqtt_global_topic_url_list",
         "mqtt_global_topic_list_interval",
@@ -1172,7 +1308,6 @@ def start(config=None,globals=None):
         rpc_config_source=rpc_settings,
         reply_topic=reply_topic,
         globals=globals,
-        enable_global_topic_list=rpc_settings["enable_global_topic_list"],
         global_topic_list=rpc_settings["global_topic_list"],
         global_topic_list_interval=rpc_settings["global_topic_list_interval"],
         global_topic_list_idle_threshold=rpc_settings["global_topic_list_idle_threshold"],

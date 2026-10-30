@@ -120,7 +120,6 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
         from server_mqtt import start as module_start
 
         cfg = {
-            "mqtt_enable_global_topic_list": True,
             "mqtt_global_topic_list": "cfg/topic_list",
             "mqtt_global_topic_list_interval": 30.0,
             "mqtt_global_topic_list_idle_threshold": 60.0,
@@ -131,7 +130,6 @@ class StubbedGlobalTopicListTests(unittest.TestCase):
             MockServer.return_value.start.return_value = "started"
             self.assertEqual(module_start(config=cfg, globals={}), "started")
             _, kwargs = MockServer.call_args
-            self.assertTrue(kwargs["enable_global_topic_list"])
             self.assertEqual(kwargs["global_topic_list"], "cfg/topic_list")
             self.assertEqual(kwargs["global_topic_list_interval"], 30.0)
             self.assertEqual(kwargs["global_topic_list_idle_threshold"], 60.0)
