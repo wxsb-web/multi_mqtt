@@ -2,10 +2,11 @@
 """把本地 multi_mqtt 当前代码同步到 .pythonanywhere.com 并热重载。
 
 用法:
-    python pythonanywhere_update.py                              # 默认同步到 .pythonanywhere.com
-    python pythonanywhere_update.py https://ip:port/  /other/dir # 自定义 base 与远程目录
-    python pythonanywhere_update.py --key -                      # 线上已启用 key='-'，URL 形如 /-<code>
-    python pythonanywhere_update.py --check                      # 只对比不上传
+    python client/pythonanywhere_update.py https://suishou.pythonanywhere.com/ \
+        /home/suishou/multi_mqtt --key -                         # 同步整仓并热重载
+    python client/pythonanywhere_update.py --check --key -       # 只对比不上传
+    python client/pythonanywhere_update.py --local-root client \
+        https://ip:port/ /other/dir                              # 只推 client 子树
 
 地址形态（server_http 的 key，本脚本用 --key 传入）:
     无 key:   https://<host>/1+1
@@ -36,7 +37,11 @@ import sys
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (os.path.join(_HERE, 'client'), _HERE):
+# 仓库根：本脚本在 client/ 下，而线上 /home/<u>/multi_mqtt 是整仓部署
+# （根目录有 server_http.py，client/ 是子目录），默认同步仓库根；只想推
+# client 子树时用 --local-root client，或把远程目录指到 .../multi_mqtt/client。
+REPO_ROOT = os.path.dirname(_HERE)
+for _p in (_HERE, REPO_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -56,9 +61,11 @@ DEFAULT_USER=''
 DEFAULT_BASE =f'https://{DEFAULT_USER}.pythonanywhere.com/'
 DEFAULT_REMOTE_DIR=f'/home/{DEFAULT_USER}/multi_mqtt'
 
-EXCLUDE_DIRS = {'.git', '.trae', '__pycache__', '.pytest_cache', '.idea', '.vscode'}
+EXCLUDE_DIRS = {'.git', '.trae', '__pycache__', '.pytest_cache', '.idea',
+                '.vscode', '.stfolder'}
 EXCLUDE_FILES = {
     'rpc.json', 'client_history.db', 'cmd_client_history.db',
+    'realtime_editor.txt',    # .gitignore 里的本地运行产物
     'glm5.3=全库审计报告.md',  # 本地审计报告，不属于项目代码
 }
 INCLUDE_EXTS = {'.py', '.sh', '.md', '.txt', '.bat'}
@@ -265,6 +272,8 @@ def main():
                         help='远程项目目录')
     parser.add_argument('--key', '-key', '-k', default='',
                         help="线上 URL 前缀（server_http 的 key），如 -")
+    parser.add_argument('--local-root', '-local-root', default=REPO_ROOT,
+                        help="本地待同步根目录（默认仓库根；只推 client 用 client）")
     parser.add_argument('--check', action='store_true', help='只对比不上传')
     parser.add_argument('--force-reload', action='store_true',
                         help='即使根目录 .py 无变化也强制重载')
@@ -273,7 +282,7 @@ def main():
     new_key = args.key
     check_only = args.check
     force_reload = args.force_reload
-    local_root = _HERE
+    local_root = os.path.abspath(args.local_root)
     timeout = 60
 
     print(f"{__file__} {local_root} -> {base}  remote_dir={remote_dir}"
