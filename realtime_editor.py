@@ -96,6 +96,7 @@ footer { height: 30px; flex: 0 0 30px; display: flex; align-items: center; gap: 
 <footer><span id="state">连接中...</span><span id="latency">延迟 --</span><span id="server-time">服务器时间 --</span> <div class="title" id="filename"></div><span id="mode">权限 --</span> </footer>
 <script>
 const fileName = __FILE_NAME__;
+document.title = fileName + ' - Realtime Editor';   // 标签页以正在编辑的文件名开头，多标签一眼区分
 // 本页对应的 WebSocket 路由，按文件分发：/ws/realtime_editor/<md5前12位>
 const wsPath = __WS_PATH__;
 const fileMode = __FILE_MODE__;
