@@ -238,10 +238,12 @@ class AliasHttpChannelTests(unittest.TestCase):
     def setUpClass(cls):
         import server_http
         cls.server_http = server_http
-        # port=0 让系统分配空闲端口；log_sink 吞掉请求日志保持输出干净
+        # port=0 让系统分配空闲端口；log_sink 吞掉请求日志保持输出干净；
+        # persist_aliases=False 让本用例只动内存别名表，不往仓库 rpc.json
+        # 里留下测试别名（持久化本身由 test_server_http 的专门用例覆盖）。
         cls.server = server_http.start_rpc_server(
             port=0, key='', globals={}, daemon=True,
-            log_sink=lambda line: None,
+            log_sink=lambda line: None, persist_aliases=False,
         )
         cls.port = cls.server.server_address[1]
 

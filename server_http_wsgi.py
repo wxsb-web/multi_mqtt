@@ -21,6 +21,13 @@ URL 形态（RPC_KEY / RPC_ALIAS_URL 环境变量可覆盖，默认 '-' / 'raw'�
     https://<host>/-<code>             例：/-r=1+1
     https://<host>/-/<code>            兼容旧写法
     https://<host>/<别名>              已注册别名免前缀（alias_url='raw'）
+    https://<host>/                    执行 root 别名（RPC_ROOT_ALIAS，默认
+                                       'root'；定义 #alias root 后首页显示它
+                                       产出的 HTML）
+
+别名持久化：默认开启，注册 / 更新 / 删除 #alias 都写仓库根目录的
+rpc.json（http_aliases 段，与 server_mqtt 的 request_topic 等同文件共存），
+进程重启 / SIGHUP 后自动恢复；RPC_PERSIST_ALIASES=0 可关闭。
 
 注意：
     * RPC 的持久命名空间是进程内单例，请使用单 worker（-w 1）。
@@ -51,6 +58,10 @@ from server_http import RPCRequestHandler
 # 用环境变量覆盖便于同一份代码在本地调试或换前缀，置空 RPC_KEY 即回到无前缀。
 RPC_KEY = os.environ.get('RPC_KEY', '-')
 ALIAS_URL = os.environ.get('RPC_ALIAS_URL', 'raw')
+# 首页 / 执行的别名名（默认 root）与别名持久化开关（默认开启，写 rpc.json）。
+RPC_ROOT_ALIAS = os.environ.get('RPC_ROOT_ALIAS', 'root')
+RPC_PERSIST_ALIASES = os.environ.get(
+    'RPC_PERSIST_ALIASES', '1').strip().lower() not in ('0', 'false', 'no', 'off', '')
 # 本应用自己的执行器，start_rpc_server 初始化后绑定（见文件末尾）
 _APP_EXECUTOR = None
 
@@ -168,6 +179,10 @@ class _WSGIHandlerShim:
         # 本地调试）会把类属性改回 ''，线上 /- 地址会整体 403。
         self.key = RPC_KEY
         self.alias_url = ALIAS_URL
+        # 首页别名 / 持久化开关同样固定在部署配置上：同进程再起别的服务器
+        # （测试或本地调试）改类属性也不能改变线上首页与落盘行为。
+        self.root_alias = RPC_ROOT_ALIAS
+        self.persist_aliases = RPC_PERSIST_ALIASES
         # executor 固定绑本应用启动时的那一个（pythonanywhere 是单 app 进程）：
         # 同进程再起别的服务器会替换类属性，WSGI 请求不能跟着跑到别人的
         # 命名空间和别名表里。
@@ -432,6 +447,8 @@ server_http.start_rpc_server(
     ip='0.0.0.0',
     key=RPC_KEY,
     alias_url=ALIAS_URL,
+    root_alias=RPC_ROOT_ALIAS,
+    persist_aliases=RPC_PERSIST_ALIASES,
     globals=globals(),
     locals=locals(),
     listen=False,           # 关键：只初始化状态

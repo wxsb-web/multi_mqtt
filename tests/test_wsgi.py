@@ -1,9 +1,17 @@
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# WSGI 应用在 import 时就初始化执行器并恢复 rpc.json 里的别名：先把
+# RPC_CONFIG_PATH 指到临时文件，本组用例的别名只落临时盘，不污染仓库
+# rpc.json（持久化本身由 test_server_http 覆盖）。
+_TEMP_CONFIG_DIR = tempfile.TemporaryDirectory()
+import server_http
+server_http.RPC_CONFIG_PATH = Path(_TEMP_CONFIG_DIR.name) / "rpc.json"
 import server_http_wsgi
 
 
@@ -83,6 +91,14 @@ class WsgiApplicationTests(unittest.TestCase):
         status, _headers, out = _call_wsgi_path("/add")
         self.assertTrue(status.startswith("200"), status)
         self.assertEqual(out, b"2")
+
+    def test_root_path_runs_root_alias(self):
+        # 首页 / 执行 root 别名（定义后持久化到 rpc.json，重启/SIGHUP 后仍生效）
+        _call_wsgi("#alias root\nr='<h1>home</h1>'")
+        status, _headers, out = _call_wsgi_path("/")
+        self.assertTrue(status.startswith("200"), status)
+        self.assertEqual(out, b"<h1>home</h1>")
+        self.assertTrue(server_http.RPC_CONFIG_PATH.exists())
 
     def test_non_get_post_method_rejected(self):
         captured = {}

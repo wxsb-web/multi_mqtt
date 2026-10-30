@@ -1,7 +1,9 @@
 import base64
+import json
 import subprocess
 import socket
 import sys
+import tempfile
 import unittest
 import urllib.parse
 import urllib.request
@@ -111,6 +113,8 @@ class KeyPrefixAndAliasUrlTests(unittest.TestCase):
     """key 作为真正的 URL 前缀，以及 alias_url 开关（不改 executor）。"""
 
     def _start(self, **kwargs):
+        # 本组只验证 URL 语义；持久化关闭，避免往仓库 rpc.json 写测试别名
+        kwargs.setdefault('persist_aliases', False)
         server = server_http.start_rpc_server(
             port=0, ip="127.0.0.1", globals={}, locals={}, **kwargs
         )
@@ -174,6 +178,8 @@ class CliArgsTests(unittest.TestCase):
         self.assertEqual(args.basic_auth, "")
         self.assertEqual(args.key, "")
         self.assertEqual(args.alias_url, "keyed")
+        self.assertEqual(args.root_alias, "root")
+        self.assertTrue(args.persist_aliases)
         self.assertEqual(args.port, 1144)
 
     def test_cli_basic_auth_value_gates_requests(self):
@@ -202,6 +208,107 @@ class CliArgsTests(unittest.TestCase):
         )
         with urllib.request.urlopen(request, timeout=10) as response:
             self.assertEqual(response.read().decode(), "2")
+
+
+class AliasPersistenceTests(unittest.TestCase):
+    """别名持久化：rpc.json 的 http_aliases 段 + 根路径 / 显示 HTML。"""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.config_path = Path(temp.name) / "rpc.json"
+        # 预置 server_mqtt 的其它键，验证写入只合并自己的段、不覆盖别人
+        self.config_path.write_text(
+            json.dumps({"request_topic": "test/request"}), encoding="utf-8")
+        old_path = server_http.RPC_CONFIG_PATH
+        server_http.RPC_CONFIG_PATH = self.config_path
+        self.addCleanup(setattr, server_http, "RPC_CONFIG_PATH", old_path)
+
+    def _start(self, **kwargs):
+        kwargs.setdefault("key", "-")
+        kwargs.setdefault("alias_url", "raw")
+        server = server_http.start_rpc_server(
+            port=0, ip="127.0.0.1", globals={}, locals={}, **kwargs)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_port
+
+    def _get(self, port, path):
+        return urllib.request.urlopen(
+            f"http://127.0.0.1:{port}{path}", timeout=10)
+
+    def _document(self):
+        return json.loads(self.config_path.read_text(encoding="utf-8"))
+
+    def _saved(self):
+        return self._document().get("http_aliases", {})
+
+    @staticmethod
+    def _quote(code):
+        return urllib.parse.quote(code, safe="")
+
+    def test_alias_definition_is_persisted_and_restored(self):
+        port = self._start()
+        with self._get(port, "/-" + self._quote("#alias addx\nr=1+1")) as response:
+            self.assertEqual(response.read().decode(), "2")
+        self.assertEqual(self._saved(), {"addx": "r=1+1"})
+        # 其它模块的键原样保留
+        self.assertEqual(self._document()["request_topic"], "test/request")
+
+        # 新服务器 = 新执行器：从 rpc.json 恢复后 /addx 免 key 前缀可用
+        port2 = self._start()
+        with self._get(port2, "/addx") as response:
+            self.assertEqual(response.read().decode(), "2")
+
+    def test_unalias_removes_persisted_entry(self):
+        port = self._start()
+        with self._get(port, "/-" + self._quote("#alias gonex\nr=7")):
+            pass
+        self.assertIn("gonex", self._saved())
+        with self._get(port, "/-" + self._quote("#unalias gonex")) as response:
+            self.assertIn("deleted", response.read().decode())
+        self.assertNotIn("gonex", self._saved())
+
+    def test_ephemeral_flags_skip_persistence(self):
+        port = self._start()
+        # 三种“不持久化”写法都只注册到内存
+        for code in ("#alias eph1 !\nr=1", "#alias eph2 np\nr=2",
+                     "#alias eph3!\nr=3"):
+            with self._get(port, "/-" + self._quote(code)):
+                pass
+        for name, expected in (("eph1", "1"), ("eph2", "2"), ("eph3", "3")):
+            with self._get(port, "/-" + name) as response:
+                self.assertEqual(response.read().decode(), expected, name)
+        self.assertEqual(self._saved(), {})
+
+    def test_disabled_persistence_does_not_touch_file(self):
+        port = self._start(persist_aliases=False)
+        with self._get(port, "/-" + self._quote("#alias memx\nr=5")) as response:
+            self.assertEqual(response.read().decode(), "5")
+        self.assertEqual(self._saved(), {})
+        with self._get(port, "/-memx") as response:
+            self.assertEqual(response.read().decode(), "5")
+
+    def test_root_path_runs_root_alias_as_html(self):
+        port = self._start()
+        body = ("response.set_header('Content-Type','text/html; charset=utf-8');"
+                "response.set_data('<h1>apk</h1>')")
+        with self._get(port, "/-" + self._quote("#alias root\n" + body)):
+            pass
+        self.assertIn("root", self._saved())
+        with self._get(port, "/") as response:
+            self.assertEqual(response.headers["Content-Type"],
+                             "text/html; charset=utf-8")
+            self.assertEqual(response.read().decode(), "<h1>apk</h1>")
+
+    def test_root_path_stays_403_in_keyed_mode(self):
+        # keyed 模式别名必须写在 key 之后：/ 不因 root 别名存在而放行
+        port = self._start(alias_url="keyed")
+        with self._get(port, "/-" + self._quote("#alias root\nr='x'")):
+            pass
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self._get(port, "/")
+        self.assertEqual(context.exception.code, 403)
 
 
 if __name__ == "__main__":

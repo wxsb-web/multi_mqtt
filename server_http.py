@@ -1,10 +1,206 @@
 #!/usr/bin/env python3
-import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac, weakref
+import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac, weakref, json, os, keyword, tempfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from pathlib import Path
 
 import rpc_executor
-from rpc_executor import PythonExecutor, format_result ,stime
+from rpc_executor import PythonExecutor, format_result ,stime, utc_ms
+
+
+# --------------------------------------------------------------------------- #
+# 别名持久化：默认 rpc.json 与本文件同目录（测试 / 部署可改 RPC_CONFIG_PATH）
+# --------------------------------------------------------------------------- #
+# 与 server_mqtt 共用同一份 rpc.json：server_mqtt 写 request_topic 等键，
+# 这里只读写自己的 http_aliases 段，读-改-写时其它键原样保留，互不覆盖。
+RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
+ALIAS_CONFIG_KEY = 'http_aliases'
+# 打开站点首页 / 时执行的别名名：定义 #alias root 后 / 直接显示它产出的
+# HTML（例如 response.set_data(open('/home/<user>/apk.html').read())）。
+ROOT_ALIAS = 'root'
+# reload 会重造锁对象：正在写 rpc.json 的线程与拿新锁的线程会同时进临界区，
+# setdefault 保住同一把锁跨 reload（与 server_mqtt 的写法一致）。
+_ALIAS_CONFIG_LOCK = globals().setdefault(
+    '_ALIAS_CONFIG_LOCK', threading.RLock())
+# #alias 指令行尾出现这些标记 = 只注册到内存、不写 rpc.json：
+#     #alias apk !      #alias apk np      #alias apk!
+# 标记在本模块被剥掉后再交给执行器，rpc_executor.py 一行不改。
+_ALIAS_EPHEMERAL_FLAGS = {'!', 'np', 'no-persist', 'nopersist', 'temp', 'ephemeral'}
+
+
+def _alias_config_path(path=None):
+    return Path(path) if path is not None else RPC_CONFIG_PATH
+
+
+def _read_config_document(path=None):
+    """读取 rpc.json 文档，返回 dict。
+
+    文件不存在返回 {}；JSON 损坏 / 根节点不是 object 时返回 None —— 调用方
+    据此拒绝写入，绝不用空文档覆盖用户已有的配置文件。
+    """
+    config_path = _alias_config_path(path)
+    with _ALIAS_CONFIG_LOCK:
+        try:
+            with config_path.open('r', encoding='utf-8') as config_file:
+                document = json.load(config_file)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as error:
+            logging.getLogger('app').warning(
+                '别名持久化读取失败，跳过 %s: %s', config_path, error)
+            return None
+        if not isinstance(document, dict):
+            logging.getLogger('app').warning(
+                '别名持久化跳过：%s 根节点不是 JSON object', config_path)
+            return None
+        return document
+
+
+def _persisted_alias_codes(path=None):
+    """返回 rpc.json 里 http_aliases 段的 name -> code（只收字符串值）。"""
+    document = _read_config_document(path)
+    if not document:
+        return {}
+    stored = document.get(ALIAS_CONFIG_KEY)
+    if not isinstance(stored, dict):
+        return {}
+    return {name: code for name, code in stored.items() if isinstance(code, str)}
+
+
+def _update_persisted_aliases(updates=None, deletes=(), path=None):
+    """按名字增删 rpc.json 的 http_aliases 段，返回 True 表示文件已改写。
+
+    读-改-写在模块级 RLock 内完成，并用同目录临时文件 + os.replace 原子
+    替换：并发请求（HTTP worker / WSGI 分发线程）不会读到半截 JSON。
+    """
+    updates = updates or {}
+    with _ALIAS_CONFIG_LOCK:
+        document = _read_config_document(path)
+        if document is None:
+            return False
+        stored = document.get(ALIAS_CONFIG_KEY)
+        aliases = dict(stored) if isinstance(stored, dict) else {}
+        changed = False
+        for name, code in updates.items():
+            if aliases.get(name) != code:
+                aliases[name] = code
+                changed = True
+        for name in deletes:
+            if aliases.pop(name, None) is not None:
+                changed = True
+        if not changed:
+            return False
+        if aliases:
+            document[ALIAS_CONFIG_KEY] = aliases
+        else:
+            document.pop(ALIAS_CONFIG_KEY, None)
+        config_path = _alias_config_path(path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temp_name = tempfile.mkstemp(
+            prefix=config_path.name + '.', suffix='.tmp',
+            dir=str(config_path.parent))
+        try:
+            with os.fdopen(handle, 'w', encoding='utf-8') as temp_file:
+                json.dump(document, temp_file, ensure_ascii=False, indent=2)
+                temp_file.write('\n')
+            os.replace(temp_name, config_path)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+        return True
+
+
+def load_persisted_aliases(executor, path=None):
+    """启动时把 rpc.json 的 http_aliases 装回执行器别名表（内存优先）。
+
+    返回本次恢复的 name -> code。命名空间里已存在的同名别名不覆盖；非法
+    名字 / 空代码跳过，防止手工编辑过的文件把执行器搞脏。
+    """
+    if executor is None or not getattr(executor, 'alias', False):
+        return {}
+    now = utc_ms()
+    restored = {}
+    for name, code in _persisted_alias_codes(path).items():
+        if (not code.strip() or not isinstance(name, str)
+                or not name.isidentifier() or keyword.iskeyword(name)):
+            continue
+        if name in executor.aliases:
+            continue
+        executor.aliases[name] = {
+            'code': code,
+            'created': now,
+            'updated': now,
+            'hits': 0,
+            'last_used': None,
+        }
+        restored[name] = code
+    if restored:
+        logging.getLogger('app').info(
+            '别名持久化: 从 %s 恢复 %d 个 (%s)',
+            _alias_config_path(path), len(restored), ', '.join(sorted(restored)))
+    return restored
+
+
+def sync_alias_persistence(executor, execution, ephemeral=False, path=None):
+    """把一次执行里注册 / 更新 / 删除的别名同步进 rpc.json。
+
+    ``ephemeral=True``（本次定义带“不持久化”标记）时不写入，并把同名旧
+    记录一并清掉，避免文件里留一份过期副本。其它指令（show / list）不动
+    文件，避免每次查询都产生写放大与 hits 计数写入。
+    """
+    info = execution.get('alias') if isinstance(execution, dict) else None
+    if not isinstance(info, dict):
+        return None
+    action = info.get('action')
+    if action in ('saved', 'updated'):
+        name, code = info.get('name'), info.get('code')
+        if not isinstance(name, str) or not isinstance(code, str):
+            return None
+        if ephemeral:
+            return _update_persisted_aliases(deletes=[name], path=path)
+        return _update_persisted_aliases(updates={name: code}, path=path)
+    if action == 'unalias':
+        deleted = [name for name in (info.get('deleted') or [])
+                   if isinstance(name, str)]
+        if deleted:
+            return _update_persisted_aliases(deletes=deleted, path=path)
+    return None
+
+
+def strip_ephemeral_alias_flag(code, executor):
+    """识别 #alias 指令行里的“不持久化”标记，返回 (code, ephemeral)。
+
+    支持 ``#alias apk !`` / ``#alias apk np`` / ``#alias apk!`` 三种写法；
+    标记只在首行生效，命中后剥掉再交给执行器（执行器不允许指令行出现
+    第二个名字，因此标记必须在本层处理）。
+    """
+    if executor is None or not getattr(executor, 'alias', False):
+        return code, False
+    if not isinstance(code, str) or not code.strip():
+        return code, False
+    head, separator, body = code.lstrip().partition('\n')
+    token = head.strip()
+    if not token.startswith('#'):
+        return code, False
+    words = token[1:].split()
+    if not words or words[0] not in getattr(executor, 'alias_keywords', ()):
+        return code, False
+    args = words[1:]
+    if not args:
+        return code, False
+    ephemeral = args[-1].lower() in _ALIAS_EPHEMERAL_FLAGS
+    if ephemeral:
+        args = args[:-1]
+    if args and args[-1].endswith('!'):
+        args[-1] = args[-1].rstrip('!')
+        ephemeral = True
+    if not ephemeral or not args:
+        return code, False
+    rebuilt = '#' + ' '.join([words[0]] + args)
+    return rebuilt + (separator + body if separator else ''), True
 
 
 def get_bmp_bytes(rgb=None, size=(16, 16)):
@@ -250,11 +446,31 @@ def _is_alias_url(handler, raw_path):
     return candidate in aliases
 
 
+def _root_alias_code(handler):
+    """根路径 '/' 要执行的代码：root_alias 指向的已注册别名名。
+
+    未注册（或别名总开关关闭）时返回 None，由调用方维持原来的 400/403
+    行为。别名名必须真实存在，因此不会把任意代码放进执行器。
+    """
+    executor = _conf(handler, 'executor')
+    if executor is None or not getattr(executor, 'alias', False):
+        return None
+    aliases = getattr(executor, 'aliases', None)
+    name = str(_conf(handler, 'root_alias') or ROOT_ALIAS)
+    if not isinstance(aliases, dict) or name not in aliases:
+        return None
+    return name
+
+
 class RPCRequestHandler(BaseHTTPRequestHandler):
     key = ''
     # 别名 URL 的匹配对象：'keyed' 只认 key 处理后的代码，'raw' 额外允许
     # 已注册别名名直接作 URL（/<别名>，不带 key 前缀）。见 _is_alias_url。
     alias_url = 'keyed'
+    # 根路径 '/' 执行的别名名（见 _root_alias_code），默认 'root'
+    root_alias = ROOT_ALIAS
+    # 别名定义是否写 rpc.json（默认持久化；带“不持久化”标记的除外）
+    persist_aliases = True
     # HTTP Basic 认证凭据 'user:password'；空串不启用认证
     basic_auth = ''
     # 复用一个持久化的执行器实例；请求级上下文通过 execute(globals=...) 注入。
@@ -448,6 +664,10 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                     code_str = raw_path[len(legacy_prefix):]
                 elif raw_path.startswith(prefixed):
                     code_str = raw_path[len(prefixed):]
+                elif raw_path == '/' and _conf(self, 'alias_url') == 'raw' and _root_alias_code(self):
+                    # 首页 / 没有 key 前缀：alias_url='raw' 时执行 root_alias
+                    # 指向的已注册别名（例如输出 apk.html），保持与 /<别名> 同层。
+                    code_str = _root_alias_code(self)
                 elif _is_alias_url(self, raw_path):
                     # alias_url='raw'：已注册的别名名可直接作 URL（/add），
                     # 不必带 key 前缀。未注册路径仍 403，只对别名这一层放开。
@@ -459,6 +679,9 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 if raw_path.startswith('/'):
                     raw_path = raw_path[1:]
                 code_str = raw_path
+                if not code_str:
+                    # 无 key 时 / 直接落到根别名（未注册仍走下面的 400）
+                    code_str = _root_alias_code(self) or ''
             if not code_str:
                 self.send_error(400, "No code")
                 return
@@ -469,6 +692,11 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 code = code_str
             else:
                 code = urllib.parse.unquote(code_str)
+
+            executor = _conf(self, 'executor')
+            # 别名指令行尾的“不持久化”标记由本层剥掉（执行器不允许指令行
+            # 出现第二个名字），剩下的 code 再走语法检查 / 执行。
+            code, alias_ephemeral = strip_ephemeral_alias_flag(code, executor)
 
             # 裸路径救援：URL 里 file=/tmp/txt 不带引号是 SyntaxError，
             # 补引号后能通过语法检查才采用，否则保留原始报错。
@@ -534,7 +762,6 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 'p': response,
             }
 
-            executor = _conf(self, 'executor')
             try:
                 # stdout 捕获由 PythonExecutor 内部的 _redirect_stdout 完成
                 # （execution['stdout'] 即输出），外层不再包 _stdout_lock +
@@ -542,6 +769,16 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 # （长任务/死循环）就冻结全部 HTTP RPC（含日志台/诊断口）。
                 # 执行的串行化与超时守卫由执行器自身的锁与 timeout 保证。
                 execution = executor.execute(code, globals=context)
+                # 别名定义 / 更新 / 删除写回 rpc.json（默认持久化）。执行
+                # 失败（例如 body 运行报错）时别名可能已注册，因此放在
+                # execute 之后立即同步；持久化本身出错不能打挂请求。
+                if _conf(self, 'persist_aliases'):
+                    try:
+                        sync_alias_persistence(
+                            executor, execution, alias_ephemeral)
+                    except Exception:
+                        logging.getLogger('error').exception(
+                            '别名持久化写入失败 path=%s', self.path)
                 output = execution['stdout']
                 if not execution['ok']:
                     raise RuntimeError(execution['error'])
@@ -608,7 +845,7 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
                      favicon_rgb=None, favicon_size=16, websocket_handler=None,
                      websocket_path='/ws', redirect_root=None, websocket_handlers=None,
                      main_loop=None, listen=True, log_sink=None, basic_auth='',
-                     alias_url='keyed'):
+                     alias_url='keyed', root_alias=ROOT_ALIAS, persist_aliases=True):
     if not key:
         key = ''
     else:
@@ -624,6 +861,12 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
         alias_url = 'raw'
     else:
         raise ValueError(f"alias_url 只支持 'keyed' 或 'raw'，收到 {alias_url!r}")
+    # 根路径 / 执行的别名名（未注册时 / 仍是原来的 400/403）；名字按原样
+    # 保留，注册到执行器后再解析。
+    root_alias = str(root_alias or ROOT_ALIAS).strip()
+    # 别名持久化默认开启：注册 / 更新 / 删除都同步进 rpc.json 的
+    # http_aliases 段，进程重启（含 pythonanywhere SIGHUP）后自动恢复。
+    persist_aliases = bool(persist_aliases)
     # basic_auth 接受 'user:password' 或 (user, password)，统一成前者；空则不启用认证
     if isinstance(basic_auth, (tuple, list)):
         basic_auth = ':'.join(str(item) for item in basic_auth)
@@ -648,14 +891,22 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     # 空间与 alias 注册随之隔离）。旧实现全部写 RPCRequestHandler 类属性，
     # 同进程第二次 start_rpc_server 会把第一个服务器的 key / executor /
     # favicon / basic_auth 等整体抢走，且旧命名空间与别名静默蒸发。
+    # 每服务器一个 PythonExecutor；不在这里强写 __name__：执行器内部
+    # 用 setdefault，模块字典自带 __name__ 不会被覆盖；自建空字典时
+    # 由执行器补成 __rpc_exec__。
+    executor = PythonExecutor(globals=persistent_ns, main_loop=main_loop)
+    # 启动即恢复上次持久化的别名：进程重启 / SIGHUP 后 #alias 定义的
+    # URL 仍可直接访问。持久化关闭时既不读也不写 rpc.json。
+    if persist_aliases:
+        load_persisted_aliases(executor)
+
     config = {
         'key': key,
         'alias_url': alias_url,
+        'root_alias': root_alias,
+        'persist_aliases': persist_aliases,
         'basic_auth': basic_auth or '',
-        # 每服务器一个 PythonExecutor；不在这里强写 __name__：执行器内部
-        # 用 setdefault，模块字典自带 __name__ 不会被覆盖；自建空字典时
-        # 由执行器补成 __rpc_exec__。
-        'executor': PythonExecutor(globals=persistent_ns, main_loop=main_loop),
+        'executor': executor,
         'favicon_bytes': get_bmp_bytes(rgb=favicon_rgb, size=favicon_size),
         'websocket_handler': websocket_handler,
         'websocket_path': websocket_path,
@@ -787,6 +1038,13 @@ def build_arg_parser():
                         choices=('keyed', 'raw'), default='keyed',
                         help="raw 时已注册别名可直接作 URL（/<别名>），"
                              "keyed 时别名必须写在 /<key><code> 里")
+    parser.add_argument('--root-alias', '-root-alias', dest='root_alias',
+                        default=ROOT_ALIAS,
+                        help="根路径 / 执行的已注册别名名（raw 模式生效）")
+    parser.add_argument('--no-persist-aliases', '-no-persist-aliases',
+                        dest='persist_aliases', action='store_false',
+                        default=True,
+                        help="关闭别名持久化（默认写 rpc.json 的 http_aliases）")
     # 三种写法同义：--basic_auth / -basic_auth / -basic-auth；值是
     # 'user:password'，空串（默认）表示不启用认证。--basic_auth 里若写成
     # 空格分隔的两个参数会被 argparse 拒绝，必须带冒号或用引号。
@@ -800,6 +1058,8 @@ def build_arg_parser():
 if __name__ == '__main__':
     args = build_arg_parser().parse_args()
     start_rpc_server(port=args.port, ip=args.ip, key=args.key,
-                     alias_url=args.alias_url, basic_auth=args.basic_auth,
+                     alias_url=args.alias_url, root_alias=args.root_alias,
+                     persist_aliases=args.persist_aliases,
+                     basic_auth=args.basic_auth,
                      globals=globals(), locals=locals())
     input("Press Ctrl+C or anykey to stop\n")
