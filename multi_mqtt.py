@@ -872,7 +872,7 @@ class MultiMQTTManager:
     # [修复-N3] stop() 中等待分发线程退出的超时（秒）。
     DISPATCH_JOIN_TIMEOUT = 5.0
 
-    def __init__(self, brokers=BROKER_LIST, log_messages=False, enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0, timestamp_window=120.0, stats_print_interval=None, stats_ping_interval=None):
+    def __init__(self,brokers=BROKER_LIST,log_messages=False,enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0,timestamp_window=400,stats_print_interval=None, stats_ping_interval=None):
         self.brokers = brokers
         self.keepalive = keepalive
         self.max_reconnect_delay = max_reconnect_delay
@@ -926,6 +926,8 @@ class MultiMQTTManager:
         # [重放窗口] 已验签消息的 timestamp 允许与本机时钟的最大偏差（秒）。
         # <=0 表示关闭校验（兼容调试/手动调时场景）。仅对"配置了公钥且验签
         # 通过"的消息生效，见 _on_message。
+        # 默认 400s：公网 broker 实测同一帧副本最迟到 230s，120s 会把正常迟到
+        # 副本当重放拒收（并回错误包）；窗口放宽后去重 TTL 同步到 430s。
         self.timestamp_window = float(timestamp_window)
         # [去重 TTL 覆盖重放窗口] 多 broker 广播必然产生重复副本，公网实测迟到
         # 副本可达 86~230s（2026-10-30 broker.mqtt.cool 同一帧迟到 173s）。
