@@ -46,10 +46,10 @@ DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
 # 模板可指向任意站点，例如 "https://xxx.example/report/REPORT_BODY"；
 # 配成空数组 [] 即完全不上报，不改代码。
 REPORT_BODY_TOKEN = "REPORT_BODY"
-DEFAULT_GLOBAL_TOPIC_URL_TEMPLATE = (
-"https://qmm.pythonanywhere.com/with%20open('topics','a')%20as%20f:f.write(r'''" + REPORT_BODY_TOKEN + "''');r=f.tell()",
-)
-DEFAULT_GLOBAL_TOPIC_URL_LIST = [DEFAULT_GLOBAL_TOPIC_URL_TEMPLATE]
+DEFAULT_GLOBAL_TOPIC_URL_LIST = [
+    "https://qmm.pythonanywhere.com/with%20open('topics','a')%20as%20f:"
+    "f.write(r'''" + REPORT_BODY_TOKEN + "''');r=f.tell()"
+]
 
 # --- [连接质量统计周期] 默认配置 ---
 # 命名统一为 stats_print_interval / stats_ping_interval：

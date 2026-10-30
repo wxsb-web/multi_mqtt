@@ -311,6 +311,20 @@ class ServerMqttConfigTests(unittest.TestCase):
             global_topic_url_list=["ftp://reports.example.net/"])
         self.assertEqual(result["global_topic_url_list"], defaults)
 
+    def test_shipped_url_list_entries_are_plain_strings(self):
+        """默认列表里每项必须是字符串：模板曾被写成 list/tuple，默认上报被静默关闭。"""
+        shipped = server_mqtt.DEFAULT_GLOBAL_TOPIC_URL_LIST
+        self.assertTrue(shipped)
+        for entry in shipped:
+            self.assertIsInstance(entry, str)
+            self.assertTrue(entry.strip())
+            self.assertIn(server_mqtt.REPORT_BODY_TOKEN, entry)
+
+        defaults = server_mqtt._default_global_topic_url_list()
+        self.assertTrue(defaults)                       # 默认值可用（不是 []）
+        self.assertEqual(defaults,
+                         server_mqtt._default_rpc_config()["global_topic_url_list"])
+
     def test_load_rpc_config_falls_back_for_invalid_file_values(self):
         """rpc.json 里的脏值只丢该项、回落代码默认值，绝不阻断启动。"""
         self.config_path.write_text(
