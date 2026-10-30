@@ -1,3 +1,4 @@
+import base64
 import subprocess
 import socket
 import sys
@@ -158,6 +159,49 @@ class KeyPrefixAndAliasUrlTests(unittest.TestCase):
     def test_alias_url_rejects_unknown_value(self):
         with self.assertRaises(ValueError):
             self._start(alias_url="definitely-not-valid")
+
+
+class CliArgsTests(unittest.TestCase):
+    """命令行参数拼写（--basic_auth / -basic_auth / -basic-auth 同义）。"""
+
+    def test_basic_auth_flag_spellings(self):
+        for flag in ("--basic_auth", "-basic_auth", "-basic-auth"):
+            args = server_http.build_arg_parser().parse_args([flag, "admin:pw"])
+            self.assertEqual(args.basic_auth, "admin:pw", flag)
+
+    def test_defaults_keep_server_unauthenticated(self):
+        args = server_http.build_arg_parser().parse_args([])
+        self.assertEqual(args.basic_auth, "")
+        self.assertEqual(args.key, "")
+        self.assertEqual(args.alias_url, "keyed")
+        self.assertEqual(args.port, 1144)
+
+    def test_cli_basic_auth_value_gates_requests(self):
+        # start_rpc_server 把 basic_auth 写进 RPCRequestHandler 类属性，同进程
+        # 后跑的 WSGI 用例会继承它（shim 读类属性），必须还原
+        old_basic_auth = server_http.RPCRequestHandler.basic_auth
+        self.addCleanup(setattr, server_http.RPCRequestHandler,
+                        "basic_auth", old_basic_auth)
+        server = server_http.start_rpc_server(
+            port=0, ip="127.0.0.1", globals={}, locals={},
+            key="-", basic_auth="admin:pw",
+        )
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_port
+        url = f"http://127.0.0.1:{port}/-1%2B1"
+
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(url, timeout=10)
+        self.assertEqual(context.exception.code, 401)
+
+        request = urllib.request.Request(url)
+        request.add_header(
+            "Authorization",
+            "Basic " + base64.b64encode(b"admin:pw").decode("ascii"),
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(response.read().decode(), "2")
 
 
 if __name__ == "__main__":

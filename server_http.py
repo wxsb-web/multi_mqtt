@@ -769,7 +769,8 @@ def qpsu(url="http://192.168.1.100/D%3A/test/qpsu.zip", write_to=''):
     from qgb import py, U, T, N, F
     return py, U, T, N, F
     
-if __name__ == '__main__':
+def build_arg_parser():
+    """构造命令行参数解析器（__main__ 与测试共用，便于锁定参数拼写）。"""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -786,7 +787,19 @@ if __name__ == '__main__':
                         choices=('keyed', 'raw'), default='keyed',
                         help="raw 时已注册别名可直接作 URL（/<别名>），"
                              "keyed 时别名必须写在 /<key><code> 里")
-    args = parser.parse_args()
+    # 三种写法同义：--basic_auth / -basic_auth / -basic-auth；值是
+    # 'user:password'，空串（默认）表示不启用认证。--basic_auth 里若写成
+    # 空格分隔的两个参数会被 argparse 拒绝，必须带冒号或用引号。
+    parser.add_argument('--basic_auth', '-basic_auth', '-basic-auth',
+                        dest='basic_auth', default='',
+                        help="HTTP Basic 认证，格式 user:password；"
+                             "空则不启用认证")
+    return parser
+
+
+if __name__ == '__main__':
+    args = build_arg_parser().parse_args()
     start_rpc_server(port=args.port, ip=args.ip, key=args.key,
-                     alias_url=args.alias_url, globals=globals(), locals=locals())
+                     alias_url=args.alias_url, basic_auth=args.basic_auth,
+                     globals=globals(), locals=locals())
     input("Press Ctrl+C or anykey to stop\n")
