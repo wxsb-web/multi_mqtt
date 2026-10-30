@@ -43,6 +43,25 @@ DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL = ConnectionQualityStats.PING_INTERVAL 
 DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
 DEFAULT_GLOBAL_TOPIC_URL = "https://qmm.pythonanywhere.com/"
 
+_GTL_SSL_CONTEXT = None
+def _global_topic_list_ssl_context():
+    """远端 topics 追加用的 TLS 上下文，优先 certifi 的 CA 包。
+
+    Windows 系统证书库可能残留已过期的交叉签名中间证书（实测 CurrentUser\\CA
+    里有一张 2025-09-15 过期的 ISRG Root X2），默认上下文会把它当信任锚，
+    使 qmm 这类 Let's Encrypt 站点报 certificate has expired；certifi 自带
+    更新后的 CA 包可规避，未安装 certifi 时回退系统默认行为。
+    """
+    global _GTL_SSL_CONTEXT
+    if _GTL_SSL_CONTEXT is None:
+        import ssl
+        try:
+            import certifi
+            _GTL_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            _GTL_SSL_CONTEXT = ssl.create_default_context()
+    return _GTL_SSL_CONTEXT
+
 
 def _default_rpc_config():
     return {
@@ -807,19 +826,19 @@ class MQTTServer:
             code_path = "with%20open('topics','a')%20as%20f:" f"f.write(r'''{body_q}%0A''');r=f.tell()"  # 按远端约定拼路径，仅空格写 %20
             url = self.global_topic_url.rstrip("/") + "/" + code_path
             req = urllib.request.Request(url, method="GET",)
-            with urllib.request.urlopen(req, timeout=9) as resp:  # 超时=9s
+            with urllib.request.urlopen(req, timeout=9, context=_global_topic_list_ssl_context()) as resp:  # 超时=9s
                 resp.read()  # 读空响应体，及时释放连接
         except Exception as qmm_e:
             # 证书过期/网络抖动属预期失败，只记一行警告，避免每轮 tick 刷整段 traceback
             logger.warning("远端 topics 追加失败（不影响 MQTT 发布）：%s", qmm_e)
 
-    def _publish_global_topic_list(self, reason: str, confirm_timeout=None, remote=True) -> dict:
+    def _publish_global_topic_list(self, reason: str, confirm_timeout=2.0, remote=True) -> dict:
         """发布监听 topic 报告并返回发布状态。
 
         confirm_timeout>0 时等待 QoS1 PUBACK，阻塞至多该秒数，仅限后台线程；
-        remote=False 跳过远端 topics 追加，供交互场景避免最长 9 秒阻塞。
-        返回 ok/reason/topic/queued/acked/sent/timeout/payload，可直接作为
-        RPC 响应交给调用方判断是否真的发成功。
+        周期 tick 显式传 0 避免阻塞调度循环。remote=False 跳过远端 topics 追加，
+        供交互场景避免最长 9 秒阻塞。返回 ok/reason/topic/queued/acked/sent/
+        timeout/payload，可直接作为 RPC 响应交给调用方判断是否真的发成功。
         """
         payload = self._resolve_global_topic_list_payload(reason)
         if payload is None:
@@ -891,7 +910,7 @@ class MQTTServer:
             and (now - self._last_gtl_publish_ts) >= self.global_topic_list_interval
         ):
             reason = "startup" if self._last_gtl_publish_ts == 0.0 else "idle_no_command"
-            self._publish_global_topic_list(reason)
+            self._publish_global_topic_list(reason, confirm_timeout=0)  # 周期任务不阻塞调度循环
 
     def _register_global_topic_list_tick(self):
         """把 tick 注册进 _dispatch_loop 周期任务槽（与 stats Ping/报告同级，不另开线程）。"""

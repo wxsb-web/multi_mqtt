@@ -258,7 +258,7 @@ class ServerMqttConfigTests(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value = response
         with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
-            self.server._publish_global_topic_list("test")
+            self.server._publish_global_topic_list("test", confirm_timeout=0)
         request = urlopen.call_args.args[0]
         self.assertTrue(request.full_url.startswith(url + "with%20open"))
 
@@ -345,7 +345,7 @@ class ServerMqttConfigTests(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value = response
         with mock.patch("urllib.request.urlopen", return_value=response):
-            other._publish_global_topic_list("test")
+            other._publish_global_topic_list("test", confirm_timeout=0)
         self.assertEqual(recorded.get("qos"), 1)
 
     def test_global_topic_list_settings_load_from_rpc_json(self):
