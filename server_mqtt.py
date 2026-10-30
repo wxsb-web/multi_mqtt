@@ -41,7 +41,17 @@ DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL = ConnectionQualityStats.PING_INTERVAL 
 # 发布参数（经 **ka 一路透传到 paho-mqtt）：QoS1+Retain，
 # broker 会连同 QoS 一起保存保留消息，新订阅者上线即收到最新 topic 列表
 DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
-DEFAULT_GLOBAL_TOPIC_URL = "https://qmm.pythonanywhere.com/"
+# 远端上报：URL 模板数组（global_topic_url_list），发送时把占位符 REPORT_BODY
+# 替换成百分号编码后的报告 JSON（末尾带 %0A，保持远端文件一行一条）。
+# 模板可指向任意站点，例如 "https://xxx.example/report/REPORT_BODY"；
+# 配成空数组 [] 即完全不上报，不改代码。
+REPORT_BODY_TOKEN = "REPORT_BODY"
+DEFAULT_GLOBAL_TOPIC_URL_TEMPLATE = (
+    "https://qmm.pythonanywhere.com/"
+    "with%20open('topics','a')%20as%20f:"
+    "f.write(r'''REPORT_BODY''');r=f.tell()"
+)
+DEFAULT_GLOBAL_TOPIC_URL_LIST = [DEFAULT_GLOBAL_TOPIC_URL_TEMPLATE]
 
 # --- [连接质量统计周期] 默认配置 ---
 # 命名统一为 stats_print_interval / stats_ping_interval：
@@ -51,25 +61,6 @@ DEFAULT_GLOBAL_TOPIC_URL = "https://qmm.pythonanywhere.com/"
 DEFAULT_STATS_PRINT_INTERVAL = ConnectionQualityStats.PRINT_INTERVAL
 DEFAULT_STATS_PING_INTERVAL = ConnectionQualityStats.PING_INTERVAL
 
-_GTL_SSL_CONTEXT = None
-def _global_topic_list_ssl_context():
-    """远端 topics 追加用的 TLS 上下文，优先 certifi 的 CA 包。
-
-    Windows 系统证书库可能残留已过期的交叉签名中间证书（实测 CurrentUser\\CA
-    里有一张 2025-09-15 过期的 ISRG Root X2），默认上下文会把它当信任锚，
-    使 qmm 这类 Let's Encrypt 站点报 certificate has expired；certifi 自带
-    更新后的 CA 包可规避，未安装 certifi 时回退系统默认行为。
-    """
-    global _GTL_SSL_CONTEXT
-    if _GTL_SSL_CONTEXT is None:
-        import ssl
-        try:
-            import certifi
-            _GTL_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
-        except Exception:
-            _GTL_SSL_CONTEXT = ssl.create_default_context()
-    return _GTL_SSL_CONTEXT
-
 
 def _default_rpc_config():
     return {
@@ -78,7 +69,7 @@ def _default_rpc_config():
         "broker_list_del": [],
         "request_topic": REQUEST_TOPIC,
         "pub_key": DEFAULT_PUB_KEY,
-        "global_topic_url": DEFAULT_GLOBAL_TOPIC_URL,
+        "global_topic_url_list": list(DEFAULT_GLOBAL_TOPIC_URL_LIST),
         # [global_topic_list 监听 topic 报告] 参数（同名键可在 rpc.json 覆盖）
         "enable_global_topic_list": True,
         "global_topic_list": DEFAULT_GLOBAL_TOPIC_LIST,
@@ -159,6 +150,29 @@ def _normalize_non_negative_seconds(value, name):
     return number
 
 
+def _normalize_global_topic_url_list(urls):
+    """校验远端上报 URL 模板数组；空数组表示关闭上报。
+
+    模板里的 REPORT_BODY 在发送时才替换，所以校验时先用一个占位值代入，
+    确保替换后的 URL 仍是合法的 http(s) 地址（scheme/主机不能来自正文）。
+    """
+    if not isinstance(urls, (list, tuple)):
+        raise ValueError("global_topic_url_list 必须是 URL 模板数组（可为空数组）")
+    normalized = []
+    for index, url in enumerate(urls):
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError(f"global_topic_url_list[{index}] 必须是非空 URL 模板字符串")
+        url = url.strip()
+        check_url = url.replace(REPORT_BODY_TOKEN, "REPORT_BODY_VALUE")
+        parsed_url = urlsplit(check_url)
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+            raise ValueError(
+                f"global_topic_url_list[{index}] 必须是非空 HTTP(S) URL 模板"
+            )
+        normalized.append(url)
+    return normalized
+
+
 def _normalize_rpc_config(config):
     if not isinstance(config, dict):
         raise TypeError("RPC 配置必须是 JSON object")
@@ -213,14 +227,8 @@ def _normalize_rpc_config(config):
         except Exception as error:
             raise ValueError(f"pub_key 无法解析: {error}") from error
     result["pub_key"] = pub_key or None
-    global_topic_url = result["global_topic_url"]
-    if not isinstance(global_topic_url, str) or not global_topic_url.strip():
-        raise ValueError("global_topic_url 必须是非空 HTTP(S) URL")
-    global_topic_url = global_topic_url.strip()
-    parsed_url = urlsplit(global_topic_url)
-    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
-        raise ValueError("global_topic_url 必须是非空 HTTP(S) URL")
-    result["global_topic_url"] = global_topic_url
+    result["global_topic_url_list"] = _normalize_global_topic_url_list(
+        result["global_topic_url_list"])
 
     # [global_topic_list 监听 topic 报告] 参数校验（qos 钉死规则在 MQTTServer.__init__）
     report_topic = result["global_topic_list"]
@@ -275,7 +283,7 @@ def _json_rpc_config(config):
         "broker_list_del": _json_brokers(config["broker_list_del"]),
         "request_topic": config["request_topic"],
         "pub_key": config["pub_key"],
-        "global_topic_url": config["global_topic_url"],
+        "global_topic_url_list": list(config["global_topic_url_list"]),
         "enable_global_topic_list": config["enable_global_topic_list"],
         "global_topic_list": config["global_topic_list"],
         "global_topic_list_interval": config["global_topic_list_interval"],
@@ -419,7 +427,7 @@ def rpc_config_get():
 get_config=get_rpc=get_rpc_config=rpc_get_config=rpc_config_get  
 
 def _rpc_config_with_cli_overrides(
-    request_topic=None, pub=None, brokers=None, global_topic_url=None
+    request_topic=None, pub=None, brokers=None, global_topic_url_list=None
 ):
     """按命令行参数覆盖配置文件，并校验最终 MQTT 配置。"""
     stored = _read_rpc_config_document()
@@ -441,8 +449,8 @@ def _rpc_config_with_cli_overrides(
             except ValueError as error:
                 raise ValueError(f"broker 端口必须是整数: {broker!r}") from error
         config["_broker_list_base"] = config["broker_list"]
-    if global_topic_url is not None:
-        config["global_topic_url"] = global_topic_url
+    if global_topic_url_list is not None:
+        config["global_topic_url_list"] = global_topic_url_list
     return _normalize_rpc_config(config)
 
 
@@ -485,7 +493,7 @@ class MQTTServer:
         global_topic_list_check_interval=None,
         global_topic_list_publish_kwargs=None,
         global_topic_list_payload_fn=None,
-        global_topic_url=DEFAULT_GLOBAL_TOPIC_URL,
+        global_topic_url_list=None,
         stats_print_interval=None,
         stats_ping_interval=None,
         rpc_config_source=None,
@@ -515,7 +523,6 @@ class MQTTServer:
                 "broker_list": brokers,
                 "request_topic": request_topic,
                 "pub_key": server_public_key_bytes,
-                "global_topic_url": global_topic_url,
             }
         )
         self._rpc_config_lock = threading.RLock()
@@ -585,10 +592,15 @@ class MQTTServer:
         self.global_topic_list_publish_kwargs["qos"] = 1
         # 自定义报告函数: fn(server) -> dict；None 则用默认的监听 topic 列表
         self.global_topic_list_payload_fn = global_topic_list_payload_fn
-        self.global_topic_url = self._rpc_config["global_topic_url"]
+        self.global_topic_url_list = (
+            list(self._rpc_config["global_topic_url_list"])
+            if global_topic_url_list is None
+            else _normalize_global_topic_url_list(global_topic_url_list)
+        )
         self._rpc_config.update({
             "enable_global_topic_list": self.enable_global_topic_list,
             "global_topic_list": self.global_topic_list,
+            "global_topic_url_list": list(self.global_topic_url_list),
             "global_topic_list_interval": self.global_topic_list_interval,
             "global_topic_list_idle_threshold": self.global_topic_list_idle_threshold,
             "global_topic_list_check_interval": self.global_topic_list_check_interval,
@@ -651,7 +663,6 @@ class MQTTServer:
                 previous_net = self.mqtt_net
                 self.mqtt_net = replacement
                 self.request_topic = candidate["request_topic"]
-                self.global_topic_url = candidate["global_topic_url"]
                 self._apply_global_topic_list_settings(candidate)
                 self._rpc_config = candidate
                 if self.enable_global_topic_list:
@@ -665,7 +676,6 @@ class MQTTServer:
                     self.mqtt_net.subscribe(candidate["request_topic"])
                     self.mqtt_net.unsubscribe(previous["request_topic"])
                 self.request_topic = candidate["request_topic"]
-                self.global_topic_url = candidate["global_topic_url"]
                 self._apply_global_topic_list_settings(candidate)
                 self._rpc_config = candidate
                 if self.enable_global_topic_list and (
@@ -690,6 +700,7 @@ class MQTTServer:
         """把候选配置的 global_topic_list 报告参数热更新到实例字段。"""
         self.enable_global_topic_list = candidate["enable_global_topic_list"]
         self.global_topic_list = candidate["global_topic_list"]
+        self.global_topic_url_list = list(candidate["global_topic_url_list"])
         self.global_topic_list_interval = candidate["global_topic_list_interval"]
         self.global_topic_list_idle_threshold = candidate["global_topic_list_idle_threshold"]
         self.global_topic_list_check_interval = candidate["global_topic_list_check_interval"]
@@ -893,28 +904,66 @@ class MQTTServer:
         return self._build_global_topic_list_payload(reason)
 
     def _append_global_topic_list_remote(self, payload: dict):
-        """把本次报告追加到远端 topics 文件（标准库，超时 9s）；失败只记日志。"""
-        try:  # 远端上报：仅用标准库，失败不影响 MQTT 发布
-            import urllib.parse, urllib.request,json  # 局部导入，避免顶层强依赖
+        """把本次报告异步发往 global_topic_url_list 的每个 URL 模板。
+
+        调用方零阻塞：每个模板一个守护线程（独立超时/失败互不影响），
+        失败只记一行警告，绝不影响 MQTT 发布与调用方返回。
+        模板里的 REPORT_BODY 占位符替换成百分号编码后的紧凑 JSON，
+        末尾附 %0A，保持远端文件一行一条。空数组则直接跳过。
+        """
+        urls = list(self.global_topic_url_list or ())
+        if not urls:
+            return
+        try:  # 远端上报：仅用标准库
+            import json
+            import urllib.parse
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))  # 紧凑 JSON，保留中文
             body = body.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "%0A")  # 换行折叠为字面量 %0A
-            body_q = urllib.parse.quote(body, safe="")  # 完整百分号编码，防止引号/反斜杠破坏远端 r'''...'''
-            code_path = "with%20open('topics','a')%20as%20f:" f"f.write(r'''{body_q}%0A''');r=f.tell()"  # 按远端约定拼路径，仅空格写 %20
-            url = self.global_topic_url.rstrip("/") + "/" + code_path
-            req = urllib.request.Request(url, method="GET",)
-            with urllib.request.urlopen(req, timeout=9, context=_global_topic_list_ssl_context()) as resp:  # 超时=9s
-                resp.read()  # 读空响应体，及时释放连接
-        except Exception as qmm_e:
-            # 证书过期/网络抖动属预期失败，只记一行警告，避免每轮 tick 刷整段 traceback
-            logger.warning("远端 topics 追加失败（不影响 MQTT 发布）：%s", qmm_e)
+            encoded = urllib.parse.quote(body, safe="") + "%0A"  # 完整百分号编码，防止引号/反斜杠破坏模板
+        except Exception as encode_error:
+            logger.warning("远端 topics 报告编码失败（不影响 MQTT 发布）：%s", encode_error)
+            return
+        for url_template in urls:
+            target = url_template.replace(REPORT_BODY_TOKEN, encoded)
+            threading.Thread(
+                target=self._send_global_topic_report,
+                args=(target,),
+                daemon=True,
+                name="gtl-remote-report",
+            ).start()
 
-    def _publish_global_topic_list(self, reason: str, confirm_timeout=2.0, remote=True) -> dict:
+    def _send_global_topic_report(self, url):
+        """GET 一个已替换好正文的上报 URL；失败只记一行警告。
+
+        故意不校验证书（等价 curl -k）：实测部分机器（如手机/Windows 证书库
+        残留 2025-09-15 过期的 ISRG Root X2 交叉签名）默认上下文访问 qmm 这类
+        Let's Encrypt 站点会报 certificate has expired，而 certifi 又不是每台
+        设备都装了；上报只发不含机密的 topic 列表，跳过校验换来免依赖的可用性。
+        """
+        try:  # 远端上报：仅用标准库，失败不影响 MQTT 发布
+            import ssl
+            import urllib.request
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            request = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(  # 超时=9s
+                request, timeout=9, context=context
+            ) as resp:
+                resp.read()  # 读空响应体，及时释放连接
+        except Exception as report_error:
+            # 证书过期/网络抖动属预期失败，只记一行警告，避免每轮 tick 刷整段 traceback
+            logger.warning("远端 topics 追加失败（不影响 MQTT 发布）：%s -> %s",
+                           url[:200], report_error)
+
+    def _publish_global_topic_list(self, reason: str, confirm_timeout=2.0) -> dict:
         """发布监听 topic 报告并返回发布状态。
 
         confirm_timeout>0 时等待 QoS1 PUBACK，阻塞至多该秒数，仅限后台线程；
-        周期 tick 显式传 0 避免阻塞调度循环。remote=False 跳过远端 topics 追加，
-        供交互场景避免最长 9 秒阻塞。返回 ok/reason/topic/queued/acked/sent/
-        timeout/payload，可直接作为 RPC 响应交给调用方判断是否真的发成功。
+        周期 tick 显式传 0 避免阻塞调度循环。远端 topics 上报始终发往
+        global_topic_url_list 里的全部模板，且是异步线程，不占用本方法耗时
+        （空数组即不上报）。返回 ok/reason/topic/queued/acked/sent/timeout/
+        payload，可直接作为 RPC 响应交给调用方判断是否真的发成功。
         """
         payload = self._resolve_global_topic_list_payload(reason)
         if payload is None:
@@ -936,8 +985,7 @@ class MQTTServer:
             )
             stats = {"queued": queued, "acked": None, "timeout": False}
         self._last_gtl_publish_ts = time.time()  # 时间戳防抖，断网恢复自然续上
-        if remote:
-            self._append_global_topic_list_remote(payload)
+        self._append_global_topic_list_remote(payload)   # 异步，不阻塞本方法
         acked = stats.get("acked")
         status = {
             "ok": True,
@@ -956,15 +1004,15 @@ class MQTTServer:
         )  # 本地日志
         return status
 
-    def publish_global_topic_list_now(self, reason="manual", confirm_timeout=2.0, remote=False) -> dict:
+    def publish_global_topic_list_now(self, reason="manual", confirm_timeout=2.0) -> dict:
         """立即发布一次监听 topic 报告，可指定与周期报告不同的 reason。
 
-        与 tick 共用同一份 payload 与发布参数；默认等待 QoS1 PUBACK 并跳过
-        远端 topics 追加，适合设备端交互立即触发。阻塞至多 confirm_timeout
-        秒，必须在后台线程调用。
+        与 tick 共用同一份 payload、发布参数和远端 URL 列表；远端上报是
+        异步线程，不会追加任何等待。阻塞上限只有 confirm_timeout 秒，
+        必须在后台线程调用。
         """
         return self._publish_global_topic_list(
-            reason, confirm_timeout=confirm_timeout, remote=remote
+            reason, confirm_timeout=confirm_timeout
         )
             
     def global_topic_list_tick(self, now=None):
@@ -1077,7 +1125,7 @@ def start(config=None,globals=None):
         "broker_list_del",
         "request_topic",
         "pub_key",
-        "global_topic_url",
+        "global_topic_url_list",
         "global_topic_list",
         "global_topic_list_interval",
         "global_topic_list_idle_threshold",
@@ -1099,6 +1147,7 @@ def start(config=None,globals=None):
     for key in (
         "mqtt_enable_global_topic_list",
         "mqtt_global_topic_list",
+        "mqtt_global_topic_url_list",
         "mqtt_global_topic_list_interval",
         "mqtt_global_topic_list_idle_threshold",
         "mqtt_global_topic_list_check_interval",
@@ -1120,7 +1169,7 @@ def start(config=None,globals=None):
         server_public_key_bytes=rpc_settings["pub_key"],
         brokers=rpc_settings["broker_list"],
         request_topic=request_topic,
-        global_topic_url=rpc_settings["global_topic_url"],
+        global_topic_url_list=rpc_settings["global_topic_url_list"],
         rpc_config_source=rpc_settings,
         reply_topic=reply_topic,
         globals=globals,
@@ -1144,14 +1193,14 @@ def start(config=None,globals=None):
 
 
 def main(port=1177, host="0.0.0.0", globals=None, locals=None, block=False,
-         request_topic=None, pub=None, brokers=None, global_topic_url=None):
+         request_topic=None, pub=None, brokers=None, global_topic_url_list=None):
     """启动 MQTT + HTTP 双通道 RPC，返回 (http_server, mqtt_server)。
 
     globals/locals 原样透传给两个通道的执行器：HTTP 侧零拷贝持有 globals
     字典引用（启动后才赋值的名字对 RPC 实时可见），MQTT 侧 PythonExecutor
     使用同一 globals。ipy 里调用传 globals=globals(), locals=locals() 即可
     把 IPython 命名空间同时暴露给 HTTP/MQTT RPC；缺省暴露本模块 globals。
-    pub/brokers/request_topic/global_topic_url 与 CLI 参数同名，None 时全部
+    pub/brokers/request_topic/global_topic_url_list 与 CLI 参数同名，None 时全部
     走 rpc.json。block=True 阻塞到 KeyboardInterrupt（脚本入口用），默认
     False 启动即返回。
     """
@@ -1161,14 +1210,14 @@ def main(port=1177, host="0.0.0.0", globals=None, locals=None, block=False,
         request_topic=request_topic,
         pub=pub,
         brokers=brokers,
-        global_topic_url=global_topic_url,
+        global_topic_url_list=global_topic_url_list,
     )
     gms = MQTTServer(
         globals=globals,
         brokers=rpc_settings["broker_list"],
         server_public_key_bytes=rpc_settings["pub_key"],
         request_topic=rpc_settings["request_topic"],
-        global_topic_url=rpc_settings["global_topic_url"],
+        global_topic_url_list=rpc_settings["global_topic_url_list"],
         rpc_config_source=rpc_settings,
     )
     gms.mqtt_net.is_windows_cmd = (sys.platform == "win32")
@@ -1195,7 +1244,7 @@ if __name__ == "__main__":
     parser.add_argument("--pub", "--pubkey", "-pub", nargs="*", default=None)
     parser.add_argument("--broker", action="append", default=None,
                         help="追加 broker，格式为 host:port")
-    parser.add_argument("--global_topic_url", default=None)
+    parser.add_argument("--global_topic_url_list", nargs="*", default=None)
     args = parser.parse_args()
     try:
         main(
@@ -1204,7 +1253,7 @@ if __name__ == "__main__":
             request_topic=args.request_topic,
             pub=args.pub,
             brokers=args.broker,
-            global_topic_url=args.global_topic_url,
+            global_topic_url_list=args.global_topic_url_list,
             block=True,
         )
     except ValueError as error:

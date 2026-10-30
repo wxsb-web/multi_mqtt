@@ -3,6 +3,7 @@ import json
 import types
 import sys
 import tempfile
+import time
 import unittest
 import urllib.parse
 import urllib.request
@@ -256,30 +257,38 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(config["request_topic"], "partial/request")
         self.assertEqual(config["broker_list"], server_mqtt._default_rpc_config()["broker_list"])
         self.assertEqual(config["pub_key"], server_mqtt.DEFAULT_PUB_KEY)
-        self.assertEqual(config["global_topic_url"], server_mqtt.DEFAULT_GLOBAL_TOPIC_URL)
+        self.assertEqual(config["global_topic_url_list"],
+                         server_mqtt._default_rpc_config()["global_topic_url_list"])
         self.assertNotIn("obsolete_option", config)
 
-    def test_global_topic_url_update_is_saved_and_used(self):
-        url = "https://reports.example.net/topics/"
-        result = server_mqtt.rpc_config(global_topic_url=url)
+    def test_global_topic_url_list_update_is_saved_and_used(self):
+        url = "https://reports.example.net/topics/REPORT_BODY"
+        result = server_mqtt.rpc_config(global_topic_url_list=[url])
 
-        self.assertEqual(result["global_topic_url"], url)
-        self.assertEqual(self.server.global_topic_url, url)
+        self.assertEqual(result["global_topic_url_list"], [url])
+        self.assertEqual(self.server.global_topic_url_list, [url])
         self.assertEqual(
-            json.loads(self.config_path.read_text())["global_topic_url"],
-            url,
+            json.loads(self.config_path.read_text())["global_topic_url_list"],
+            [url],
         )
 
         response = mock.MagicMock()
         response.__enter__.return_value = response
         with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
             self.server._publish_global_topic_list("test", confirm_timeout=0)
-        request = urlopen.call_args.args[0]
-        self.assertTrue(request.full_url.startswith(url + "with%20open"))
+            deadline = time.time() + 5          # 上报已改异步线程，轮询等它发出
+            while not urlopen.called and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(urlopen.called, "远端上报线程未在 5s 内发出请求")
+            request = urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.startswith(url.replace("REPORT_BODY", "%7B")))
+        self.assertNotIn("REPORT_BODY", request.full_url)
 
-    def test_invalid_global_topic_url_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "HTTP\\(S\\) URL"):
-            server_mqtt.rpc_config(global_topic_url="ftp://reports.example.net/")
+    def test_invalid_global_topic_url_list_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "URL 模板数组"):
+            server_mqtt.rpc_config(global_topic_url_list="https://reports.example.net/")
+        with self.assertRaisesRegex(ValueError, "HTTP\\(S\\) URL 模板"):
+            server_mqtt.rpc_config(global_topic_url_list=["ftp://reports.example.net/"])
         self.assertFalse(self.config_path.exists())
 
     def test_timestamp_reject_publishes_explicit_error_reply(self):
@@ -347,6 +356,7 @@ class ServerMqttConfigTests(unittest.TestCase):
             server_public_key_bytes=None,
             enable_global_topic_list=False,
             global_topic_list_publish_kwargs={"retain": False, "qos": 0},
+            global_topic_url_list=[],          # 本用例只验证 qos，不上报远端
         )
         self.assertEqual(other.global_topic_list_publish_kwargs["qos"], 1)
 
