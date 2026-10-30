@@ -47,8 +47,8 @@ DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
 # 配成空数组 [] 即完全不上报，不改代码。
 REPORT_BODY_TOKEN = "REPORT_BODY"
 DEFAULT_GLOBAL_TOPIC_URL_LIST = [
-    "https://qmm.pythonanywhere.com/with%20open('topics','a')%20as%20f:"
-    "f.write(r'''" + REPORT_BODY_TOKEN + "''');r=f.tell()"
+"https://qmm.pythonanywhere.com/with%20open('topics','a')%20as%20f:f.write(r'''" +REPORT_BODY_TOKEN + "''');r=f.tell()",
+'https://textdb.online/update/?key=ime_feed&value='+REPORT_BODY_TOKEN,
 ]
 
 # --- [连接质量统计周期] 默认配置 ---
