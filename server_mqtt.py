@@ -43,6 +43,14 @@ DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL = ConnectionQualityStats.PING_INTERVAL 
 DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
 DEFAULT_GLOBAL_TOPIC_URL = "https://qmm.pythonanywhere.com/"
 
+# --- [连接质量统计周期] 默认配置 ---
+# 命名统一为 stats_print_interval / stats_ping_interval：
+#   stats_print_interval - 报告打印间隔（默认 3600s，0=关闭周期报告）
+#   stats_ping_interval  - 周期 Ping 间隔（默认 600s，0=停用周期 Ping）
+# 两个键均可在 rpc.json 覆盖，并在运行期经 rpc_config(...) 热更新。
+DEFAULT_STATS_PRINT_INTERVAL = ConnectionQualityStats.PRINT_INTERVAL
+DEFAULT_STATS_PING_INTERVAL = ConnectionQualityStats.PING_INTERVAL
+
 _GTL_SSL_CONTEXT = None
 def _global_topic_list_ssl_context():
     """远端 topics 追加用的 TLS 上下文，优先 certifi 的 CA 包。
@@ -78,6 +86,12 @@ def _default_rpc_config():
         "global_topic_list_idle_threshold": DEFAULT_GLOBAL_TOPIC_LIST_IDLE_THRESHOLD,
         "global_topic_list_check_interval": DEFAULT_GLOBAL_TOPIC_LIST_CHECK_INTERVAL,
         "global_topic_list_publish_kwargs": dict(DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS),
+        # [连接质量统计周期] 同名键可在 rpc.json 覆盖
+        "stats_print_interval": DEFAULT_STATS_PRINT_INTERVAL,
+        "stats_ping_interval": DEFAULT_STATS_PING_INTERVAL,
+        # [客户端专属] 仅 client_*.py 读取；服务端不应用。null/缺省时客户端
+        # 依次回退 stats_print_interval，再回退 Python 原有默认行为（3600s）。
+        "client_stats_print_interval": None,
     }
 
 
@@ -129,6 +143,19 @@ def _normalize_positive_seconds(value, name):
         raise ValueError(f"{name} 必须是正数（秒）") from error
     if not (number > 0.0) or number == float("inf"):   # 同时挡住 0/负数/NaN/inf
         raise ValueError(f"{name} 必须是正数（秒）")
+    return number
+
+
+def _normalize_non_negative_seconds(value, name):
+    """非负秒校验：接受 0（表示停用对应周期任务）以及正数。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{name} 必须是 >=0 的秒数")
+    try:
+        number = float(value.strip() if isinstance(value, str) else value)
+    except ValueError as error:
+        raise ValueError(f"{name} 必须是 >=0 的秒数") from error
+    if number < 0.0 or number != number or number == float("inf"):
+        raise ValueError(f"{name} 必须是 >=0 的秒数")
     return number
 
 
@@ -222,6 +249,22 @@ def _normalize_rpc_config(config):
     elif not isinstance(publish_kwargs, dict):
         raise ValueError("global_topic_list_publish_kwargs 必须是 JSON object 或 null")
     result["global_topic_list_publish_kwargs"] = dict(publish_kwargs)
+
+    # [连接质量统计周期] 0 表示停用对应周期任务，因此用非负校验
+    result["stats_print_interval"] = _normalize_non_negative_seconds(
+        result["stats_print_interval"], "stats_print_interval")
+    result["stats_ping_interval"] = _normalize_non_negative_seconds(
+        result["stats_ping_interval"], "stats_ping_interval")
+
+    # [客户端专属] null/空字符串表示「未设置」，由客户端继续回退；
+    # 设置后必须是 >=0 的秒数（0=客户端关闭周期报告）。
+    client_interval = result["client_stats_print_interval"]
+    if client_interval is None or (
+            isinstance(client_interval, str) and not client_interval.strip()):
+        result["client_stats_print_interval"] = None
+    else:
+        result["client_stats_print_interval"] = _normalize_non_negative_seconds(
+            client_interval, "client_stats_print_interval")
     return result
 
 
@@ -239,6 +282,9 @@ def _json_rpc_config(config):
         "global_topic_list_idle_threshold": config["global_topic_list_idle_threshold"],
         "global_topic_list_check_interval": config["global_topic_list_check_interval"],
         "global_topic_list_publish_kwargs": config["global_topic_list_publish_kwargs"],
+        "stats_print_interval": config["stats_print_interval"],
+        "stats_ping_interval": config["stats_ping_interval"],
+        "client_stats_print_interval": config["client_stats_print_interval"],
     }
 
 
@@ -440,6 +486,8 @@ class MQTTServer:
         global_topic_list_publish_kwargs=None,
         global_topic_list_payload_fn=None,
         global_topic_url=DEFAULT_GLOBAL_TOPIC_URL,
+        stats_print_interval=None,
+        stats_ping_interval=None,
         rpc_config_source=None,
     ):
         # 实例化网络层管理器（enable_crypto 默认为 False）
@@ -471,11 +519,26 @@ class MQTTServer:
             }
         )
         self._rpc_config_lock = threading.RLock()
+        # 生效优先级：显式构造参数 > rpc.json（rpc_config_source）> 模块默认值
+        self.stats_print_interval = (
+            self._rpc_config["stats_print_interval"]
+            if stats_print_interval is None
+            else _normalize_non_negative_seconds(
+                stats_print_interval, "stats_print_interval")
+        )
+        self.stats_ping_interval = (
+            self._rpc_config["stats_ping_interval"]
+            if stats_ping_interval is None
+            else _normalize_non_negative_seconds(
+                stats_ping_interval, "stats_ping_interval")
+        )
         self.mqtt_net = MultiMQTTManager(
             brokers=brokers,
             log_messages=False,  # 每个 broker 不打印原始消息
             server_public_key_bytes=server_public_key_bytes,
             enable_stats=True,
+            stats_print_interval=self.stats_print_interval,
+            stats_ping_interval=self.stats_ping_interval,
             **net_kwargs,
         )
         
@@ -530,6 +593,8 @@ class MQTTServer:
             "global_topic_list_idle_threshold": self.global_topic_list_idle_threshold,
             "global_topic_list_check_interval": self.global_topic_list_check_interval,
             "global_topic_list_publish_kwargs": dict(self.global_topic_list_publish_kwargs),
+            "stats_print_interval": self.stats_print_interval,
+            "stats_ping_interval": self.stats_ping_interval,
         })
         self._last_gtl_publish_ts = 0.0           # 上次发布报告的时间，0=尚未发布过
         self.last_command_ts = 0.0                # 最近一次收到控制指令的时间，0=从未收到
@@ -570,6 +635,8 @@ class MQTTServer:
                     log_messages=False,
                     server_public_key_bytes=candidate["pub_key"],
                     enable_stats=True,
+                    stats_print_interval=candidate["stats_print_interval"],
+                    stats_ping_interval=candidate["stats_ping_interval"],
                     **self._net_options,
                 )
                 replacement.set_on_message(self.handle_message)
@@ -608,7 +675,16 @@ class MQTTServer:
                     self._register_global_topic_list_tick()   # set_periodic_task 覆盖式注册
                 elif gtl_was_enabled and not self.enable_global_topic_list:
                     self._unregister_global_topic_list_tick()
+            self._apply_stats_settings(candidate)
             gms = self
+
+    def _apply_stats_settings(self, candidate):
+        """把候选配置的连接质量统计周期热更新到实例与当前网络管理器。"""
+        self.stats_print_interval = candidate["stats_print_interval"]
+        self.stats_ping_interval = candidate["stats_ping_interval"]
+        # setter 内部对同值提前返回且投递唤醒哨兵，改间隔后无需重建 manager
+        self.mqtt_net.set_stats_print_interval(self.stats_print_interval)
+        self.mqtt_net.set_stats_ping_interval(self.stats_ping_interval)
 
     def _apply_global_topic_list_settings(self, candidate):
         """把候选配置的 global_topic_list 报告参数热更新到实例字段。"""
@@ -1008,6 +1084,8 @@ def start(config=None,globals=None):
         "global_topic_list_check_interval",
         "global_topic_list_publish_kwargs",
         "enable_global_topic_list",
+        "stats_print_interval",
+        "stats_ping_interval",
     ):
         if key in config:
             explicit_rpc_settings[key] = config[key]
@@ -1025,6 +1103,8 @@ def start(config=None,globals=None):
         "mqtt_global_topic_list_idle_threshold",
         "mqtt_global_topic_list_check_interval",
         "mqtt_global_topic_list_publish_kwargs",
+        "mqtt_stats_print_interval",
+        "mqtt_stats_ping_interval",
     ):
         if key in config:
             explicit_rpc_settings[key[len("mqtt_"):]] = config[key]
@@ -1051,6 +1131,8 @@ def start(config=None,globals=None):
         global_topic_list_check_interval=rpc_settings["global_topic_list_check_interval"],
         global_topic_list_publish_kwargs=rpc_settings["global_topic_list_publish_kwargs"],
         global_topic_list_payload_fn=config.get("mqtt_global_topic_list_payload_fn"),
+        stats_print_interval=rpc_settings["stats_print_interval"],
+        stats_ping_interval=rpc_settings["stats_ping_interval"],
     )
 
     # logger.info(

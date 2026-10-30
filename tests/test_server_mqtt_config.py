@@ -17,7 +17,8 @@ import server_mqtt
 class FakeMQTTManager:
     instances = []
 
-    def __init__(self, brokers, server_public_key_bytes=None, **_kwargs):
+    def __init__(self, brokers, server_public_key_bytes=None,
+                 stats_print_interval=None, stats_ping_interval=None, **_kwargs):
         self.brokers = brokers
         self.server_public_key_bytes = server_public_key_bytes
         self.server_vk = None
@@ -27,7 +28,21 @@ class FakeMQTTManager:
         self.unsubscribed = []
         self.stopped = False
         self.callback = None
+        self.stats_print_interval = (
+            server_mqtt.DEFAULT_STATS_PRINT_INTERVAL
+            if stats_print_interval is None else stats_print_interval
+        )
+        self.stats_ping_interval = (
+            server_mqtt.DEFAULT_STATS_PING_INTERVAL
+            if stats_ping_interval is None else stats_ping_interval
+        )
         self.__class__.instances.append(self)
+
+    def set_stats_print_interval(self, seconds):
+        self.stats_print_interval = seconds
+
+    def set_stats_ping_interval(self, seconds):
+        self.stats_ping_interval = seconds
 
     def set_on_message(self, callback):
         self.callback = callback
@@ -438,6 +453,132 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(self.server.global_topic_list_interval,
                          server_mqtt.DEFAULT_GLOBAL_TOPIC_LIST_INTERVAL)
         self.assertFalse(self.config_path.exists())
+
+    def test_stats_intervals_load_from_rpc_json(self):
+        """rpc.json 中的 stats_print_interval / stats_ping_interval 必须生效。"""
+        self.config_path.write_text(
+            json.dumps({
+                "stats_print_interval": 120,
+                "stats_ping_interval": 30,
+            }),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+        self.assertEqual(config["stats_print_interval"], 120.0)
+        self.assertEqual(config["stats_ping_interval"], 30.0)
+
+        server = server_mqtt.MQTTServer(
+            brokers=[("b.example", 1883)],
+            request_topic="t/request",
+            server_public_key_bytes=None,
+            rpc_config_source=config,
+        )
+        self.assertEqual(server.stats_print_interval, 120.0)
+        self.assertEqual(server.stats_ping_interval, 30.0)
+        # 配置值已传给网络层 stats，报告/Ping 按新周期运行
+        self.assertEqual(server.mqtt_net.stats_print_interval, 120.0)
+        self.assertEqual(server.mqtt_net.stats_ping_interval, 30.0)
+        self.assertEqual(server.get_rpc_config()["stats_print_interval"], 120.0)
+        self.assertEqual(server.get_rpc_config()["stats_ping_interval"], 30.0)
+
+    def test_rpc_config_updates_stats_intervals_hot(self):
+        """只改统计周期时热更新现有 manager，不重建网络连接。"""
+        manager_count = len(FakeMQTTManager.instances)
+
+        result = server_mqtt.rpc_config(
+            stats_print_interval=15.0,
+            stats_ping_interval=5.0,
+        )
+
+        self.assertEqual(result["stats_print_interval"], 15.0)
+        self.assertEqual(result["stats_ping_interval"], 5.0)
+        self.assertEqual(self.server.stats_print_interval, 15.0)
+        self.assertEqual(self.server.stats_ping_interval, 5.0)
+        self.assertEqual(self.server.mqtt_net.stats_print_interval, 15.0)
+        self.assertEqual(self.server.mqtt_net.stats_ping_interval, 5.0)
+        self.assertEqual(len(FakeMQTTManager.instances), manager_count)
+        stored = json.loads(self.config_path.read_text())
+        self.assertEqual(stored["stats_print_interval"], 15.0)
+        self.assertEqual(stored["stats_ping_interval"], 5.0)
+
+    def test_stats_intervals_allow_zero_to_disable(self):
+        """0 是合法值：关闭周期报告 / 停用周期 Ping。"""
+        result = server_mqtt.rpc_config(
+            stats_print_interval=0,
+            stats_ping_interval=0,
+        )
+        self.assertEqual(result["stats_print_interval"], 0.0)
+        self.assertEqual(result["stats_ping_interval"], 0.0)
+        self.assertEqual(self.server.mqtt_net.stats_print_interval, 0.0)
+        self.assertEqual(self.server.mqtt_net.stats_ping_interval, 0.0)
+
+    def test_invalid_stats_intervals_rejected(self):
+        """负数/非数字/NaN/inf 必须整体拒收，不落盘。"""
+        for bad_updates in (
+            {"stats_print_interval": -1},
+            {"stats_ping_interval": -5},
+            {"stats_print_interval": "abc"},
+            {"stats_ping_interval": float("inf")},
+            {"stats_print_interval": float("nan")},
+            {"stats_ping_interval": True},
+        ):
+            with self.assertRaises(ValueError):
+                server_mqtt.rpc_config(**bad_updates)
+        self.assertEqual(self.server.stats_print_interval,
+                         server_mqtt.DEFAULT_STATS_PRINT_INTERVAL)
+        self.assertEqual(self.server.stats_ping_interval,
+                         server_mqtt.DEFAULT_STATS_PING_INTERVAL)
+
+    def test_client_stats_print_interval_loads_without_touching_server(self):
+        """客户端专属键写入配置，但服务端统计周期仍按 stats_print_interval。"""
+        self.config_path.write_text(
+            json.dumps({
+                "client_stats_print_interval": 90,
+                "stats_print_interval": 120,
+            }),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+        self.assertEqual(config["client_stats_print_interval"], 90.0)
+        self.assertEqual(config["stats_print_interval"], 120.0)
+
+        server = server_mqtt.MQTTServer(
+            brokers=[("b.example", 1883)],
+            request_topic="t/request",
+            server_public_key_bytes=None,
+            rpc_config_source=config,
+        )
+        # 服务端只应用 stats_print_interval，不应用 client_stats_print_interval
+        self.assertEqual(server.stats_print_interval, 120.0)
+        self.assertEqual(server.mqtt_net.stats_print_interval, 120.0)
+        self.assertEqual(
+            server.get_rpc_config()["client_stats_print_interval"], 90.0)
+
+    def test_client_stats_print_interval_hot_update_and_unset(self):
+        """rpc_config 可设置/清除客户端专属键，且不影响服务端周期。"""
+        result = server_mqtt.rpc_config(client_stats_print_interval=45)
+        self.assertEqual(result["client_stats_print_interval"], 45.0)
+        self.assertEqual(self.server.stats_print_interval,
+                         server_mqtt.DEFAULT_STATS_PRINT_INTERVAL)
+        stored = json.loads(self.config_path.read_text())
+        self.assertEqual(stored["client_stats_print_interval"], 45.0)
+
+        # null/空字符串表示未设置：客户端会继续回退 stats_print_interval
+        for unset in (None, ""):
+            result = server_mqtt.rpc_config(client_stats_print_interval=unset)
+            self.assertIsNone(result["client_stats_print_interval"])
+            stored = json.loads(self.config_path.read_text())
+            self.assertIsNone(stored["client_stats_print_interval"])
+
+    def test_client_stats_print_interval_invalid_rejected(self):
+        """客户端专属键只接受 null/空串或 >=0 的秒数。"""
+        for bad_value in (-1, "abc", float("inf"), float("nan"), True):
+            with self.assertRaises(ValueError):
+                server_mqtt.rpc_config(client_stats_print_interval=bad_value)
+        self.assertIsNone(self.server.get_rpc_config()[
+            "client_stats_print_interval"])
 
     def test_rpc_functions_are_callable_over_http(self):
         import server_http
