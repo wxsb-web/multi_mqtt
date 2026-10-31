@@ -1807,6 +1807,25 @@ class TerminalWriterTests(unittest.TestCase):
         self.assertTrue(captured[0].startswith("[RPC]"))
         self.assertIn("1.2.3.4:5555", captured[0])
 
+    def test_log_message_silenced_for_rdp_page_requests(self):
+        # rdp 控制页「服务端日志」关闭后所有请求带 X-RDP-Log: 0：
+        # 2xx 访问行不再写（每次点击/截图都会打一行，刷屏），
+        # 4xx/5xx 与未带标记的请求照常输出。
+        import server_http
+        h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)
+        h.client_address = ("1.2.3.4", 5555)
+        captured = []
+        h.log_sink = captured.append
+        h.headers = {"X-RDP-Log": "0"}
+        h.log_message('"%s" %s %s', "GET /rdp.click(1,2) HTTP/1.0", 200, "-")
+        self.assertEqual(captured, [])
+        h.log_message('"%s" %s %s', "GET /rdp.click(1,2) HTTP/1.0", 500, "-")
+        self.assertEqual(len(captured), 1)
+        self.assertIn("[RPC]", captured[0])
+        h.headers = {}
+        h.log_message('"%s" %s %s', "GET /x HTTP/1.0", 200, "-")
+        self.assertEqual(len(captured), 2)
+
     def test_log_message_falls_back_when_sink_raises(self):
         import server_http
         h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)

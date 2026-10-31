@@ -424,6 +424,32 @@ def _conf(handler, name):
     return getattr(RPCRequestHandler, name)
 
 
+def _status_of(text):
+    """从 http.server 的访问行里取状态码；取不到返回 0（按“不可判定”当普通日志）。"""
+    try:
+        return int(text.rsplit('"', 1)[-1].split()[0])
+    except Exception:
+        return 0
+
+
+def _rdp_log_off(handler):
+    """请求是否要求静音 [RPC] 访问行：rdp.py 控制页「服务端日志」开关关闭时，
+    页面所有 fetch 都带 ``X-RDP-Log: 0``。
+
+    只影响该请求自己这一行，不改服务器级开关——同进程其它客户端（日志台
+    之外的工具、其它页面）的访问行照常输出。写成函数并带 getattr 兜底，
+    是因为测试/WSGI 垫片里的 handler 可能是 __new__ 出来的、没有 headers。
+    """
+    headers = getattr(handler, 'headers', None)
+    if headers is None:
+        return False
+    try:
+        value = headers.get('X-RDP-Log', '')
+    except Exception:
+        return False
+    return str(value).strip().lower() in ('0', 'off', 'false', 'no')
+
+
 def _is_alias_url(handler, raw_path):
     """alias_url='raw' 时，判断路径（去掉前导 /）是否正好是已注册别名。
 
@@ -506,17 +532,16 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             text = format % args
         except Exception:
             text = str(format)
-        # /mcp 的一次工具调用在 HTTP 层会伴随 initialize/notifications/tool
-        # call 多条 POST，2xx 访问行既无工具名也无参数，只会把日志冲散；
-        # 真正的调用轨迹由 pty 侧 [MCP] <id> ┌/└ 首尾配对承担。这里只在
-        # 4xx/5xx 保留访问行，便于排查协议层失败。
-        if '/mcp' in text:
-            try:
-                code = int(text.rsplit('"', 1)[-1].split()[0])
-            except Exception:
-                code = 0
-            if 200 <= code < 400:
-                return
+        # 2xx/3xx 访问行在两类高噪声通道上不写：
+        # * /mcp 的一次工具调用在 HTTP 层会伴随 initialize/notifications/tool
+        #   call 多条 POST，既无工具名也无参数，只会把日志冲散；真正的调用
+        #   轨迹由 pty 侧 [MCP] <id> ┌/└ 首尾配对承担。
+        # * rdp.py 控制页的「服务端日志」开关关闭后，页面所有请求都带
+        #   X-RDP-Log: 0——每点一下、每张自动刷新截图都是一条 HTTP 请求，
+        #   逐条访问行会把日志台刷满，同样的内容页面 #log 自己已记录。
+        # 4xx/5xx 一律保留，便于排查协议层/服务端失败。
+        if 200 <= _status_of(text) < 400 and ('/mcp' in text or _rdp_log_off(self)):
+            return
         line = (f"[RPC] {stime()[12:]}  {self.client_address[0]}:"
                 f"{self.client_address[1]} {text}")
         sink = _conf(self, 'log_sink')
