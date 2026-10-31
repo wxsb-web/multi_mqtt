@@ -58,6 +58,15 @@ from server_http import RPCRequestHandler
 # 用环境变量覆盖便于同一份代码在本地调试或换前缀，置空 RPC_KEY 即回到无前缀。
 RPC_KEY = os.environ.get('RPC_KEY', '-')
 ALIAS_URL = os.environ.get('RPC_ALIAS_URL', 'raw')
+# alias_url 归一化成 (路由模式 'dash'/'raw', 是否 JSON 解码 query 值)。
+# 环境变量属于显式配置，写错时降级为默认 dash 并 WARNING，不让整个 WSGI
+# 应用 import 失败（AGENTS.md：附加功能出问题只降级，不阻塞主流程）。
+try:
+    _ALIAS_URL_MODE, _ALIAS_JSON = server_http.normalize_alias_url(ALIAS_URL)
+except ValueError as _alias_url_error:
+    logging.getLogger('app').warning(
+        'RPC_ALIAS_URL=%r 无效，降级为 dash: %s', ALIAS_URL, _alias_url_error)
+    _ALIAS_URL_MODE, _ALIAS_JSON = server_http.ALIAS_URL_DASH, False
 # 首页 / 执行的别名名（默认 root）与别名持久化开关（默认开启，写 rpc.json）。
 RPC_ROOT_ALIAS = os.environ.get('RPC_ROOT_ALIAS', 'root')
 RPC_PERSIST_ALIASES = os.environ.get(
@@ -159,6 +168,9 @@ class _WSGIHandlerShim:
         path = _wsgi_unescape(environ.get('PATH_INFO', '') or '')
         self.path = path + (
             '?' + urllib.parse.unquote(qs, encoding='utf-8') if qs else '')
+        # 别名参数（alias.md 8.1）：从**原始** QUERY_STRING 解析一次，
+        # handle_rpc 优先读这里，避免对已 unquote 的 self.path 二次解码。
+        self.query_params = server_http.parse_query_params(qs)
         # 告知 handle_rpc：路径已是解码后的文本，不要再 unquote。
         self.path_already_decoded = True
 
@@ -178,7 +190,8 @@ class _WSGIHandlerShim:
         # ALIAS_URL），否则同进程再起一台无 key 的 start_rpc_server（测试或
         # 本地调试）会把类属性改回 ''，线上 /- 地址会整体 403。
         self.key = RPC_KEY
-        self.alias_url = ALIAS_URL
+        self.alias_url = _ALIAS_URL_MODE
+        self.alias_json = _ALIAS_JSON
         # 首页别名 / 持久化开关同样固定在部署配置上：同进程再起别的服务器
         # （测试或本地调试）改类属性也不能改变线上首页与落盘行为。
         self.root_alias = RPC_ROOT_ALIAS
@@ -446,7 +459,7 @@ server_http.start_rpc_server(
     port=int(os.environ.get('RPC_PORT', '6080')),
     ip='0.0.0.0',
     key=RPC_KEY,
-    alias_url=ALIAS_URL,
+    alias_url=_ALIAS_URL_MODE,
     root_alias=RPC_ROOT_ALIAS,
     persist_aliases=RPC_PERSIST_ALIASES,
     globals=globals(),

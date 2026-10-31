@@ -22,6 +22,180 @@ import rpc_executor
 from rpc_executor import ALIAS_KEYWORDS, UNALIAS_KEYWORDS, PythonExecutor
 
 
+class AliasParamsModeTests(unittest.TestCase):
+    """params 模式：签名声明可绑定集 + 默认值，参数走请求级注入管线。"""
+
+    def setUp(self):
+        self.ex = PythonExecutor()
+
+    def test_registration_record_and_binding(self):
+        res = self.ex.execute("#alias add(x, y=3)\nint(x) + int(y)")
+        self.assertTrue(res["ok"], res)
+        self.assertIn("alias", res)
+        record = self.ex.aliases["add"]
+        self.assertEqual(record["mode"], "params")
+        self.assertEqual(record["signature"], "x, y=3")
+        self.assertEqual(record["params"], ["x", "y"])
+        self.assertEqual(record["defaults"], {"y": 3})
+        self.assertEqual(record["code"], "int(x) + int(y)")
+
+        self.assertEqual(self.ex.execute("add", globals={"x": 4})["r"], 7)
+        self.assertEqual(
+            self.ex.execute("add", globals={"x": 4, "y": 10})["r"], 14)
+
+    def test_missing_and_unknown_params(self):
+        self.ex.execute("#alias add(x, y=3)\nint(x) + int(y)")
+        missing = self.ex.execute("add")
+        self.assertFalse(missing["ok"])
+        self.assertIn("缺少必填参数", missing["error"])
+        self.assertIn("add(x, y=3)", missing["error"])
+
+        unknown = self.ex.execute("add", globals={"x": 1, "y": 2, "z": 3})
+        self.assertFalse(unknown["ok"])
+        self.assertIn("未知参数", unknown["error"])
+        self.assertIn("可绑定", unknown["error"])
+
+    def test_lenient_mode_reports_warnings(self):
+        self.ex.execute("#alias add(x, y=3)\nint(x) + int(y)")
+        self.ex.params_lenient = True
+        res = self.ex.execute("add", globals={"x": 1, "z": 9})
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["r"], 4)                  # 未知 z 被忽略
+        self.assertEqual(len(res["warnings"]), 1)
+        self.assertIn("未知参数", res["warnings"][0])
+
+    def test_params_never_leak_into_namespace(self):
+        self.ex.execute("#alias add(x, y=3)\nint(x) + int(y)")
+        self.ex.execute("add", globals={"x": 4})
+        for name in ("x", "y", "_alias_arg"):
+            self.assertNotIn(name, self.ex.globals_dict, name)
+
+    def test_arg_form_is_orthogonal_to_params(self):
+        # `add=5` 的参数进 _alias_arg，绝不参与 params 注入（alias.md 4.4）
+        self.ex.execute("#alias add(x, y=3)\nx + y")
+        res = self.ex.execute("add=5")
+        self.assertFalse(res["ok"])
+        self.assertIn("NameError", res["error"])
+
+    def test_quoted_non_identifier_param_name(self):
+        res = self.ex.execute('#alias zh("选项A"=1)\nr = 选项A')
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self.ex.aliases["zh"]["defaults"], {"选项A": 1})
+        self.assertEqual(self.ex.execute("zh")["r"], 1)
+
+    def test_plain_alias_free_variables_are_bindable(self):
+        # 无签名别名的可绑定集 = body 顶层自由变量集（13.4）
+        self.ex.execute("#alias sum3\nint(x) + int(y) + int(z)")
+        self.assertEqual(self.ex.aliases["sum3"]["params"], ["x", "y", "z"])
+        self.assertEqual(self.ex.aliases["sum3"]["defaults"], {})
+
+        # 通道显式数据（HTTP query）走 C1；本地 globals 保持旧注入语义
+        http_like = self.ex.execute(
+            "sum3", alias_params={"x": "1", "y": "2"})
+        self.assertFalse(http_like["ok"])
+        self.assertIn("缺少必填参数", http_like["error"])
+
+        ok = self.ex.execute(
+            "sum3", alias_params={"x": "1", "y": "2", "z": "3"})
+        self.assertEqual(ok["r"], 6)
+
+        legacy = self.ex.execute(
+            "sum3", globals={"x": 1, "y": 2, "z": 3, "request": object()})
+        self.assertTrue(legacy["ok"], legacy)
+        self.assertEqual(legacy["r"], 6)
+
+    def test_show_by_signature_form(self):
+        self.ex.execute("#alias add(x, y=3)\nx + y")
+        res = self.ex.execute("#alias add(x, y=3)")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["r"]["name"], "add")
+        self.assertEqual(res["r"]["mode"], "params")
+        self.assertEqual(res["r"]["signature"], "x, y=3")
+        self.assertEqual(res["r"]["params"], ["x", "y"])
+        self.assertEqual(res["r"]["defaults"], {"y": 3})
+
+    def test_list_renders_each_mode(self):
+        self.ex.execute("#alias add(x, y=3)\nx + y")
+        self.ex.execute("#alias git+\nr = _alias_arg")
+        listing = self.ex.execute("#alias")["r"]
+        self.assertEqual(listing["add(x, y=3)"], "x + y")
+        self.assertEqual(listing["git+"], "r = _alias_arg")
+
+
+class AliasRegistrationErrorTests(unittest.TestCase):
+    """R1–R6：注册期 fail fast，注册表不产生记录。"""
+
+    def test_registration_errors_fail_fast(self):
+        cases = [
+            ("#alias a+\nx", "前缀太短"),
+            ("#alias add(*a)\nx", "*args"),
+            ("#alias add(*, x)\nx", "keyword-only"),
+            ("#alias add(x: int)\nx", "类型注解"),
+            ("#alias add(y=x+1)\ny", "默认值必须是字面量"),
+            ("#alias bad(x, z)\nx + y", "dead param"),
+            ("#alias add(_alias_arg)\nx", "保留变量"),
+            ("#alias git+(x)\nx", "前缀 + 签名"),
+        ]
+        for code, expected in cases:
+            with self.subTest(code=code):
+                ex = PythonExecutor()
+                res = ex.execute(code)
+                self.assertFalse(res["ok"], res)
+                self.assertIn(expected, res["error"])
+                self.assertEqual(ex.aliases, {})
+
+
+class AliasPrefixModeTests(unittest.TestCase):
+    """prefix 模式：最长前缀优先，剩余串进 _alias_arg。"""
+
+    def setUp(self):
+        self.ex = PythonExecutor()
+
+    def test_remainder_and_empty_calls(self):
+        self.ex.execute("#alias git+\nr = _alias_arg")
+        self.assertEqual(self.ex.execute("git status -s")["r"], "status -s")
+        self.assertEqual(self.ex.execute("git")["r"], "")       # C5：空剩余
+        self.assertEqual(self.ex.execute("git+")["r"], "")       # 记录名 exact
+        self.assertEqual(self.ex.execute("gity")["r"], "y")
+
+    def test_longest_prefix_wins(self):
+        self.ex.execute("#alias gi+\nr = 'short:' + _alias_arg")
+        self.ex.execute("#alias git+\nr = 'long:' + _alias_arg")
+        self.assertEqual(self.ex.execute("git status")["r"], "long:status")
+        self.assertEqual(self.ex.execute("gi hello")["r"], "short:hello")
+
+    def test_escape_and_prefix_switch(self):
+        self.ex.execute("#alias git+\nr = _alias_arg")
+        hits = self.ex.aliases["git+"]["hits"]
+
+        escaped = self.ex.execute("\\git status")       # 字面执行，不展开
+        self.assertFalse(escaped["ok"])
+        self.assertIn("SyntaxError", escaped["error"])
+        self.assertEqual(self.ex.aliases["git+"]["hits"], hits)
+
+        disabled = self.ex.execute("git status", alias_prefix=False)
+        self.assertFalse(disabled["ok"])
+        self.assertIn("SyntaxError", disabled["error"])
+        self.assertEqual(self.ex.aliases["git+"]["hits"], hits)
+
+    def test_exact_name_and_prefix_coexist(self):
+        self.ex.execute("#alias git\nr = 'exact'")
+        self.ex.execute("#alias git+\nr = 'prefix:' + _alias_arg")
+        self.assertEqual(self.ex.execute("git")["r"], "exact")
+        self.assertEqual(self.ex.execute("git pull")["r"], "prefix:pull")
+
+    def test_prefix_record_has_no_bindable_params(self):
+        # alias.md 4.1：prefix 模式无可绑定名，输入一律走 _alias_arg；
+        # body 的其它自由变量仍按普通名字从持久命名空间解析。
+        self.ex.globals_dict["shout"] = lambda text: "[" + text + "]"
+        self.ex.execute("#alias git+\nr = shout(_alias_arg)")
+        record = self.ex.aliases["git+"]
+        self.assertEqual(record["mode"], "prefix")
+        self.assertEqual(record["params"], [])
+        self.assertEqual(record["defaults"], {})
+        self.assertEqual(self.ex.execute("git status")["r"], "[status]")
+
+
 class AliasCrudTests(unittest.TestCase):
     def setUp(self):
         self.ex = PythonExecutor()
@@ -61,6 +235,13 @@ class AliasCrudTests(unittest.TestCase):
     def test_use_surrounding_whitespace(self):
         self.ex.execute("#alias w1\nr='ok'")
         self.assertEqual(self.ex.execute("  w1 \n")["r"], "ok")
+
+    def test_import_bindings_are_not_free_variables(self):
+        # import 绑定名字（无 Name 节点）不算自由变量，否则会被误判成
+        # 可绑定参数 / 必填参数（HTTP query 侧直接表现为 C1/C2）。
+        self.ex.execute("#alias lib\nimport math\nr = math.floor(2.9)")
+        self.assertEqual(self.ex.aliases["lib"]["params"], [])
+        self.assertEqual(self.ex.execute("lib")["r"], 2)
 
     def test_await_body(self):
         res = self.ex.execute(
@@ -186,6 +367,45 @@ class AliasCrudTests(unittest.TestCase):
         res = self.ex.execute("#alias for\nr=1")
         self.assertTrue(res["ok"], res)
         self.assertEqual(self.ex.execute("for")["r"], 1)
+
+    # ---------------- 带参数调用 ---------------- #
+
+    def test_alias_call_with_path_argument(self):
+        # URL /<别名>=<参数> 的语义：路径本身作为参数写进 _alias_arg
+        res = self.ex.execute("#alias where\nr = _alias_arg")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["r"], "")                 # 定义即执行：无参数
+
+        used = self.ex.execute("where=/home/suishou/multi_mqtt/")
+        self.assertTrue(used["ok"], used)
+        self.assertEqual(used["r"], "/home/suishou/multi_mqtt/")
+        self.assertEqual(self.ex.aliases["where"]["hits"], 1)
+
+    def test_alias_argument_default_and_reset(self):
+        self.ex.execute(
+            "#alias gp\ndir = _alias_arg or '/tmp/default'\nr = dir")
+        self.assertEqual(self.ex.execute("gp=/home/u/proj")["r"], "/home/u/proj")
+        # 精确调用（不带参数）时参数复位成空串，不会沿用上一次的值
+        self.assertEqual(self.ex.execute("gp")["r"], "/tmp/default")
+
+    def test_alias_argument_keeps_slashes_and_equals(self):
+        self.ex.execute("#alias echo1\nr = _alias_arg")
+        self.assertEqual(self.ex.execute("echo1=/a/b=c/d/")["r"], "/a/b=c/d/")
+        self.assertEqual(self.ex.execute("echo1=")["r"], "")
+
+    def test_unregistered_prefix_is_not_expanded(self):
+        # 未注册的 name=value 仍按普通 Python 执行（这里是语法错误），
+        # 前缀匹配只对已注册别名生效，不会劫持普通赋值
+        res = self.ex.execute("nosuch=/home/u/proj")
+        self.assertFalse(res["ok"])
+        self.assertIn("SyntaxError", res["error"])
+
+    def test_split_alias_call(self):
+        self.assertEqual(rpc_executor.split_alias_call("a=/x/"), ("a", "/x/"))
+        self.assertEqual(rpc_executor.split_alias_call("a="), ("a", ""))
+        self.assertEqual(rpc_executor.split_alias_call("a=1=2"), ("a", "1=2"))
+        for bad in ("=x", "a b=1", "a", "", None):
+            self.assertIsNone(rpc_executor.split_alias_call(bad), bad)
 
     def test_invalid_body_not_saved(self):
         res = self.ex.execute("#alias bad\n1+")

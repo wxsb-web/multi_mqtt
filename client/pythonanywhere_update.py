@@ -351,9 +351,21 @@ def _site_file_url(base, path, key=''):
 
 
 def _serve_body(remote_path, file_name, rate_limit, chunk_size, content_type):
-    """别名 body：分块流式输出，先等配额再写，整段耗时 ≈ 文件大小 / rate_limit。"""
+    """别名 body：首行 #serve-file 规格，后面保留等价的可执行代码。
+
+    server_http 看到首行规格后直接读文件流式输出（不经过执行器、不占执行
+    锁，客户端断开立即停）；旧版服务端 / 其它通道不认识规格时，仍按后面
+    的可执行代码分块输出（先等配额再写，整段耗时 ≈ 文件大小 / rate_limit）。
+    """
     disposition = 'attachment; filename="%s"' % str(file_name).replace('"', '_')
-    return "\n".join([
+    spec = json.dumps({
+        'path': str(remote_path),
+        'filename': str(file_name),
+        'content_type': str(content_type),
+        'rate_limit': int(rate_limit or 0),
+        'chunk_size': max(1024, int(chunk_size or 65536)),
+    }, ensure_ascii=True)
+    body = "\n".join([
         "import os, time",
         "__p = os.path.abspath(os.path.expanduser(%r))" % str(remote_path),
         "__rate = %d" % int(rate_limit or 0),
@@ -383,6 +395,7 @@ def _serve_body(remote_path, file_name, rate_limit, chunk_size, content_type):
         "    except (BrokenPipeError, ConnectionResetError):",
         "        pass",
     ])
+    return "#serve-file " + spec + "\n" + body
 
 
 def _mount_body(url_name, body, persist):
@@ -418,7 +431,11 @@ def _mount_body(url_name, body, persist):
     ]
     return "\n".join(lines)
 
-ALIAS_RATE_LIMIT = 200 * 1024  # 服务端字节/秒（按 1024 字节/KB）；0 = 不限速
+# 服务端字节/秒（按 1024 字节/KB）；0 = 不限速。
+# 默认 300KB：PythonAnywhere 的 web 请求有 300 秒上限（实测 200KB/s 下
+# 61,538,304 字节（正好 300.48s）被网关切断），66MB 的 APK 在 200KB/s
+# 需要 5.4 分钟必然下不完；300KB/s 约 3.6 分钟，留 1 分钟余量。
+ALIAS_RATE_LIMIT = 300 * 1024
 def alias_file_download(base, remote_path='~/ime.apk', url_name=None,
                         rate_limit=ALIAS_RATE_LIMIT, chunk_size=64 * 1024,
                         content_type='application/vnd.android.package-archive',
@@ -429,8 +446,9 @@ def alias_file_download(base, remote_path='~/ime.apk', url_name=None,
     * remote_path: 相对 / 绝对 / '~/ime.apk' 均可——远端用
       os.path.expanduser + abspath 解析，'~/ime.apk' 与
       '/home/<user>/ime.apk' 等价。
-    * rate_limit: 服务端字节/秒，默认 200KB/s，0 = 全速。65MB 在 200KB/s
-      约 5.4 分钟；站点若限制单请求时长，调大或传 0。
+    * rate_limit: 服务端字节/秒，默认 300KB/s，0 = 全速。PythonAnywhere
+      对单个 web 请求有 300 秒上限：限速调得太低会让 66MB 的 APK 在
+      300 秒处被网关切断（200KB/s 实测在 61.5MB 处断流），宁可调大。
     * url_name: 下载路径，默认取文件名（ime.apk → /ime.apk）。
     * persist: True（默认）把 body 写进 rpc.json 的 http_aliases，
       SIGHUP 重载 / 重启后自动恢复；False 只注册到进程内存。

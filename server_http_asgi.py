@@ -51,6 +51,14 @@ logger = logging.getLogger(__name__)
 # 本 ASGI 应用的部署配置（默认值、覆盖方式与 server_http_wsgi 保持一致）。
 RPC_KEY = os.environ.get('RPC_KEY', '-')
 ALIAS_URL = os.environ.get('RPC_ALIAS_URL', 'raw')
+# alias_url 归一化成 (路由模式 'dash'/'raw', 是否 JSON 解码 query 值)；
+# 环境变量写错只降级为默认 dash 并 WARNING，不让 ASGI 应用 import 失败。
+try:
+    _ALIAS_URL_MODE, _ALIAS_JSON = server_http.normalize_alias_url(ALIAS_URL)
+except ValueError as _alias_url_error:
+    logger.warning('RPC_ALIAS_URL=%r 无效，降级为 dash: %s',
+                   ALIAS_URL, _alias_url_error)
+    _ALIAS_URL_MODE, _ALIAS_JSON = server_http.ALIAS_URL_DASH, False
 RPC_ROOT_ALIAS = os.environ.get('RPC_ROOT_ALIAS', 'root')
 RPC_PERSIST_ALIASES = os.environ.get(
     'RPC_PERSIST_ALIASES', '1').strip().lower() not in ('0', 'false', 'no', 'off', '')
@@ -166,6 +174,9 @@ class _ASGIHandlerShim:
         self.path = path + (
             '?' + urllib.parse.unquote(self.query_string, encoding='utf-8')
             if self.query_string else '')
+        # 别名参数（alias.md 8.1）：从原始 query 解析一次，handle_rpc 优先
+        # 读这里，避免对已 unquote 的 self.path 二次解码。
+        self.query_params = server_http.parse_query_params(self.query_string)
         # 告知 handle_rpc：路径已是解码后的文本，不要再 unquote。
         self.path_already_decoded = True
 
@@ -204,7 +215,8 @@ class _ASGIHandlerShim:
         # 部署配置固定在模块常量上：同进程再起别的 start_rpc_server（测试或
         # 本地调试）改类属性不能把线上 /- 地址整体 403。
         self.key = RPC_KEY
-        self.alias_url = ALIAS_URL
+        self.alias_url = _ALIAS_URL_MODE
+        self.alias_json = _ALIAS_JSON
         self.root_alias = RPC_ROOT_ALIAS
         self.persist_aliases = RPC_PERSIST_ALIASES
         self.executor = _APP_EXECUTOR or RPCRequestHandler.executor
@@ -618,7 +630,7 @@ server_http.start_rpc_server(
     port=int(os.environ.get('RPC_PORT', '6080')),
     ip='0.0.0.0',
     key=RPC_KEY,
-    alias_url=ALIAS_URL,
+    alias_url=_ALIAS_URL_MODE,
     root_alias=RPC_ROOT_ALIAS,
     persist_aliases=RPC_PERSIST_ALIASES,
     globals=globals(),

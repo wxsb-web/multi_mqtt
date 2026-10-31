@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac, weakref, json, os, tempfile
+import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac, weakref, json, os, tempfile, time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from pathlib import Path
@@ -56,15 +56,40 @@ def _read_config_document(path=None):
         return document
 
 
-def _persisted_alias_codes(path=None):
-    """返回 rpc.json 里 http_aliases 段的 name -> code（只收字符串值）。"""
+def _persisted_alias_records(path=None):
+    """返回 rpc.json 里 http_aliases 段的 name -> ``{'code','signature'}``。
+
+    兼容两种值形态：字符串（plain / prefix 别名）与 object（params 别名
+    带签名）。其它形态跳过，不让手工编辑过的文件打断启动。params 别名
+    只存名字 + 签名，模式 / 可绑定集 / 默认值启动时由执行器重新推导，
+    避免文件里的派生字段过期。
+    """
     document = _read_config_document(path)
     if not document:
         return {}
     stored = document.get(ALIAS_CONFIG_KEY)
     if not isinstance(stored, dict):
         return {}
-    return {name: code for name, code in stored.items() if isinstance(code, str)}
+    records = {}
+    for name, value in stored.items():
+        if isinstance(value, str):
+            records[name] = {'code': value, 'signature': None}
+        elif isinstance(value, dict):
+            code = value.get('code')
+            if not isinstance(code, str):
+                continue
+            signature = value.get('signature')
+            records[name] = {
+                'code': code,
+                'signature': signature if isinstance(signature, str) else None,
+            }
+    return records
+
+
+def _persisted_alias_codes(path=None):
+    """兼容旧接口：只取 name -> code（params 签名请用 _persisted_alias_records）。"""
+    return {name: payload['code']
+            for name, payload in _persisted_alias_records(path).items()}
 
 
 def _update_persisted_aliases(updates=None, deletes=(), path=None):
@@ -117,28 +142,31 @@ def load_persisted_aliases(executor, path=None):
     """启动时把 rpc.json 的 http_aliases 装回执行器别名表（内存优先）。
 
     返回本次恢复的 name -> code。命名空间里已存在的同名别名不覆盖；非法
-    名字 / 空代码跳过，防止手工编辑过的文件把执行器搞脏。名字规则与
-    #alias 一致（rpc_executor.is_valid_alias_name），带点的 ime.apk 等
-    任意非空白名字都能长期恢复。
+    名字 / 空代码 / 坏签名跳过，防止手工编辑过的文件把执行器搞脏。名字
+    规则与 #alias 一致（rpc_executor.is_valid_alias_name），带点的
+    ime.apk、params 的 add(x, y=3)、prefix 的 git+ 都能长期恢复；模式 /
+    可绑定集 / 默认值由执行器按签名重新推导，不信任文件里的派生字段。
     """
     if executor is None or not getattr(executor, 'alias', False):
         return {}
     now = utc_ms()
     restored = {}
-    for name, code in _persisted_alias_codes(path).items():
+    for name, payload in _persisted_alias_records(path).items():
+        code = payload['code']
         if (not code.strip() or not isinstance(name, str)
                 or not rpc_executor.is_valid_alias_name(name)):
             continue
         if name in executor.aliases:
             continue
-        executor.aliases[name] = {
-            'code': code,
-            'created': now,
-            'updated': now,
-            'hits': 0,
-            'last_used': None,
-        }
-        restored[name] = code
+        try:
+            restored_name, record = rpc_executor.build_alias_record(
+                name, code, signature=payload['signature'], now=now)
+        except (ValueError, SyntaxError) as error:
+            logging.getLogger('app').warning(
+                '别名持久化跳过 %r：%s', name, error)
+            continue
+        executor.aliases[restored_name] = record
+        restored[restored_name] = code
     if restored:
         logging.getLogger('app').info(
             '别名持久化: 从 %s 恢复 %d 个 (%s)',
@@ -152,6 +180,10 @@ def sync_alias_persistence(executor, execution, ephemeral=False, path=None):
     ``ephemeral=True``（本次定义带“不持久化”标记）时不写入，并把同名旧
     记录一并清掉，避免文件里留一份过期副本。其它指令（show / list）不动
     文件，避免每次查询都产生写放大与 hits 计数写入。
+
+    plain / prefix 别名仍以字符串落盘（与旧格式逐字节兼容）；params 别名
+    落盘为 ``{"code": ..., "signature": ...}``，否则重启后签名丢失、别名
+    退化成 plain。
     """
     info = execution.get('alias') if isinstance(execution, dict) else None
     if not isinstance(info, dict):
@@ -163,7 +195,10 @@ def sync_alias_persistence(executor, execution, ephemeral=False, path=None):
             return None
         if ephemeral:
             return _update_persisted_aliases(deletes=[name], path=path)
-        return _update_persisted_aliases(updates={name: code}, path=path)
+        signature = info.get('signature')
+        payload = (code if signature is None
+                   else {'code': code, 'signature': signature})
+        return _update_persisted_aliases(updates={name: payload}, path=path)
     if action == 'unalias':
         deleted = [name for name in (info.get('deleted') or [])
                    if isinstance(name, str)]
@@ -494,16 +529,126 @@ def _log_silenced(handler):
 # 用同名注册覆盖即可，两侧都不会丢规则或重复判定。
 
 
-def _is_alias_url(handler, raw_path):
-    """alias_url='raw' 时，判断路径（去掉前导 /）是否正好是已注册别名。
+ALIAS_URL_DASH = 'dash'
+ALIAS_URL_RAW = 'raw'
 
-    只认执行器里真实存在的别名名（非空且不含空白/控制字符，见
-    rpc_executor.is_valid_alias_name），因此不会把任意路径放进执行器；
-    执行器 alias 总开关关闭时也不放行。
-    'keyed'（默认）不启用本分支：别名只能写在 /<key><code> 里，由执行器
-    自己对整段代码做别名展开——本仓库不改执行器，这里只是 HTTP URL 细节。
+
+def normalize_alias_url(value):
+    """把 alias_url 配置归一化成 ``(路由模式, 是否 JSON 解码 query 值)``。
+
+    路由形态只有 alias.md 8.2 定义的两种：
+
+    * ``'dash'``（默认，兼容旧名 ``'keyed'``）—— 别名永远带 ``-`` 前缀；
+    * ``'raw'`` —— 额外允许 ``/<别名>`` 免前缀（``/-<别名>`` 仍然可用）。
+
+    ``'json'`` **不是第三种路由形态**（alias.md 8.3）：它只表示对 query
+    值尝试 ``json.loads``，失败保留原始字符串。raw 是 dash 的超集，因此
+    ``'json'`` 归一到 raw + 解码；需要 dash 路由 + JSON 解码时写
+    ``'dash-json'``。未知值属于显式配置错误，当场 ValueError。
+
+    ``ASGI / WSGI`` 垫片与 ``start_rpc_server`` 都经这里归一化，保证
+    ``_conf(handler, 'alias_url')`` 在运行期只有两种稳定取值。
     """
-    if _conf(handler, 'alias_url') != 'raw':
+    text = str(value or ALIAS_URL_DASH).strip().lower()
+    if text in ('json', 'raw-json', 'json-raw'):
+        return ALIAS_URL_RAW, True
+    if text in ('dash-json', 'json-dash', 'keyed-json', 'json-keyed'):
+        return ALIAS_URL_DASH, True
+    if text in ('dash', 'keyed', 'key', 'key-prefix', 'after-key'):
+        return ALIAS_URL_DASH, False
+    if text in ('raw', 'url', 'original', 'before-key'):
+        return ALIAS_URL_RAW, False
+    raise ValueError(
+        f"alias_url 只支持 'dash' / 'raw' / 'json'，收到 {text!r}")
+
+
+def _alias_url_mode(handler):
+    """当前 handler 的路由模式；运行期配置坏掉只降级为默认 dash。"""
+    try:
+        return normalize_alias_url(_conf(handler, 'alias_url'))[0]
+    except ValueError:
+        return ALIAS_URL_DASH
+
+
+def parse_query_params(query_string):
+    """把 URL query 解析成 dict（重复 key 按 HTTP 标准 last-wins）。
+
+    容错：坏编码 / 非字符串输入返回 {}，绝不因为 query 解析让请求失败。
+    WSGI / ASGI 垫片用原始 ``QUERY_STRING``（未解码）调用本函数，原生
+    handler 用 ``self.path`` 里 ``?`` 之后的部分；只解析一次，避免二次
+    解码把 ``%25`` 变成 ``%``。
+    """
+    if not query_string or not isinstance(query_string, str):
+        return {}
+    try:
+        pairs = urllib.parse.parse_qsl(query_string, keep_blank_values=True)
+    except Exception:
+        return {}
+    params = {}
+    for key, value in pairs:
+        params[key] = value
+    return params
+
+
+def decode_alias_query(params, as_json=False):
+    """query dict → 注入执行器的调用方数据（alias.md 8.3）。
+
+    默认原样传字符串（``?x=4`` → ``'4'``，body 自己 ``int(x)``）；
+    ``as_json=True``（``alias_url='json'``）时逐值尝试 ``json.loads``，
+    失败保留原始字符串——单个值坏掉不牵连同组其它值。
+    """
+    if not isinstance(params, dict):
+        return {}
+    if not as_json:
+        return dict(params)
+    decoded = {}
+    for key, value in params.items():
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                pass
+        decoded[key] = value
+    return decoded
+
+
+def _alias_exact_record(executor, code):
+    """``code`` 整段精确命中的别名记录；``=arg`` / prefix 形态返回 None。
+
+    HTTP 只对 exact 调用注入 query 参数（alias.md 8.1）：``=arg`` 的参数
+    属于 ``_alias_arg``，prefix 的剩余串同理，都是正交机制，不能被 query
+    覆盖；prefix 记录本身也没有可绑定集。
+    """
+    if executor is None or not getattr(executor, 'alias', False):
+        return None
+    aliases = getattr(executor, 'aliases', None)
+    if not isinstance(aliases, dict) or not isinstance(code, str):
+        return None
+    info = aliases.get(code.strip())
+    if not isinstance(info, dict):
+        return None
+    mode = info.get('mode')
+    if mode == 'prefix' or code.strip().endswith(rpc_executor.ALIAS_PREFIX_SUFFIX):
+        return None
+    return info
+
+
+def _is_alias_url(handler, raw_path):
+    """alias_url='raw' 时，判断路径（去掉前导 /）是否命中已注册别名。
+
+    三种形态都放行（均只匹配**已注册**别名，非别名路径仍 403）：
+
+    * ``/<别名>`` —— 整段 exact（含 ``git+`` 这种前缀记录名）；
+    * ``/<别名>=<参数>`` —— ``=arg`` 形态，参数交给执行器的 _expand_alias，
+      别名 body 里用 ``_alias_arg`` 读（如 ``/git_pull=/home/u/proj``）；
+    * ``/<前缀><剩余>`` —— prefix 别名命中（如 ``/git status``、``/ime /a.apk``），
+      剩余串进 ``_alias_arg``。
+
+    dash 模式不放开免前缀形态，但 ``/-<别名>`` 仍由 key 路由处理。执行器
+    alias 总开关关闭时不放行。query 部分不是路径，已由 handle_rpc 在调用
+    本函数前切开。
+    """
+    if _alias_url_mode(handler) != ALIAS_URL_RAW:
         return False
     executor = _conf(handler, 'executor')
     if executor is None or not getattr(executor, 'alias', False):
@@ -514,7 +659,157 @@ def _is_alias_url(handler, raw_path):
     candidate = raw_path[1:]
     if not getattr(handler, 'path_already_decoded', False):
         candidate = urllib.parse.unquote(candidate)
-    return candidate in aliases
+    if candidate in aliases:
+        return True
+    call = rpc_executor.split_alias_call(candidate)
+    if call is not None and call[0] in aliases:
+        return True
+    return rpc_executor.match_prefix_alias(aliases, candidate) is not None
+
+
+def _is_alias_call(executor, code):
+    """``code`` 是否会被执行器当作别名调用展开。
+
+    命中三种形态：整段 exact 的别名名、``<别名>=<参数>``、以及前缀别名
+    命中（``git status``）。别名调用本身可能不是合法 Python（
+    ``where=/home/u/proj`` 是非法赋值、``git status`` 是两个未定义名字），
+    必须跳过下面的裸路径救援，否则参数 / 剩余串会被补引号再交给 body。
+    """
+    if executor is None or not getattr(executor, 'alias', False):
+        return False
+    aliases = getattr(executor, 'aliases', None)
+    if not isinstance(aliases, dict) or not isinstance(code, str):
+        return False
+    text = code.strip()
+    if text in aliases:
+        return True
+    call = rpc_executor.split_alias_call(text)
+    if call is not None and call[0] in aliases:
+        return True
+    return rpc_executor.match_prefix_alias(aliases, text) is not None
+
+
+SERVE_FILE_MARKER = '#serve-file'
+SERVE_FILE_CHUNK = 64 * 1024
+# 同一个坏规格只告警一次：坏别名每次请求都解析，逐次 warning 会刷爆日志
+_WARNED_SERVE_SPEC = set()
+
+
+def parse_serve_file(code):
+    """解析别名 body 首行的 ``#serve-file {json}`` 文件直出规格。
+
+    规格字段（都容错）：path（必填）、filename、content_type、
+    rate_limit（字节/秒，0 = 全速）、chunk_size。不是该形态、JSON 坏了、
+    字段类型写错，一律返回 None 并只打一次 WARNING——调用方退回普通别名
+    执行，下载端点坏掉不能牵连 RPC 主流程。
+    """
+    if not isinstance(code, str):
+        return None
+    head = code.lstrip().partition('\n')[0].strip()
+    if not head.startswith(SERVE_FILE_MARKER):
+        return None
+    payload = head[len(SERVE_FILE_MARKER):].strip()
+    try:
+        spec = json.loads(payload)
+        if not isinstance(spec, dict):
+            raise ValueError('规格不是 JSON object')
+        path = spec.get('path')
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError('path 缺失')
+        rate_limit = int(spec.get('rate_limit') or 0)
+        chunk_size = int(spec.get('chunk_size') or SERVE_FILE_CHUNK)
+    except (ValueError, TypeError) as error:
+        if payload not in _WARNED_SERVE_SPEC:
+            _WARNED_SERVE_SPEC.add(payload)
+            logging.getLogger('app').warning(
+                '别名文件直出规格无效，退回普通执行: %s (%s)',
+                payload[:120], error)
+        return None
+    filename = spec.get('filename')
+    if not isinstance(filename, str) or not filename.strip():
+        filename = os.path.basename(str(path).rstrip('/\\')) or 'download.bin'
+    content_type = spec.get('content_type')
+    if not isinstance(content_type, str) or not content_type.strip():
+        content_type = 'application/octet-stream'
+    return {
+        'path': str(path),
+        'filename': filename,
+        'content_type': content_type,
+        'rate_limit': max(0, rate_limit),
+        'chunk_size': max(1024, chunk_size),
+    }
+
+
+def _serve_file_spec(executor, code):
+    """``code`` 精确命中带文件直出规格的别名时返回 spec，否则 None。
+
+    只认整段精确的别名名：``<别名>=<参数>`` 不退化成任意路径读取。
+    """
+    if executor is None or not getattr(executor, 'alias', False):
+        return None
+    aliases = getattr(executor, 'aliases', None)
+    if not isinstance(aliases, dict) or not isinstance(code, str):
+        return None
+    info = aliases.get(code.strip())
+    if not isinstance(info, dict):
+        return None
+    return parse_serve_file(info.get('code'))
+
+
+def _stream_alias_file(handler, spec):
+    """在请求线程里直接流式输出文件（不经过执行器，不占执行锁）。
+
+    为什么不能走别名 body：body 在执行器的锁内运行，一个 65MB / 200KB/s
+    的下载会把锁占 5 分钟，期间所有 RPC 排队超时；客户端中途取消还会让
+    服务端继续慢慢写完整个文件。这里直接读文件写 socket，客户端一断开
+    （BrokenPipe/ConnectionReset）立即收手。
+    """
+    path = os.path.abspath(os.path.expanduser(spec['path']))
+    try:
+        size = os.path.getsize(path) if os.path.isfile(path) else None
+    except OSError:
+        size = None
+    if size is None:
+        body = ('not found: %s' % path).encode('utf-8')
+        handler.send_response(404)
+        handler.send_header('Content-Type', 'text/plain; charset=utf-8')
+        handler.send_header('Content-Length', str(len(body)))
+        handler.end_headers()
+        try:
+            handler.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return
+
+    handler.send_response(200)
+    handler.send_header('Content-Type', spec['content_type'])
+    handler.send_header('Content-Length', str(size))
+    handler.send_header(
+        'Content-Disposition',
+        'attachment; filename="%s"' % spec['filename'].replace('"', '_'))
+    handler.send_header('Accept-Ranges', 'bytes')
+    handler.end_headers()
+
+    rate = spec['rate_limit']
+    chunk = spec['chunk_size']
+    sent = 0
+    started = time.monotonic()
+    try:
+        with open(path, 'rb') as source:
+            while True:
+                block = source.read(chunk)
+                if not block:
+                    break
+                if rate > 0:
+                    gap = started + (sent + len(block)) / float(rate)
+                    gap -= time.monotonic()
+                    if gap > 0:
+                        time.sleep(gap)
+                handler.wfile.write(block)
+                sent += len(block)
+    except (BrokenPipeError, ConnectionResetError):
+        logging.getLogger('app').info(
+            '文件直出客户端提前断开 %s (%d/%d bytes)', path, sent, size)
 
 
 def _root_alias_code(handler):
@@ -535,9 +830,11 @@ def _root_alias_code(handler):
 
 class RPCRequestHandler(BaseHTTPRequestHandler):
     key = ''
-    # 别名 URL 的匹配对象：'keyed' 只认 key 处理后的代码，'raw' 额外允许
+    # 别名 URL 的路由形态：'dash' 只认 key 处理后的代码，'raw' 额外允许
     # 已注册别名名直接作 URL（/<别名>，不带 key 前缀）。见 _is_alias_url。
-    alias_url = 'keyed'
+    alias_url = ALIAS_URL_DASH
+    # alias_url='json' 时对 query 值尝试 json.loads（alias.md 8.3）
+    alias_json = False
     # 根路径 '/' 执行的别名名（见 _root_alias_code），默认 'root'
     root_alias = ROOT_ALIAS
     # 别名定义是否写 rpc.json（默认持久化；带“不持久化”标记的除外）
@@ -716,7 +1013,14 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
         if not self.check_basic_auth():
             return
         try:
-            raw_path = self.path
+            # path 与 query 必须切开：路由只认路径部分，query 是别名调用
+            # 的参数（alias.md 8.1）。原生 handler 的 self.path 是原始
+            # percent-encoded 请求行；WSGI / ASGI 垫片已解码路径并把原始
+            # query 解析好放在 self.query_params 上，避免二次解码。
+            raw_path, _, query_text = self.path.partition('?')
+            query_params = getattr(self, 'query_params', None)
+            if not isinstance(query_params, dict):
+                query_params = parse_query_params(query_text)
             key = _conf(self, 'key')
             if key:
                 # key 是真正的 URL 前缀：代码紧跟在根斜杠之后，例如
@@ -730,7 +1034,7 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                     code_str = raw_path[len(legacy_prefix):]
                 elif raw_path.startswith(prefixed):
                     code_str = raw_path[len(prefixed):]
-                elif raw_path == '/' and _conf(self, 'alias_url') == 'raw' and _root_alias_code(self):
+                elif raw_path == '/' and _alias_url_mode(self) == ALIAS_URL_RAW and _root_alias_code(self):
                     # 首页 / 没有 key 前缀：alias_url='raw' 时执行 root_alias
                     # 指向的已注册别名（例如输出 apk.html），保持与 /<别名> 同层。
                     code_str = _root_alias_code(self)
@@ -764,18 +1068,30 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             # 出现第二个名字），剩下的 code 再走语法检查 / 执行。
             code, alias_ephemeral = strip_ephemeral_alias_flag(code, executor)
 
+            # 文件直出别名（body 首行 #serve-file {...}）：在请求线程里直接
+            # 流式输出，不经过执行器。否则整段下载独占执行锁，几分钟内其它
+            # RPC 全部排队超时；规格坏掉时 parse 返回 None，退回普通执行。
+            if getattr(self, 'command', 'GET').upper() == 'GET':
+                serve_spec = _serve_file_spec(executor, code)
+                if serve_spec is not None:
+                    _stream_alias_file(self, serve_spec)
+                    return
+
             # 裸路径救援：URL 里 file=/tmp/txt 不带引号是 SyntaxError，
             # 补引号后能通过语法检查才采用，否则保留原始报错。
-            try:
-                ast.parse(code)
-            except SyntaxError:
-                rescued = _rescue_path_syntax(code)
-                if rescued is not code and rescued != code:
-                    try:
-                        ast.parse(rescued)
-                        code = rescued
-                    except SyntaxError:
-                        pass
+            # 别名调用（<别名>=<参数>）不是 Python，救援会把参数改成带引号
+            # 的字符串，所以整段跳过，交给执行器原样展开。
+            if not _is_alias_call(executor, code):
+                try:
+                    ast.parse(code)
+                except SyntaxError:
+                    rescued = _rescue_path_syntax(code)
+                    if rescued is not code and rescued != code:
+                        try:
+                            ast.parse(rescued)
+                            code = rescued
+                        except SyntaxError:
+                            pass
 
             class ResponseWrapper:
                 """RPC 代码里的 response/p 对象。
@@ -828,13 +1144,22 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 'p': response,
             }
 
+            # 别名调用的调用方数据（alias.md 8.1）：只有整段 exact 命中的
+            # 别名吃 query，`=arg` / prefix 的参数由 _alias_arg 负责，是
+            # 正交机制。query 为空时不传，保持 plain 别名的历史注入语义。
+            alias_params = None
+            if query_params and _alias_exact_record(executor, code) is not None:
+                alias_params = decode_alias_query(
+                    query_params, bool(_conf(self, 'alias_json')))
+
             try:
                 # stdout 捕获由 PythonExecutor 内部的 _redirect_stdout 完成
                 # （execution['stdout'] 即输出），外层不再包 _stdout_lock +
                 # 二次重定向——那会把整个执行串成全局临界区，一条慢请求
                 # （长任务/死循环）就冻结全部 HTTP RPC（含日志台/诊断口）。
                 # 执行的串行化与超时守卫由执行器自身的锁与 timeout 保证。
-                execution = executor.execute(code, globals=context)
+                execution = executor.execute(
+                    code, globals=context, alias_params=alias_params)
                 # 别名定义 / 更新 / 删除写回 rpc.json（默认持久化）。执行
                 # 失败（例如 body 运行报错）时别名可能已注册，因此放在
                 # execute 之后立即同步；持久化本身出错不能打挂请求。
@@ -911,22 +1236,17 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
                      favicon_rgb=None, favicon_size=16, websocket_handler=None,
                      websocket_path='/ws', redirect_root=None, websocket_handlers=None,
                      main_loop=None, listen=True, log_sink=None, basic_auth='',
-                     alias_url='keyed', root_alias=ROOT_ALIAS, persist_aliases=True):
+                     alias_url=ALIAS_URL_DASH, root_alias=ROOT_ALIAS, persist_aliases=True):
     if not key:
         key = ''
     else:
         # key 是路径里的字面前缀，统一去掉首尾斜杠：/<key><code> 与
         # /<key>/<code> 由 handle_rpc 两种都认，key 写成 '/-' 或 '-/' 同义。
         key = str(key).strip('/')
-    # 别名 URL 匹配对象。'keyed' 保持旧行为（别名必须写在 key 之后的代码里）；
-    # 'raw' 额外允许已注册别名名直接作 URL，如 key='-' 时 /add 等价 /-r=1+1。
-    alias_url = str(alias_url or 'keyed').strip().lower()
-    if alias_url in ('key', 'keyed', 'key-prefix', 'after-key'):
-        alias_url = 'keyed'
-    elif alias_url in ('raw', 'url', 'original', 'before-key'):
-        alias_url = 'raw'
-    else:
-        raise ValueError(f"alias_url 只支持 'keyed' 或 'raw'，收到 {alias_url!r}")
+    # 别名 URL 匹配模式。'dash'（默认，兼容旧名 'keyed'）只认 key 处理后的
+    # 代码；'raw' 额外允许已注册别名名直接作 URL（如 key='-' 时 /add 等价
+    # /-r=1+1）。'json' 不是路由形态，只表示 query 值尝试 json.loads。
+    alias_url, alias_json = normalize_alias_url(alias_url)
     # 根路径 / 执行的别名名（未注册时 / 仍是原来的 400/403）；名字按原样
     # 保留，注册到执行器后再解析。
     root_alias = str(root_alias or ROOT_ALIAS).strip()
@@ -969,6 +1289,7 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     config = {
         'key': key,
         'alias_url': alias_url,
+        'alias_json': alias_json,
         'root_alias': root_alias,
         'persist_aliases': persist_aliases,
         'basic_auth': basic_auth or '',
@@ -1101,9 +1422,11 @@ def build_arg_parser():
     parser.add_argument('--key', '-key', '-k', default='',
                         help="URL 前缀，如 - 时 URL 为 /-<code>")
     parser.add_argument('--alias-url', '-alias-url', dest='alias_url',
-                        choices=('keyed', 'raw'), default='keyed',
-                        help="raw 时已注册别名可直接作 URL（/<别名>），"
-                             "keyed 时别名必须写在 /<key><code> 里")
+                        choices=('dash', 'raw', 'json', 'keyed',
+                                 'dash-json', 'raw-json'),
+                        default=ALIAS_URL_DASH,
+                        help="dash 时别名走 /-<别名>；raw 额外允许 /<别名>；"
+                             "json（或 raw-json）再对 query 值尝试 json.loads")
     parser.add_argument('--root-alias', '-root-alias', dest='root_alias',
                         default=ROOT_ALIAS,
                         help="根路径 / 执行的已注册别名名（raw 模式生效）")

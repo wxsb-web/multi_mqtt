@@ -34,8 +34,12 @@ def _http_scope(method, path, headers=None, query=b""):
     }
 
 
-def _call_asgi_path(path, method="GET", headers=None, body=b""):
-    """驱动一次 ASGI 请求，返回 (status:int, headers_dict, body_bytes)。"""
+def _call_asgi_path(path, method="GET", headers=None, body=b"", query=b""):
+    """驱动一次 ASGI 请求，返回 (status:int, headers_dict, body_bytes)。
+
+    ``query`` 是原始 query bytes（与 uvicorn 给 scope['query_string'] 的
+    形态一致）；路径仍是已解码文本。
+    """
     messages = []
 
     async def receive():
@@ -45,7 +49,7 @@ def _call_asgi_path(path, method="GET", headers=None, body=b""):
         messages.append(message)
 
     asyncio.run(server_http_asgi.application(
-        _http_scope(method, path, headers), receive, send))
+        _http_scope(method, path, headers, query), receive, send))
 
     start = next(m for m in messages if m["type"] == "http.response.start")
     out = b"".join(m.get("body") or b"" for m in messages
@@ -99,6 +103,20 @@ class AsgiApplicationTests(unittest.TestCase):
         status, _headers, out = _call_asgi_path("/add")
         self.assertEqual(status, 200)
         self.assertEqual(out, b"2")
+
+    def test_query_params_injected_into_params_alias(self):
+        # alias.md 8.1：ASGI 垫片从原始 query_string 解析一次交给执行器
+        _call_asgi("#alias addi(x, y=3)\nint(x) + int(y)")
+        status, _headers, out = _call_asgi_path("/-addi", query=b"x=4")
+        self.assertEqual(status, 200)
+        self.assertEqual(out, b"7")
+
+    def test_unknown_query_param_returns_500(self):
+        _call_asgi("#alias addi(x, y=3)\nint(x) + int(y)")
+        status, _headers, out = _call_asgi_path(
+            "/-addi", query=b"x=4&z=9")
+        self.assertEqual(status, 500)
+        self.assertIn("未知参数", out.decode("utf-8", "replace"))
 
     def test_root_path_runs_root_alias(self):
         # 首页 / 执行 root 别名（定义后持久化到 rpc.json）
