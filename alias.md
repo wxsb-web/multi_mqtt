@@ -153,23 +153,81 @@ subprocess.run('git ' + _alias_arg, shell=True, cwd='/repo')
 - 定义即执行这一次没有调用方数据：params 别名的**必填**参数、plain 别名
   在命名空间里还拿不到的自由变量，这一次执行跳过（返回消息说明缺哪些
   名字），注册本身仍然成功；
-- `#unalias a b c` → 删除，支持多个；
+- `#unalias a b c` → 删除，支持多个；名字含空白时同样写成字符串字面量
+  （`#unalias "a b" 'c d'`），见 3.1.1；
 - body 自动 `textwrap.dedent`，指令行之后的所有行整体为 body。
+
+### 3.1.1 名字：裸写与 Python 字符串字面量
+
+**裸写规则不变**：一个指令行只能有一个名字，裸名字不能含任何空白，
+所以 `#alias a b` 仍然是错误。名字不要求是 Python 标识符
+（`ime.apk`、`v1.2`、中文都可以）。
+
+需要空白、引号、制表符、换行等字符时，把名字写成 **Python 字符串字面量**
+（与 Python 源码同一套转义，`ast.literal_eval` 语义；只支持单行、无前缀的
+`'...'` / `"..."`）：
+
+```
+#alias "a b"          # 名字 == 'a b'（空格）
+#alias 'a b'          # 单引号等价
+#alias "a\tb"         # \t → 制表符
+#alias "a\nb"         # \n → 真实换行
+#alias "a\"b"         # 转义引号 → a"b
+#alias "a\\b"         # 转义反斜杠 → a\b
+```
+
+字面量后面可以继续跟 `+`（前缀模式）或 `(参数列表)`（params 模式）：
+
+```
+#alias "git status"+              # 前缀别名，有效前缀 'git status'
+#alias "add two"(x, y=3)          # params 别名，名字 'add two'
+```
+
+注意：`+` 后缀在**解码之后**判定。所以 `#alias "git+"` 注册的仍是
+有效前缀 `git` 的 prefix 别名，而不是名字为 `git+` 的 plain 别名。
+
+解码后的名字（下称“名字”）规则：
+
+| 规则 | 说明 |
+|---|---|
+| 非空 | `#alias ""` 拒绝 |
+| 首尾不能有空白 | 指令行与 URL 都会 `strip`，首尾空白永远匹配不上 |
+| **允许内部空白** | 空格 / `\t` / `\n` 都可以（只能来自显式字面量） |
+| 拒绝控制字符 | NUL、`\x01`、DEL 等仍拒绝，避免 URL / JSON / 终端歧义 |
+
+对应的调用写法：
+
+| 调用 | 写法 |
+|---|---|
+| exact | 直接输入解码后的名字：`a b` |
+| `=arg` | 名字含空白时必须加引号：`"a b"=/x`（裸写 `a b=/x` 仍是错误） |
+| prefix | 直接输入前缀开头的文本：`git status -s` |
+
+`#unalias` 同样引号感知：`#unalias "a b" 'c d'` 一次删两个带空格的名字；
+引号未闭合会报错，裸名字的分词行为与旧的 `split()` 完全一致。
+
+列表 / 展示（`#alias`）对不能裸写的名字用 `repr()` 渲染（`'a b'`、
+`'git status'+`、`'add two'(x, y=3)`），保证输出可以原样粘贴回指令行。
+
+持久化（`rpc.json` 的 `http_aliases`）：key 就是解码后的名字（如 `"a b"`），
+启动恢复时直接按解码名重建记录（`build_alias_record(..., decoded_name=True)`），
+不再把名字拼回指令文本；URL 侧 `/a%20b` 在 `unquote` 后精确命中 `a b`。
 
 ### 3.2 params 签名语法
 
 指令行参数部分形如 `add(x, y=3)`。判定规则：去掉首尾空白后，
-若整体以 `)` 结尾且含 `(`，按 `名字(参数列表)` 解析（名字不含空白）；
-参数列表按顶层逗号切分，逐项解析为 `名字[=默认值]`，名字允许写成字符串
-字面量（`"选项A"`），因此中文等非标识符名也能表达；默认值必须
-`ast.literal_eval` 可求值。
+若整体以 `)` 结尾且含 `(`，按 `名字(参数列表)` 解析（名字含空白时
+必须写成字符串字面量，见 3.1.1）；参数列表按顶层逗号切分，逐项解析为
+`名字[=默认值]`，参数名允许写成字符串字面量（`"选项A"`），因此中文等
+非标识符名也能表达，但**参数名本身不能含空白**（它要作为 body 里的
+Python 变量名直接写出）；默认值必须 `ast.literal_eval` 可求值。
 
 允许的参数列表：
 
 ```
 add(x, y)          # 全部必填
 add(x, y=3)        # y 有默认值
-add(x, "选项A"=1)  # 名字规则同别名名：允许中文等非标识符名
+add(x, "选项A"=1)  # 参数名可写成字面量（中文等非标识符名），但不能含空白
 ```
 
 **显式拒绝**（注册时报错拒绝，消息指明原因）：
@@ -219,6 +277,14 @@ params:
   add(x, y=3)               → x + y
 prefix:
   git+                      → import subprocess; ...
+```
+
+含空白 / 引号等不能裸写的名字用 `repr()` 加引号渲染（输出可粘贴回指令行）：
+
+```
+  'a b'                     → r=9
+  'git status'+             → r = _alias_arg
+  'add two'(x, y=3)         → int(x) + int(y)
 ```
 
 ---
@@ -344,7 +410,9 @@ alias param error: 未知参数 ['z']；可绑定: ['x', 'y']
 - 有效前缀长度 ≥ `ALIAS_PREFIX_MIN_LEN`（默认 **2**，可配）：
   `#alias a+` 拒绝（R6）。单字符前缀破坏面太大——它会劫持所有以该
   字符开头的表达式，默认禁掉，逼用户起 `git+`、`ime+` 这种有意义的短前缀；
-- 其余命名规则沿用 `is_valid_alias_name`（无空白 / 控制字符）。
+- 其余命名规则沿用 `is_valid_alias_name`（解码后的名字：非空、首尾无空白、
+  允许内部空白、拒绝控制字符，见 3.1.1）；有效前缀同样按解码名计算，
+  所以 `#alias "git status"+` 的前缀是 `git status`。
 
 ### 6.2 匹配语义
 
@@ -403,7 +471,7 @@ ReDoS 责任由开启者承担，默认永远关闭。**v1 规范只承诺前缀
 |---|---|---|---|
 | ① 转义 | `\` 开头 | `\git status` | 剥 `\`，原样执行，后续全部跳过 |
 | ② exact | 整段等于别名名 | `add`、`hi` | params 别名在此进入注入流程（4.3） |
-| ③ `=arg` | `<名>=<参数>` | `ime=/sdcard/a.apk`、`git=pull` | 只用第一个 `=` 分隔；参数原样进 `_alias_arg`，**不**参与 params 注入 |
+| ③ `=arg` | `<名>=<参数>` | `ime=/sdcard/a.apk`、`git=pull`、`"a b"=/x` | 只用第一个 `=` 分隔；参数原样进 `_alias_arg`，**不**参与 params 注入；名字含空白时必须用字符串字面量 |
 | ④ prefix | 整段以有效前缀开头 | `git pull` | 最长前缀优先；remainder 进 `_alias_arg` |
 | ⑤ fallback | 都不命中 | `abc+1`、`print(abc)` | 原样作为 Python 执行，别名零影响 |
 
@@ -419,7 +487,12 @@ ReDoS 责任由开启者承担，默认永远关闭。**v1 规范只承诺前缀
 GET /-add?x=4&y=3        → executor.execute('add', alias_params={'x': '4', 'y': '3'})
 GET /-git status -s      → executor.execute('git status -s')   # prefix 展开
 GET /-hi                 → executor.execute('hi')              # exact 展开
+GET /-a%20b              → executor.execute('a b')             # 带空格的 exact
+GET /-%22a%20b%22=%2Fx   → executor.execute('"a b"=/x')        # 带空格的 =arg
 ```
+
+URL 里名字的空白写成 `%20`、引号写成 `%22`；server_http 在路由前统一
+`unquote` 一次，因此 `/a%20b` 精确命中注册名 `a b`（3.1.1）。
 
 server_http 职责只有三步：
 
@@ -527,6 +600,8 @@ executor.execute('add', globals={'x': 4, 'y': 3})        # r == 7
 - record 仅**新增** `mode` / `signature` / `params` / `defaults` 字段，
   旧代码读取不受影响；
 - 旧调用 `execute(code, globals=...)` 对 plain 别名的注入行为不变；
+- `#alias a b` 这类“裸名字含空白”的指令行**仍然是错误**（既有语义不变）；
+  带空白 / 转义的名字只能写成 Python 字符串字面量（3.1.1）；
 - 无迁移步骤，升级即生效。
 
 ---
@@ -599,15 +674,55 @@ GET /-sum3?x=1&y=2&z=3   → r == '123'（字符串拼接；要算术请写 int(
 注册时 `record['params'] == ['x', 'y', 'z']`、`defaults == {}`——
 **必填由“无默认值”推导**，签名只是可选的声明 sugar。
 
-### 13.5 注册错误一览
+### 13.5 引号名字：带空格的别名
 
 ```
+#alias "a b"
+r = 9
+```
+
+```
+a b              → r == 9（exact，名字就是解码后的 'a b'）
+"a b"=/x         → 命中 =arg 形态，_alias_arg == '/x'
+# GET /a%20b     → r == 9
+# GET /%22a%20b%22=%2Fx → r == '/x'
+```
+
+```
+#alias "git status"+
+r = _alias_arg
+```
+
+```
+git status -s    → _alias_arg == '-s'
+git status       → _alias_arg == ''（C5）
+```
+
+```
+#alias "add two"(x, y=3)
+int(x) + int(y)
+```
+
+```
+GET /-%22add%20two%22?x=4   → r == 7（query 注入 + 默认值 y=3）
+```
+
+持久化重启后同样成立：`rpc.json` 的 key 是解码后的 `a b` / `add two`，
+`build_alias_record(..., decoded_name=True)` 直接按解码名重建记录。
+
+### 13.6 注册错误一览
+
+```
+#alias a b                   → 裸名字含空白：仍按“一行一个名字”拒绝（3.1.1）
+#alias "a b               → 引号未闭合：拒绝注册
+#alias ""                    → 名字为空：拒绝注册
 #alias a+                    → R6: 前缀太短（最小 2），建议 git+、ime+
 #alias add(*a)               → R1: 不支持 *args
 #alias add(y=x+1)            → R2: 默认值必须是字面量
 #alias bad(x, z)  +  x+y     → R3: 'z' 是 dead param
 #alias add(_alias_arg)       → R4: 保留名
 #alias git+(x)               → R5: v1 不支持 前缀+签名 组合
+#alias zh("选项 A"=1)        → 参数名含空白：拒绝注册（参数名要能作 Python 变量）
 ```
 
 ---
@@ -624,4 +739,7 @@ GET /-sum3?x=1&y=2&z=3   → r == '123'（字符串拼接；要算术请写 int(
 - [x] `#alias` 列表按模式渲染（plain / `name(x, y=3)` / `name+`）
 - [x] `alias_prefix=False` 单次开关
 - [x] lenient 模式经 `"warnings"` 字段透传未知 key
+- [x] 名字支持 Python 字符串字面量（`#alias "a b"` / 转义 / `"git status"+` / `"add two"(x, y=3)`），裸名字含空白仍报错
+- [x] `split_alias_call` / `#unalias` 分词 / 临时标记剥离都引号感知
+- [x] 持久化恢复按解码名重建（`build_alias_record(..., decoded_name=True)`）
 - [x] server_http：读 record（O(1)）决定是否注入 query，`alias_url` 支持 `'dash'` / `'raw'` / `'json'` 值解码

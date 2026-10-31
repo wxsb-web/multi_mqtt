@@ -612,6 +612,59 @@ class AliasPersistenceTests(unittest.TestCase):
                 self.assertEqual(response.read().decode(), expected, name)
         self.assertEqual(self._saved(), {})
 
+    def test_quoted_alias_name_persisted_and_routed(self):
+        # #alias "a b" 用 Python 字符串字面量表达带空格的别名名；
+        # rpc.json 里 key 也是解码后的 "a b"，重启后 /a%20b 仍能路由。
+        port = self._start()
+        with self._get(port, "/-" + self._quote('#alias "a b"\nr=9')) as response:
+            self.assertEqual(response.read().decode(), "9")
+        self.assertEqual(self._saved(), {"a b": "r=9"})
+
+        port2 = self._start()
+        with self._get(port2, "/a%20b") as response:
+            self.assertEqual(response.read().decode(), "9")
+
+    def test_quoted_alias_name_arg_form_over_url(self):
+        port = self._start()
+        with self._get(port, "/-" + self._quote('#alias "a b"\nr = _alias_arg')):
+            pass
+        # =arg 形态里名字也必须加引号（裸写 a b=/x 仍是错误语法）
+        with self._get(port, "/" + self._quote('"a b"=/x')) as response:
+            self.assertEqual(response.read().decode(), "/x")
+
+    def test_quoted_name_ephemeral_marker_keeps_name(self):
+        # 标记在引号字面量之外：只剥标记，名字内部空格/内容原样保留
+        port = self._start()
+        with self._get(port, "/-" + self._quote('#alias "a b" !\nr=9')) as response:
+            self.assertEqual(response.read().decode(), "9")
+        self.assertEqual(self._saved(), {})
+        with self._get(port, "/a%20b") as response:
+            self.assertEqual(response.read().decode(), "9")
+
+    def test_bang_inside_quoted_name_is_not_flag(self):
+        # #alias "apk!" 里的 ! 属于名字，不触发“只内存”语义
+        port = self._start()
+        with self._get(port, "/-" + self._quote('#alias "apk!"\nr=3')) as response:
+            self.assertEqual(response.read().decode(), "3")
+        self.assertEqual(self._saved(), {"apk!": "r=3"})
+
+    def test_strip_ephemeral_flag_is_quote_aware(self):
+        executor = server_http.rpc_executor.PythonExecutor()
+        cases = [
+            ('#alias "a b" !\nr=1', '#alias "a b"\nr=1', True),
+            ('#alias "a b" np\nr=1', '#alias "a b"\nr=1', True),
+            ('#alias "a b"!\nr=1', '#alias "a b"\nr=1', True),
+            ('#alias "a b"\nr=1', '#alias "a b"\nr=1', False),
+            ('#alias "apk!"\nr=1', '#alias "apk!"\nr=1', False),
+            ('#alias "temp"\nr=1', '#alias "temp"\nr=1', False),
+            ('#alias apk!\nr=1', '#alias apk\nr=1', True),
+        ]
+        for code, expected, ephemeral in cases:
+            with self.subTest(code=code):
+                self.assertEqual(
+                    server_http.strip_ephemeral_alias_flag(code, executor),
+                    (expected, ephemeral))
+
     def test_disabled_persistence_does_not_touch_file(self):
         port = self._start(persist_aliases=False)
         with self._get(port, "/-" + self._quote("#alias memx\nr=5")) as response:

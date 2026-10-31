@@ -160,7 +160,8 @@ def load_persisted_aliases(executor, path=None):
             continue
         try:
             restored_name, record = rpc_executor.build_alias_record(
-                name, code, signature=payload['signature'], now=now)
+                name, code, signature=payload['signature'], now=now,
+                decoded_name=True)
         except (ValueError, SyntaxError) as error:
             logging.getLogger('app').warning(
                 '别名持久化跳过 %r：%s', name, error)
@@ -207,12 +208,54 @@ def sync_alias_persistence(executor, execution, ephemeral=False, path=None):
     return None
 
 
+def _alias_flag_tokens(text):
+    """把 ``#alias`` 首行参数按空白切成 token，字符串字面量整体保留原文。
+
+    ``"a b" c`` → ``['"a b"', 'c']``；字面量内部的空格不会被折叠，字面量
+    后面的 ``+`` / ``!`` 等后缀仍算在同一个 token 里。引号未闭合 / 转义
+    非法时退回普通空白切分，交给执行器给出正式报错。
+    """
+    tokens = []
+    index, size = 0, len(text)
+    while index < size:
+        if text[index].isspace():
+            index += 1
+            continue
+        start = index
+        if text[index] in '"\'':
+            try:
+                _, index = rpc_executor.scan_string_literal(text, index)
+            except ValueError:
+                index = start
+                while index < size and not text[index].isspace():
+                    index += 1
+                tokens.append(text[start:index])
+                continue
+        while index < size and not text[index].isspace():
+            index += 1
+        tokens.append(text[start:index])
+    return tokens
+
+
+def _is_pure_string_literal(token):
+    """token 是否恰好是一个完整的字符串字面量（引号里写的不当标记看）。"""
+    if not token or token[0] not in '"\'':
+        return False
+    try:
+        _, end = rpc_executor.scan_string_literal(token, 0)
+    except ValueError:
+        return False
+    return end == len(token)
+
+
 def strip_ephemeral_alias_flag(code, executor):
     """识别 #alias 指令行里的“不持久化”标记，返回 (code, ephemeral)。
 
     支持 ``#alias apk !`` / ``#alias apk np`` / ``#alias apk!`` 三种写法；
     标记只在首行生效，命中后剥掉再交给执行器（执行器不允许指令行出现
-    第二个名字，因此标记必须在本层处理）。
+    第二个名字，因此标记必须在本层处理）。分词是**引号感知**的：
+    ``#alias "a b" !`` 只剥掉末尾标记、字面量原样保留；``#alias "apk!"``
+    里的 ``!`` 属于名字，不触发临时语义。
     """
     if executor is None or not getattr(executor, 'alias', False):
         return code, False
@@ -222,18 +265,24 @@ def strip_ephemeral_alias_flag(code, executor):
     token = head.strip()
     if not token.startswith('#'):
         return code, False
-    words = token[1:].split()
+    words = token[1:].split(None, 1)
     if not words or words[0] not in getattr(executor, 'alias_keywords', ()):
         return code, False
-    args = words[1:]
+    args = _alias_flag_tokens(words[1] if len(words) > 1 else '')
     if not args:
         return code, False
-    ephemeral = args[-1].lower() in _ALIAS_EPHEMERAL_FLAGS
-    if ephemeral:
+    ephemeral = False
+    # 1) 独立标记 token（! / np / ...）；引号字面量里的同名文本是名字
+    if not _is_pure_string_literal(args[-1]) \
+            and args[-1].lower() in _ALIAS_EPHEMERAL_FLAGS:
         args = args[:-1]
-    if args and args[-1].endswith('!'):
-        args[-1] = args[-1].rstrip('!')
         ephemeral = True
+    # 2) 紧贴在名字末尾的 !（#alias apk! / #alias "a b"!）
+    if args and not ephemeral and args[-1].endswith('!'):
+        stripped = args[-1].rstrip('!')
+        if stripped:
+            args[-1] = stripped
+            ephemeral = True
     if not ephemeral or not args:
         return code, False
     rebuilt = '#' + ' '.join([words[0]] + args)

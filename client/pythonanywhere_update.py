@@ -432,10 +432,10 @@ def _mount_body(url_name, body, persist):
     return "\n".join(lines)
 
 # 服务端字节/秒（按 1024 字节/KB）；0 = 不限速。
-# 默认 300KB：PythonAnywhere 的 web 请求有 300 秒上限（实测 200KB/s 下
-# 61,538,304 字节（正好 300.48s）被网关切断），66MB 的 APK 在 200KB/s
-# 需要 5.4 分钟必然下不完；300KB/s 约 3.6 分钟，留 1 分钟余量。
-ALIAS_RATE_LIMIT = 300 * 1024
+# 默认 500KB：PythonAnywhere 的 web 请求有 300 秒上限（实测 200KB/s 下
+# 61,538,304 字节（正好 300.48s）被网关切断），66MB 的 APK 在 300KB/s
+# 约 3.6 分钟已接近上限；500KB/s 约 2.2 分钟、限速本身也够直观。
+ALIAS_RATE_LIMIT = 500 * 1024
 def alias_file_download(base, remote_path='~/ime.apk', url_name=None,
                         rate_limit=ALIAS_RATE_LIMIT, chunk_size=64 * 1024,
                         content_type='application/vnd.android.package-archive',
@@ -446,9 +446,10 @@ def alias_file_download(base, remote_path='~/ime.apk', url_name=None,
     * remote_path: 相对 / 绝对 / '~/ime.apk' 均可——远端用
       os.path.expanduser + abspath 解析，'~/ime.apk' 与
       '/home/<user>/ime.apk' 等价。
-    * rate_limit: 服务端字节/秒，默认 300KB/s，0 = 全速。PythonAnywhere
+    * rate_limit: 服务端字节/秒，默认 500KB/s，0 = 全速。PythonAnywhere
       对单个 web 请求有 300 秒上限：限速调得太低会让 66MB 的 APK 在
-      300 秒处被网关切断（200KB/s 实测在 61.5MB 处断流），宁可调大。
+      300 秒处被网关切断（200KB/s 实测在 61.5MB 处断流），500KB/s 下
+      66MB 约 132 秒，留足余量。
     * url_name: 下载路径，默认取文件名（ime.apk → /ime.apk）。
     * persist: True（默认）把 body 写进 rpc.json 的 http_aliases，
       SIGHUP 重载 / 重启后自动恢复；False 只注册到进程内存。

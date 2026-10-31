@@ -50,20 +50,124 @@ class AliasSpecError(ValueError):
     """别名注册期规格错误（R1–R6），调用方据此拒绝注册。"""
 
 
+def scan_string_literal(text, start=0):
+    """扫描 ``text[start:]`` 开头的 Python 字符串字面量，返回 ``(值, 结束下标)``。
+
+    只支持单行、无前缀的 ``'...'`` / ``"..."``（``ast.literal_eval`` 语义，
+    因此 ``\\n`` / ``\\t`` / ``\\"`` / ``\\\\`` / ``\\xNN`` 等转义都按 Python
+    规则解码）。引号未闭合、转义非法或求值结果不是 ``str`` 时抛
+    :class:`AliasSpecError`，调用方据此拒绝注册。
+    """
+    if not isinstance(text, str) or start < 0 or start >= len(text):
+        raise AliasSpecError('alias error: 缺少字符串字面量')
+    quote = text[start]
+    if quote not in '"\'':
+        raise AliasSpecError(
+            'alias error: 名字的字符串字面量必须以引号开头: %r' % text[start:])
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if char == '\\':
+            index += 2
+            continue
+        if char == quote:
+            literal = text[start:index + 1]
+            try:
+                value = ast.literal_eval(literal)
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                raise AliasSpecError(
+                    'alias error: 名字不是合法的字符串字面量: %r' % literal)
+            if not isinstance(value, str):
+                raise AliasSpecError(
+                    'alias error: 名字的字符串字面量必须求值为 str: %r' % literal)
+            return value, index + 1
+        index += 1
+    raise AliasSpecError(
+        'alias error: 字符串名字的引号未闭合: %r' % text[start:])
+
+
+def split_string_literal(text):
+    """拆出开头的字符串字面量，返回 ``(解码值, 字面量之后的剩余原文)``。"""
+    value, end = scan_string_literal(text, 0)
+    return value, text[end:]
+
+
 def split_alias_call(code):
     """把 ``<别名>=<参数>`` 拆成 ``(别名, 参数)``；不是该形态返回 None。
 
     只用**第一个** ``=`` 作分隔符，因此参数里可以继续出现 ``=`` 和 ``/``
-    （路径、查询串都原样保留，不做 strip / 解码以外的处理）。别名名字里
-    不允许空白，避免把普通赋值语句误判成别名调用。
+    （路径、查询串都原样保留，不做 strip / 解码以外的处理）。
+
+    名字含空白时不能裸写（``a b=1`` 仍返回 None），必须用字符串字面量：
+    ``"a b"=/x``、``'a b'=/x``；字面量之后必须紧跟 ``=``。
     """
     if not isinstance(code, str):
         return None
-    name, sep, arg = code.partition(ALIAS_ARG_SEP)
+    text = code.strip()
+    if not text:
+        return None
+    if text[0] in '"\'':
+        try:
+            name, rest = split_string_literal(text)
+        except AliasSpecError:
+            return None
+        if not rest.startswith(ALIAS_ARG_SEP):
+            return None
+        if not is_valid_alias_name(name):
+            return None
+        return name, rest[len(ALIAS_ARG_SEP):]
+    name, sep, arg = text.partition(ALIAS_ARG_SEP)
     name = name.strip()
     if not sep or not name or any(ch.isspace() for ch in name):
         return None
     return name, arg
+
+
+def split_alias_names(text):
+    """按空白切分 ``#unalias`` 的名字列表，但把字符串字面量当作一个整体。
+
+    ``#unalias "a b" c`` → ``['a b', 'c']``；字面量里的空格不会被折叠，
+    引号未闭合时抛 :class:`AliasSpecError`。裸名字不含空白，因此与旧的
+    ``str.split()`` 行为完全一致。
+    """
+    if not isinstance(text, str):
+        return []
+    names = []
+    index, size = 0, len(text)
+    while index < size:
+        char = text[index]
+        if char.isspace():
+            index += 1
+            continue
+        if char in '"\'':
+            name, index = scan_string_literal(text, index)
+            names.append(name)
+            continue
+        start = index
+        while index < size and not text[index].isspace():
+            index += 1
+        names.append(text[start:index])
+    return names
+
+
+def quote_alias_name(name):
+    """把解码后的名字渲染成**可粘贴回指令行**的形式。
+
+    能裸写（无空白、不以引号开头、不会被误解析成 prefix / 签名形态）时
+    原样返回；否则用 ``repr()`` 加引号与转义（``repr('a b')`` →
+    ``'a b'``），保证 ``#alias <列表输出>`` 能再次注册出同一个名字。
+    """
+    if isinstance(name, str) and name \
+            and not any(ch.isspace() for ch in name) \
+            and name[0] not in '"\'':
+        try:
+            spec = parse_alias_signature(name)
+        except AliasSpecError:
+            spec = None
+        if spec is not None and spec['name'] == name \
+                and spec['mode'] == 'plain':
+            return name
+    return repr(name)
 
 
 def is_valid_alias_name(name):
@@ -71,13 +175,24 @@ def is_valid_alias_name(name):
 
     名字不再限制为 Python 标识符：``ime.apk``、``v1.2``、中文等都可以，
     因为别名替换只做整段精确匹配 + ``<名字>=<参数>`` 前缀匹配 + 前缀模式，
-    不走 Python 标识符解析。只拒绝会让 ``#alias`` 指令行 / URL 路径无法表达
-    的名字：空串、任何空白字符和控制字符（换行、制表符、NUL 等）。
+    不走 Python 标识符解析。
+
+    裸名字（``#alias a b``）仍不允许空白（保留“一行一个名字”的既有语义）；
+    需要空白/引号/换行等字符时，指令行里写成 Python 字符串字面量
+    （``#alias "a b"``），解码后即可保存。这里校验的是**解码后的名字**：
+
+    * 非空；
+    * 首尾不能有空白（指令行与 URL 会 strip，否则永远匹配不上）；
+    * 允许内部空白（空格、制表符、``\\n`` 等，来自显式字面量）；
+    * 其它控制字符（NUL、DEL 等）仍拒绝，避免 URL / JSON / 终端歧义。
     """
     if not isinstance(name, str) or not name:
         return False
-    return not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127
-                   for ch in name)
+    if name != name.strip():
+        return False
+    return not any(
+        (ord(ch) < 32 and not ch.isspace()) or ord(ch) == 127
+        for ch in name)
 
 
 # ------------------------------------------------------------------ #
@@ -195,7 +310,9 @@ def _parse_signature_params(signature):
             raise AliasSpecError(
                 'alias error: 不支持类型注解（HTTP 侧零 Python 知识）: %r' % item)
         name = _unquote_param_name(raw_name)
-        if not is_valid_alias_name(name):
+        # 参数字面量会成为 body 里的 Python 变量名，必须能直接写出：空白 /
+        # 控制字符都不允许（名字规则放宽后要在这里单独拒绝）。
+        if not is_valid_alias_name(name) or any(ch.isspace() for ch in name):
             raise AliasSpecError(
                 'alias error: 非法参数名 %r（不能含空白/控制字符）' % name)
         if name == ALIAS_ARG_NAME:
@@ -215,6 +332,50 @@ def _parse_signature_params(signature):
     return params, defaults
 
 
+def _alias_spec_from_decoded(name, signature=None):
+    """用**已解码**的名字构造注册规格（引号名字与持久化恢复共用）。
+
+    ``signature`` 非 None 表示 params 模式；否则按名字是否以 ``+`` 结尾
+    区分 prefix / plain。名字合法性按解码后的规则（:func:`is_valid_alias_name`）
+    校验，因此允许内部空白，但首尾空白与控制字符仍拒绝。
+    """
+    if not isinstance(name, str) or not name:
+        raise AliasSpecError('alias error: 别名名不能为空')
+    if signature is not None:
+        if name.endswith(ALIAS_PREFIX_SUFFIX):
+            raise AliasSpecError(
+                'alias error: v1 不支持前缀 + 签名组合: %r' % name)
+        if not is_valid_alias_name(name):
+            raise AliasSpecError(
+                'alias error: 非法别名名 %r（不能为空、首尾空白或含控制字符）'
+                % name)
+        params, defaults = _parse_signature_params(signature)
+        return {
+            'name': name, 'mode': 'params',
+            'signature': signature or None,
+            'params': params, 'defaults': defaults,
+        }
+    if name.endswith(ALIAS_PREFIX_SUFFIX):
+        prefix = name[:-len(ALIAS_PREFIX_SUFFIX)]
+        if len(prefix) < ALIAS_PREFIX_MIN_LEN:
+            raise AliasSpecError(
+                'alias error: 前缀太短（%r 的有效前缀 %r，最少 %d 个字符），'
+                '建议 git+、ime+ 这类有意义的前缀'
+                % (name, prefix, ALIAS_PREFIX_MIN_LEN))
+        if not is_valid_alias_name(prefix):
+            raise AliasSpecError(
+                'alias error: 非法前缀别名 %r（前缀不能为空或含控制字符）'
+                % name)
+        return {'name': name, 'mode': 'prefix', 'signature': None,
+                'params': [], 'defaults': {}}
+    if not is_valid_alias_name(name):
+        raise AliasSpecError(
+            'alias error: 非法别名名 %r（不能为空、首尾空白或含控制字符）'
+            % name)
+    return {'name': name, 'mode': 'plain', 'signature': None,
+            'params': None, 'defaults': {}}
+
+
 def parse_alias_signature(text):
     """解析 ``#alias`` 指令行的名字部分，返回注册规格 dict。
 
@@ -224,52 +385,41 @@ def parse_alias_signature(text):
     * ``add(x, y=3)`` → ``{'mode': 'params', 'signature': 'x, y=3', ...}``；
     * ``git+`` → ``{'mode': 'prefix', 'name': 'git+'}``（有效前缀 ``git``）。
 
+    名字含空白 / 换行 / 引号等字符时，指令行里写成 **Python 字符串字面量**
+    （``#alias "a b"`` / ``'a b'`` / ``"a\\tb"`` / ``"a\\nb"`` / ``"a\\"b"``），
+    字面量之后可以继续跟 ``+`` 或 ``(参数列表)``。解码后的名字允许内部空白，
+    但裸名字仍不允许（``#alias a b`` 保持“一行一个名字”的既有错误语义）。
+
     非法规格抛 :class:`AliasSpecError`，注册表不产生记录（fail fast）。
     """
     if not isinstance(text, str) or not text.strip():
         raise AliasSpecError('usage: #alias <名字> ...')
     name_part = text.strip()
+    if name_part[0] in '"\'':
+        name, rest = split_string_literal(name_part)
+        rest = rest.strip()
+        if not rest:
+            return _alias_spec_from_decoded(name)
+        if rest == ALIAS_PREFIX_SUFFIX:
+            return _alias_spec_from_decoded(name + ALIAS_PREFIX_SUFFIX)
+        if rest.startswith('(') and rest.endswith(')'):
+            return _alias_spec_from_decoded(name, rest[1:-1].strip())
+        raise AliasSpecError(
+            'alias error: 引号名字后面只能跟 + 或 (参数列表): %r' % name_part)
     if name_part.endswith(')') and '(' in name_part:
         name, _, rest = name_part.partition('(')
         name = name.strip()
         signature = rest[:-1].strip()
         if not name or any(ch.isspace() for ch in name):
             raise AliasSpecError(
-                'alias error: 签名名字不能为空或包含空白: %r' % name_part)
-        if name.endswith(ALIAS_PREFIX_SUFFIX):
-            raise AliasSpecError(
-                'alias error: v1 不支持前缀 + 签名组合: %r' % name_part)
-        if not is_valid_alias_name(name):
-            raise AliasSpecError(
-                'alias error: 非法别名名 %r（不能含空白/控制字符）' % name)
-        params, defaults = _parse_signature_params(signature)
-        return {
-            'name': name, 'mode': 'params',
-            'signature': signature or None,
-            'params': params, 'defaults': defaults,
-        }
+                'alias error: 签名名字不能为空或包含空白（空白请用引号字面量，'
+                '如 #alias "a b"(x)）: %r' % name_part)
+        return _alias_spec_from_decoded(name, signature)
     if any(ch.isspace() for ch in name_part):
         raise AliasSpecError(
-            '指令行只允许一个别名名字，收到: %r' % name_part.split())
-    if name_part.endswith(ALIAS_PREFIX_SUFFIX):
-        prefix = name_part[:-len(ALIAS_PREFIX_SUFFIX)]
-        if len(prefix) < ALIAS_PREFIX_MIN_LEN:
-            raise AliasSpecError(
-                'alias error: 前缀太短（%r 的有效前缀 %r，最少 %d 个字符），'
-                '建议 git+、ime+ 这类有意义的前缀'
-                % (name_part, prefix, ALIAS_PREFIX_MIN_LEN))
-        if not is_valid_alias_name(prefix):
-            raise AliasSpecError(
-                'alias error: 非法前缀别名 %r（前缀不能为空或含空白/控制字符）'
-                % name_part)
-        return {'name': name_part, 'mode': 'prefix', 'signature': None,
-                'params': [], 'defaults': {}}
-    if not is_valid_alias_name(name_part):
-        raise AliasSpecError(
-            'alias error: 非法别名名 %r（不能为空或含空白/控制字符）'
-            % name_part)
-    return {'name': name_part, 'mode': 'plain', 'signature': None,
-            'params': None, 'defaults': {}}
+            '指令行只允许一个别名名字（名字含空白请写成 Python 字符串字面量，'
+            '如 #alias "a b"），收到: %r' % name_part)
+    return _alias_spec_from_decoded(name_part)
 
 
 class _FreeVarCollector(ast.NodeVisitor):
@@ -388,23 +538,40 @@ def match_prefix_alias(aliases, text):
 
 
 def alias_display_name(name, info):
-    """列表 / 展示用的名字：params 别名渲染成 ``add(x, y=3)``。"""
+    """列表 / 展示用的名字：params 渲染成 ``add(x, y=3)``，prefix 渲染成 ``git+``。
+
+    名字含空白 / 引号等不能裸写时用 ``repr()`` 加引号（``'a b'``、
+    ``'a b'+``），保证 ``#alias`` 的列表输出可以原样粘贴回指令行。
+    """
+    if not isinstance(name, str):
+        return name
     if isinstance(info, dict) and info.get('mode') == 'params' \
             and info.get('signature'):
-        return '%s(%s)' % (name, info['signature'])
-    return name
+        return '%s(%s)' % (quote_alias_name(name), info['signature'])
+    if name.endswith(ALIAS_PREFIX_SUFFIX):
+        return (quote_alias_name(name[:-len(ALIAS_PREFIX_SUFFIX)])
+                + ALIAS_PREFIX_SUFFIX)
+    return quote_alias_name(name)
 
 
-def build_alias_record(name_or_spec, code, signature=None, old=None, now=None):
+def build_alias_record(name_or_spec, code, signature=None, old=None, now=None,
+                       decoded_name=False):
     """构造注册记录，返回 ``(name, record)``；规格非法抛异常。
 
-    ``name_or_spec`` 是 ``#alias`` 指令行的名字部分（``add(x, y=3)`` /
-    ``git+`` / ``abc``）；持久化恢复时改为传 ``name`` + ``signature``。
+    ``name_or_spec`` 默认是 ``#alias`` 指令行的名字部分（``add(x, y=3)`` /
+    ``git+`` / ``abc``）；持久化恢复时改传 ``decoded_name=True`` + 已解码
+    的名字 + ``signature``，避免把含空白 / 引号的名字重新拼成指令文本后
+    再解析（那样会丢信息甚至解析失败）。
     注册期校验（R1–R7）全部在返回记录之前完成。
     """
     if not isinstance(code, str) or not code.strip():
         raise AliasSpecError('alias error: 别名代码不能为空')
-    if signature is not None:
+    if decoded_name:
+        if signature is not None:
+            spec = _alias_spec_from_decoded(name_or_spec, signature)
+        else:
+            spec = _alias_spec_from_decoded(name_or_spec)
+    elif signature is not None:
         spec = parse_alias_signature('%s(%s)' % (name_or_spec, signature))
     else:
         spec = parse_alias_signature(name_or_spec)
@@ -931,7 +1098,7 @@ class PythonExecutor:
         两种写法都带别名名，满足 alias.md 5.3（错误里必须能定位到别名）。
         """
         if info.get('signature'):
-            return '%s(%s)' % (name, info['signature'])
+            return '%s(%s)' % (quote_alias_name(name), info['signature'])
         return '%r 可绑定 %r' % (name, list(info.get('params') or []))
 
     def _alias_define(self, name_or_spec, body, globals=None, format_result=False,
@@ -1021,10 +1188,15 @@ class PythonExecutor:
         return self._alias_result(listing, alias={"action": "list", "count": len(listing)})
 
     def _alias_unalias(self, arg):
-        names = arg.split()
+        # 引号感知分词："a b" 整体算一个名字，与 #alias "a b" 对称
+        try:
+            names = split_alias_names(arg)
+        except AliasSpecError as error:
+            return self._alias_error(str(error))
         if not names:
             return self._alias_error(
-                "usage: #<unalias关键字> <名字> [<名字> ...]；一次可删多个"
+                "usage: #<unalias关键字> <名字> [<名字> ...]；一次可删多个，"
+                "含空白/转义的名字用 Python 字符串字面量（如 #unalias \"a b\"）"
             )
         deleted, missing = [], []
         for name in names:

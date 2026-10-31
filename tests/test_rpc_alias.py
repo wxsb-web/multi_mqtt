@@ -344,9 +344,11 @@ class AliasCrudTests(unittest.TestCase):
     # ---------------- 校验 ---------------- #
 
     def test_name_rule_allows_any_non_blank_name(self):
-        for good in ("1abc", "a-b", "ime.apk", "v1.2", "中文", "for"):
+        for good in ("1abc", "a-b", "ime.apk", "v1.2", "中文", "for",
+                     "a b", "a\tb", "a\nb"):
             self.assertTrue(rpc_executor.is_valid_alias_name(good), good)
-        for bad in ("", " ", "a b", "a\tb", "a\nb", "\x00"):
+        # 首尾空白（指令行 / URL 会 strip）与控制字符仍拒绝
+        for bad in ("", " ", " a b", "a b ", "\t", "\x00", "\x01", "\x7f"):
             self.assertFalse(rpc_executor.is_valid_alias_name(bad), bad)
 
     def test_dotted_name_can_be_registered_and_used(self):
@@ -404,7 +406,10 @@ class AliasCrudTests(unittest.TestCase):
         self.assertEqual(rpc_executor.split_alias_call("a=/x/"), ("a", "/x/"))
         self.assertEqual(rpc_executor.split_alias_call("a="), ("a", ""))
         self.assertEqual(rpc_executor.split_alias_call("a=1=2"), ("a", "1=2"))
-        for bad in ("=x", "a b=1", "a", "", None):
+        # 名字含空白时必须写成字符串字面量；裸写仍是“一行一个名字”的错误
+        self.assertEqual(rpc_executor.split_alias_call('"a b"=/x'), ("a b", "/x"))
+        self.assertEqual(rpc_executor.split_alias_call("'a b'="), ("a b", ""))
+        for bad in ("=x", "a b=1", "a", "", None, '"a b', '"a b"/x'):
             self.assertIsNone(rpc_executor.split_alias_call(bad), bad)
 
     def test_invalid_body_not_saved(self):
@@ -463,6 +468,128 @@ class AliasCrudTests(unittest.TestCase):
     def test_space_after_hash_tolerated(self):
         self.ex.execute("# alias sp\nr=5")
         self.assertEqual(self.ex.execute("sp")["r"], 5)
+
+
+class AliasQuotedNameTests(unittest.TestCase):
+    """名字写成 Python 字符串字面量：支持空白与 ' " \\n \\t 等转义。
+
+    裸名字含空白仍是错误（``#alias a b`` 的既有语义不变），只有显式
+    字面量才能表达带空白 / 引号的名字；解码后的名字允许内部空白。
+    """
+
+    def setUp(self):
+        self.ex = PythonExecutor()
+
+    def test_quoted_plain_name_define_and_use(self):
+        res = self.ex.execute('#alias "a b"\nr=9')
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["r"], 9)                       # 定义即执行
+        self.assertIn("a b", self.ex.aliases)
+        self.assertEqual(self.ex.aliases["a b"]["mode"], "plain")
+        self.assertEqual(self.ex.execute("a b")["r"], 9)     # 整段精确匹配
+        self.assertEqual(self.ex.aliases["a b"]["hits"], 1)
+
+    def test_bare_name_with_space_stays_error(self):
+        fresh = PythonExecutor()
+        res = fresh.execute("#alias a b\n1")
+        self.assertFalse(res["ok"], res)
+        self.assertIn("只允许一个别名名字", res["error"])
+        self.assertEqual(fresh.aliases, {})
+
+    def test_single_quotes_and_escapes(self):
+        cases = [
+            ("'a b'", "a b"),          # 单引号同样可以
+            ('"a\\tb"', "a\tb"),       # \t → 制表符
+            ('"a\\nb"', "a\nb"),       # \n → 真实换行
+            ('"a\\"b"', 'a"b'),        # 转义双引号
+            ('"a\\\\b"', "a\\b"),      # 转义反斜杠
+        ]
+        for literal, decoded in cases:
+            with self.subTest(literal=literal):
+                ex = PythonExecutor()
+                res = ex.execute("#alias %s\nr=1" % literal)
+                self.assertTrue(res["ok"], res)
+                self.assertIn(decoded, ex.aliases)
+                self.assertEqual(ex.execute(decoded)["r"], 1)
+
+    def test_unclosed_or_empty_literal_rejected(self):
+        for code in ('#alias "a b\nr=1', '#alias ""\nr=1', '#alias " "\nr=1'):
+            with self.subTest(code=code):
+                ex = PythonExecutor()
+                res = ex.execute(code)
+                self.assertFalse(res["ok"], res)
+                self.assertEqual(ex.aliases, {})
+
+    def test_quoted_prefix_name(self):
+        res = self.ex.execute('#alias "git status"+\nr = _alias_arg')
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self.ex.aliases["git status+"]["mode"], "prefix")
+        self.assertEqual(self.ex.execute("git status -s")["r"], "-s")
+        self.assertEqual(self.ex.execute("git status")["r"], "")   # C5
+
+    def test_quoted_params_name(self):
+        res = self.ex.execute('#alias "add two"(x, y=3)\nint(x) + int(y)')
+        self.assertTrue(res["ok"], res)
+        record = self.ex.aliases["add two"]
+        self.assertEqual(record["mode"], "params")
+        self.assertEqual(record["params"], ["x", "y"])
+        self.assertEqual(record["defaults"], {"y": 3})
+        self.assertEqual(self.ex.execute("add two", globals={"x": 4})["r"], 7)
+        # C1 错误里能定位到别名（显示名用 repr 引号后可粘贴回指令行）
+        missing = self.ex.execute("add two")
+        self.assertIn("缺少必填参数", missing["error"])
+        self.assertIn("add two", missing["error"])
+
+    def test_param_name_with_space_still_rejected(self):
+        res = self.ex.execute('#alias zh("选项 A"=1)\nr = 选项A')
+        self.assertFalse(res["ok"], res)
+        self.assertIn("非法参数名", res["error"])
+
+    def test_quoted_arg_form_call(self):
+        self.ex.execute('#alias "a b"\nr = _alias_arg')
+        self.assertEqual(self.ex.execute('"a b"=/x')["r"], "/x")
+        self.assertEqual(self.ex.execute("'a b'=/y")["r"], "/y")
+
+    def test_unalias_quoted_names(self):
+        self.ex.execute("#alias \"a b\"\nr=1")
+        self.ex.execute("#alias 'c d'\nr=2")
+        res = self.ex.execute('#unalias "a b" \'c d\'')
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["r"]["deleted"], ["a b", "c d"])
+        self.assertEqual(self.ex.aliases, {})
+
+    def test_list_uses_rep_quotes_for_unsafe_names(self):
+        self.ex.execute('#alias "a b"\nr=1')
+        self.ex.execute('#alias "git status"+\nr=2')
+        self.ex.execute('#alias "add two"(x, y=3)\nint(x) + int(y)')
+        listing = self.ex.execute("#alias")["r"]
+        self.assertIn("'a b'", listing)
+        self.assertIn("'git status'+", listing)
+        self.assertIn("'add two'(x, y=3)", listing)
+        # 裸名字保持裸写，不无谓加引号
+        self.ex.execute("#alias plain\nr=3")
+        self.assertIn("plain", self.ex.execute("#alias")["r"])
+
+    def test_show_quoted_name(self):
+        self.ex.execute('#alias "a b"\nr=1')
+        res = self.ex.execute('#alias "a b"')
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["r"]["name"], "a b")
+        self.assertEqual(self.ex.execute("#alias 'a b'")["r"]["name"], "a b")
+
+    def test_decoded_name_persistence_rebuild(self):
+        name, record = rpc_executor.build_alias_record(
+            "a b", "r=1", decoded_name=True)
+        self.assertEqual(name, "a b")
+        self.assertEqual(record["mode"], "plain")
+        name, record = rpc_executor.build_alias_record(
+            "add two", "int(x) + int(y)", signature="x, y=3", decoded_name=True)
+        self.assertEqual(name, "add two")
+        self.assertEqual(record["mode"], "params")
+        self.assertEqual(record["params"], ["x", "y"])
+        name, record = rpc_executor.build_alias_record(
+            "git status+", "r = _alias_arg", decoded_name=True)
+        self.assertEqual(record["mode"], "prefix")
 
 
 class AliasHttpChannelTests(unittest.TestCase):
