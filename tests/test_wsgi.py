@@ -92,6 +92,15 @@ class WsgiApplicationTests(unittest.TestCase):
         self.assertTrue(status.startswith("200"), status)
         self.assertEqual(out, b"2")
 
+    def test_dotted_alias_is_persisted_and_routable(self):
+        # 带点名字（ime.apk）同样能定义、持久化并免 key 访问
+        _call_wsgi("#alias ime.apk\nr='apk'")
+        status, _headers, out = _call_wsgi_path("/ime.apk")
+        self.assertTrue(status.startswith("200"), status)
+        self.assertEqual(out, b"apk")
+        self.assertIn("ime.apk", server_http.RPC_CONFIG_PATH.read_text(
+            encoding="utf-8"))
+
     def test_root_path_runs_root_alias(self):
         # 首页 / 执行 root 别名（定义后持久化到 rpc.json，重启/SIGHUP 后仍生效）
         _call_wsgi("#alias root\nr='<h1>home</h1>'")

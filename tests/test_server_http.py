@@ -260,6 +260,21 @@ class AliasPersistenceTests(unittest.TestCase):
         with self._get(port2, "/addx") as response:
             self.assertEqual(response.read().decode(), "2")
 
+    def test_dotted_alias_is_persisted_and_restored(self):
+        port = self._start()
+        with self._get(port, "/-" + self._quote("#alias ime.apk\nr='apk'")) as response:
+            self.assertEqual(response.read().decode(), "apk")
+        self.assertEqual(self._saved(), {"ime.apk": "r='apk'"})
+
+        # 新服务器 = 新执行器：带点名字同样从 rpc.json 恢复，/ime.apk 免 key
+        port2 = self._start()
+        with self._get(port2, "/ime.apk") as response:
+            self.assertEqual(response.read().decode(), "apk")
+
+        with self._get(port2, "/-" + self._quote("#unalias ime.apk")):
+            pass
+        self.assertNotIn("ime.apk", self._saved())
+
     def test_unalias_removes_persisted_entry(self):
         port = self._start()
         with self._get(port, "/-" + self._quote("#alias gonex\nr=7")):

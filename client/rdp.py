@@ -27,9 +27,12 @@ RPC 入口(仅 html/screen 需要 server_http 注入的请求级 response 对象
     key('ctrl+shift+esc')             按键 / 组合键,加号连接
 
 页面设置区的「服务端日志」开关(默认开)关闭后,页面所有请求都带
-``X-RDP-Log: 0``,server_http 随即跳过这些请求的 ``[RPC]`` 访问行——每点一下、
-每张自动刷新截图都是一条 HTTP 请求,否则日志台会被刷满。静音只作用于本页
-发出的请求,其它客户端的日志照常输出,4xx/5xx 也仍保留便于排查。
+``X-RDP-Log: 0``;本模块在 import 时把这条规则作为**过滤器**注入 server_http
+(``add_log_filter('rdp-slog', ...)``),server_http 据此跳过这些请求的
+``[RPC]`` 访问行——每点一下、每张自动刷新截图都是一条 HTTP 请求,否则日志台
+会被刷满。静音只作用于本页发出的请求,其它客户端的日志照常输出,4xx/5xx 也
+仍保留便于排查。server_http 不需要认识 rdp;注册失败(独立使用本模块、或
+server_http 不在 sys.path)只跳过,不影响页面和主流程。
 
 除 html/screen 外都只用返回值回传结果,不需要 p;页面里的 RPC 表达式
 一律按本模块真实导入身份生成(见 _mod_expr),所以 ``import rdp``、
@@ -1012,3 +1015,33 @@ refresh();                              // 首次加载不归位红点,只有一
 </script>
 </body>
 </html>'''
+
+
+# --------------------------------------------------------------------------- #
+# 「服务端日志」开关的静音规则：本模块只声明“请求带 X-RDP-Log: 0 就不写
+# 访问行”，通过 server_http 的过滤器注册接口注入，server_http 不需要认识
+# rdp。注册失败（独立 import 本模块、或 server_http 不在 sys.path）只跳过，
+# 绝不影响页面和主流程。
+# --------------------------------------------------------------------------- #
+_SILENCE_VALUES = ('0', 'off', 'false', 'no')
+
+
+def _silence_access_log(handler):
+    """server_http 日志过滤器：本页请求头带 X-RDP-Log: 0 时静音访问行。"""
+    headers = getattr(handler, 'headers', None)
+    if headers is None:      # 测试/WSGI 垫片可能是 __new__ 出来的 handler
+        return False
+    try:
+        value = headers.get('X-RDP-Log', '')
+    except Exception:
+        return False
+    return str(value).strip().lower() in _SILENCE_VALUES
+
+
+try:  # 只有跑在 server_http 进程里才需要注册；独立 import 时静默跳过
+    import server_http
+
+    # 同名覆盖：页面「重载 rdp」reload 本模块时不会累积重复过滤器
+    server_http.add_log_filter('rdp-slog', _silence_access_log)
+except Exception:
+    pass

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac, weakref, json, os, keyword, tempfile
+import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac, weakref, json, os, tempfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from pathlib import Path
@@ -117,7 +117,9 @@ def load_persisted_aliases(executor, path=None):
     """启动时把 rpc.json 的 http_aliases 装回执行器别名表（内存优先）。
 
     返回本次恢复的 name -> code。命名空间里已存在的同名别名不覆盖；非法
-    名字 / 空代码跳过，防止手工编辑过的文件把执行器搞脏。
+    名字 / 空代码跳过，防止手工编辑过的文件把执行器搞脏。名字规则与
+    #alias 一致（rpc_executor.is_valid_alias_name），带点的 ime.apk 等
+    任意非空白名字都能长期恢复。
     """
     if executor is None or not getattr(executor, 'alias', False):
         return {}
@@ -125,7 +127,7 @@ def load_persisted_aliases(executor, path=None):
     restored = {}
     for name, code in _persisted_alias_codes(path).items():
         if (not code.strip() or not isinstance(name, str)
-                or not name.isidentifier() or keyword.iskeyword(name)):
+                or not rpc_executor.is_valid_alias_name(name)):
             continue
         if name in executor.aliases:
             continue
@@ -432,29 +434,72 @@ def _status_of(text):
         return 0
 
 
-def _rdp_log_off(handler):
-    """请求是否要求静音 [RPC] 访问行：rdp.py 控制页「服务端日志」开关关闭时，
-    页面所有 fetch 都带 ``X-RDP-Log: 0``。
+# --------------------------------------------------------------------------- #
+# 访问行静音过滤器：下游模块（例如 rdp 控制页的「服务端日志」开关）用
+#
+#     server_http.add_log_filter('rdp-slog', predicate)
+#
+# 注入「这条请求要不要静音」的判定，而不是在 log_message 里堆 if 分支。
+# 约定：
+#   * predicate(handler) 返回 True = 该次请求的访问行不写；假值 = 照常写；
+#   * 只对 2xx/3xx 询问过滤器——4xx/5xx 一律保留，便于排查协议层/业务失败；
+#   * 过滤器自身出错只降级成「照常写」，并对该过滤器打一次 WARNING，
+#     绝不让日志钩子把请求打挂、也不静默丢日志；
+#   * 同名注册覆盖旧函数（模块 reload 重复注册不会累积）；
+#   * 过滤器只应做纯内存判断（读头/path），不许 I/O、不许阻塞。
+# 用 setdefault 取回旧 dict：server_http 被 reload 后已注册的过滤器还在，
+# 配合 rdp 模块 reload 时的同名覆盖，双向 reload 都不会丢规则或重复。
+# --------------------------------------------------------------------------- #
+_LOG_FILTERS = globals().setdefault('_LOG_FILTERS', {})
+_WARNED_FILTERS = globals().setdefault('_WARNED_FILTERS', set())
 
-    只影响该请求自己这一行，不改服务器级开关——同进程其它客户端（日志台
-    之外的工具、其它页面）的访问行照常输出。写成函数并带 getattr 兜底，
-    是因为测试/WSGI 垫片里的 handler 可能是 __new__ 出来的、没有 headers。
+
+def add_log_filter(name, predicate):
+    """注册/替换一个访问行静音过滤器（name 相同即覆盖）。
+
+    下游模块在 import 时调用即可；传入不可调用对象属于显式调用错误，
+    当场抛 TypeError（文件/运行时错误才走降级，见 _log_silenced）。
     """
-    headers = getattr(handler, 'headers', None)
-    if headers is None:
-        return False
-    try:
-        value = headers.get('X-RDP-Log', '')
-    except Exception:
-        return False
-    return str(value).strip().lower() in ('0', 'off', 'false', 'no')
+    if not callable(predicate):
+        raise TypeError(f'日志过滤器 {name!r} 必须是可调用对象')
+    _LOG_FILTERS[name] = predicate
+    _WARNED_FILTERS.discard(name)
+    return predicate
+
+
+def remove_log_filter(name):
+    """移除已注册的过滤器，返回是否真的移除了一个。"""
+    removed = _LOG_FILTERS.pop(name, None) is not None
+    _WARNED_FILTERS.discard(name)
+    return removed
+
+
+def _log_silenced(handler):
+    """任一过滤器返回 True 即静音本次访问行；过滤器异常按“照常写”降级。"""
+    for name, predicate in list(_LOG_FILTERS.items()):
+        try:
+            if predicate(handler):
+                return True
+        except Exception as error:
+            if name not in _WARNED_FILTERS:
+                _WARNED_FILTERS.add(name)
+                logging.getLogger('app').warning(
+                    '日志过滤器 %r 异常，已降级为照常输出: %r', name, error)
+    return False
+
+
+# 本模块不内置任何静音规则（包括 /mcp）：规则属于拥有该端点的下游模块，
+# 由它们 import 时自行 add_log_filter(...) 注入（rdp 页、pty 的 MCP 服务都是
+# 这样）。server_http reload 后注册表经 setdefault 保活，重新加载下游模块时
+# 用同名注册覆盖即可，两侧都不会丢规则或重复判定。
 
 
 def _is_alias_url(handler, raw_path):
     """alias_url='raw' 时，判断路径（去掉前导 /）是否正好是已注册别名。
 
-    只认执行器里真实存在的别名名（别名名必须是合法 Python 标识符），
-    因此不会把任意路径放进执行器；执行器 alias 总开关关闭时也不放行。
+    只认执行器里真实存在的别名名（非空且不含空白/控制字符，见
+    rpc_executor.is_valid_alias_name），因此不会把任意路径放进执行器；
+    执行器 alias 总开关关闭时也不放行。
     'keyed'（默认）不启用本分支：别名只能写在 /<key><code> 里，由执行器
     自己对整段代码做别名展开——本仓库不改执行器，这里只是 HTTP URL 细节。
     """
@@ -532,15 +577,11 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             text = format % args
         except Exception:
             text = str(format)
-        # 2xx/3xx 访问行在两类高噪声通道上不写：
-        # * /mcp 的一次工具调用在 HTTP 层会伴随 initialize/notifications/tool
-        #   call 多条 POST，既无工具名也无参数，只会把日志冲散；真正的调用
-        #   轨迹由 pty 侧 [MCP] <id> ┌/└ 首尾配对承担。
-        # * rdp.py 控制页的「服务端日志」开关关闭后，页面所有请求都带
-        #   X-RDP-Log: 0——每点一下、每张自动刷新截图都是一条 HTTP 请求，
-        #   逐条访问行会把日志台刷满，同样的内容页面 #log 自己已记录。
-        # 4xx/5xx 一律保留，便于排查协议层/服务端失败。
-        if 200 <= _status_of(text) < 400 and ('/mcp' in text or _rdp_log_off(self)):
+        # 2xx/3xx 访问行可被过滤器静音（见模块上部 _LOG_FILTERS）：规则全部
+        # 由下游模块用 add_log_filter() 注入（如 rdp 页「服务端日志」关闭后
+        # 每个请求都带 X-RDP-Log: 0、pty 的 MCP 端点）。4xx/5xx 一律保留，
+        # 便于排查协议层/业务失败；过滤器异常只降级为照常输出，不打断请求。
+        if 200 <= _status_of(text) < 400 and _log_silenced(self):
             return
         line = (f"[RPC] {stime()[12:]}  {self.client_address[0]}:"
                 f"{self.client_address[1]} {text}")

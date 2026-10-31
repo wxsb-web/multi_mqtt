@@ -93,5 +93,43 @@ class KeyPressBehaviorTests(unittest.TestCase):
         self.assertEqual(rdp._vk_of('enter'), 0x0D)
 
 
+@unittest.skipUnless(sys.platform == 'win32', 'client.rdp 依赖 user32,仅 Windows 可导入')
+class LogFilterRegistrationTests(unittest.TestCase):
+    """「服务端日志」开关通过 server_http.add_log_filter 注入,而非硬编码。"""
+
+    def test_registers_request_level_log_filter(self):
+        import server_http
+        from client import rdp
+
+        class Handler:
+            def __init__(self, headers):
+                self.headers = headers
+
+        self.assertIs(server_http._LOG_FILTERS.get('rdp-slog'),
+                      rdp._silence_access_log)
+        self.assertTrue(rdp._silence_access_log(Handler({'X-RDP-Log': '0'})))
+        self.assertTrue(rdp._silence_access_log(Handler({'X-RDP-Log': 'off'})))
+        self.assertFalse(rdp._silence_access_log(Handler({'X-RDP-Log': '1'})))
+        self.assertFalse(rdp._silence_access_log(Handler({})))
+        self.assertFalse(rdp._silence_access_log(Handler(None)))
+
+    def test_filter_only_silences_own_page_requests(self):
+        # 端到端：带标记的本页请求 2xx 不写，4xx/5xx 与其它请求照常写。
+        import server_http
+        from client import rdp  # noqa: F401 - import 时注册过滤器
+        h = server_http.RPCRequestHandler.__new__(server_http.RPCRequestHandler)
+        h.client_address = ("1.2.3.4", 5555)
+        captured = []
+        h.log_sink = captured.append
+        h.headers = {'X-RDP-Log': '0'}
+        h.log_message('"%s" %s %s', "GET /rdp.click(1,2) HTTP/1.0", 200, "-")
+        self.assertEqual(captured, [])
+        h.log_message('"%s" %s %s', "GET /rdp.click(1,2) HTTP/1.0", 500, "-")
+        self.assertEqual(len(captured), 1)
+        h.headers = {}
+        h.log_message('"%s" %s %s', "GET /other HTTP/1.0", 200, "-")
+        self.assertEqual(len(captured), 2)
+
+
 if __name__ == '__main__':
     unittest.main()

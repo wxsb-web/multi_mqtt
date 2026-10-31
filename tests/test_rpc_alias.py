@@ -162,16 +162,30 @@ class AliasCrudTests(unittest.TestCase):
 
     # ---------------- 校验 ---------------- #
 
-    def test_invalid_name_rejected(self):
-        for bad in ("1abc", "a-b", "a b"):
-            res = self.ex.execute(f"#alias {bad}\n1")
-            self.assertFalse(res["ok"], bad)
-        self.assertEqual(self.ex.aliases, {})
+    def test_name_rule_allows_any_non_blank_name(self):
+        for good in ("1abc", "a-b", "ime.apk", "v1.2", "中文", "for"):
+            self.assertTrue(rpc_executor.is_valid_alias_name(good), good)
+        for bad in ("", " ", "a b", "a\tb", "a\nb", "\x00"):
+            self.assertFalse(rpc_executor.is_valid_alias_name(bad), bad)
 
-    def test_python_keyword_name_rejected(self):
-        res = self.ex.execute("#alias for\n1")
-        self.assertFalse(res["ok"])
-        self.assertNotIn("for", self.ex.aliases)
+    def test_dotted_name_can_be_registered_and_used(self):
+        res = self.ex.execute("#alias ime.apk\nr='apk-body'")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["r"], "apk-body")             # 定义即执行
+        self.assertIn("ime.apk", self.ex.aliases)
+
+        used = self.ex.execute("ime.apk")                  # 整段精确匹配
+        self.assertEqual(used["r"], "apk-body")
+        self.assertEqual(self.ex.aliases["ime.apk"]["hits"], 1)
+
+        removed = self.ex.execute("#unalias ime.apk")
+        self.assertTrue(removed["ok"])
+        self.assertEqual(removed["r"]["deleted"], ["ime.apk"])
+
+    def test_keyword_name_can_be_registered(self):
+        res = self.ex.execute("#alias for\nr=1")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self.ex.execute("for")["r"], 1)
 
     def test_invalid_body_not_saved(self):
         res = self.ex.execute("#alias bad\n1+")

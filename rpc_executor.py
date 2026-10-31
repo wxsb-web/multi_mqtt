@@ -3,7 +3,6 @@
 import ast
 import asyncio
 import io
-import keyword
 import sys
 import threading
 import textwrap
@@ -20,6 +19,20 @@ import traceback
 ALIAS_KEYWORDS = ["alias",'a']
 UNALIAS_KEYWORDS = ["unalias",'ua','d']
 #发送只有 #alias 三个字（不带名字、不带代码）即可 list all alias
+
+
+def is_valid_alias_name(name):
+    """别名名字是否可注册并长期保存（#alias 与 rpc.json 共用同一套规则）。
+
+    名字不再限制为 Python 标识符：``ime.apk``、``v1.2``、中文等都可以，
+    因为别名替换只做整段精确匹配，不走 Python 标识符解析。只拒绝会让
+    ``#alias`` 指令行 / URL 路径无法表达的名字：空串、任何空白字符和
+    控制字符（换行、制表符、NUL 等）。
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    return not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127
+                   for ch in name)
 
  
 
@@ -351,10 +364,9 @@ class PythonExecutor:
         变量在“定义即执行”这一次运行里同样可用、执行后同样被还原。
         body 运行报错不影响注册结果（语法错误才拒绝保存）。
         """
-        if not name.isidentifier():
-            return self._alias_error(f"别名名字必须是合法 Python 标识符: {name!r}")
-        if keyword.iskeyword(name):
-            return self._alias_error(f"别名名字不能是 Python 关键字: {name}")
+        if not is_valid_alias_name(name):
+            return self._alias_error(
+                f"别名名字不能为空或包含空白/控制字符: {name!r}")
         try:
             ast.parse(body)
         except SyntaxError:
