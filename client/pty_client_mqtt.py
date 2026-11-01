@@ -1172,6 +1172,7 @@ class FirstPacketStats:
             "up_send_n": 0, "up_send_min": None,
             "up_send_sum": 0.0, "up_send_max": None,
             "mid_orphan_write": 0,
+            "mid_ttl_dropped": 0,
         }
 
     # ---------------------------- 安装 ----------------------------
@@ -1752,7 +1753,8 @@ class FirstPacketStats:
             "in_flight": {"batches": pending_batches, "mids": pending_mids,
                           "pending_sum": pending_sum,
                           "stale_mids": stale_mids,
-                          "orphan_writes": g["mid_orphan_write"]},
+                          "orphan_writes": g["mid_orphan_write"],
+                          "mid_ttl_dropped": g["mid_ttl_dropped"]},
             "note": ("纯被动统计：0 额外网络请求，时间全部基于本地单调钟，"
                      "不解析也不信赖远端时间戳。下行首包=第一份副本先到的 "
                      "broker；上行首包=on_publish 先完成的 broker，QoS0 下只"
@@ -1770,7 +1772,13 @@ class FirstPacketStats:
                      "（样本只留键名，不保存内容）。in_flight 健康时恒有 "
                      "mids==pending_sum 且 stale_mids==orphan_writes==0："
                      "stale_mids>0 表示有 mid 指向已回收批次，orphan_writes>0 "
-                     "表示写入时批次就已不存在。uplink_publish.coverage 用来"
+                     "表示写入时批次就已不存在。mid_ttl_dropped=等不到 "
+                     "on_publish、超过 120s 被 _prune 回收的 mid 次数；"
+                     "broker_distribution 的 queued 与 send_ms.n 之差应等于它"
+                     "（QoS0 的 on_publish 只在包写出 socket 时触发；连接在写出"
+                     "前失效、或旧 client 被重建而未写完，就永远等不到回执，只能"
+                     "在 TTL 到期时静默回收，这里把这条路径显式计数）。"
+                     "uplink_publish.coverage 用来"
                      "定位“某个 broker 上行全缺席”：predicted=广播开始前预测该"
                      "发的 host 次数，attempted=predicted∪seen（因此恒有 "
                      "seen<=attempted 且 attempted==seen+blind），seen=实际进了"
@@ -1784,9 +1792,11 @@ class FirstPacketStats:
                      "下行）却 is_connected()=False，说明是 paho 状态判断或 client"
                      " 对象错位（僵尸连接），不是真掉线；socket=False 才是真断。"
                      "注意 offline_hosts 与 pty_frames.hb_frames 可以看似矛盾："
-                     "heartbeat 短周期只落在断线窗口的间隙里就能收满，而广播恰好"
-                     "撞在窗口内。brokers_queued 是窗口内每批实际入队数，"
-                     "connectivity.connected 是查询瞬间值，两者不同源。"
+                     "offline 只在 broadcast 那一刻采样，先看 offline_samples"
+                     "的 at_s 是否集中在启动初期（那时确实还没连上），之后连上"
+                     "并收满心跳并不矛盾；只有 at_s 与收心跳时段重叠，才说明是"
+                     "状态判断或 client 对象错位。brokers_queued 是窗口内每批"
+                     "实际入队数，connectivity.connected 是查询瞬间值，不同源。"
                      "requests.observed 依赖 multi_mqtt 在 message_callback 之前"
                      "按 req_id 的全局去重（TTL≈60s），同一 req_id 在 TTL 内"
                      "只计一次；超过 TTL 的重复投递会再计一次。"),
@@ -1888,6 +1898,10 @@ class FirstPacketStats:
         for k, (_bid, t0) in list(self._mid.items()):
             if now - t0 > self._MID_TTL:
                 self._drop_mid(k)
+                # 显式计数：mid 等不到 on_publish、被 TTL 静默回收的次数。
+                # 报告里 send_ms.n 与 queued 的差额应等于它，否则说明还有
+                # 别的丢样本路径（批次淘汰/orphan）。
+                self._g["mid_ttl_dropped"] += 1
 
     def _reset_locked(self):
         self._t0 = time.monotonic()

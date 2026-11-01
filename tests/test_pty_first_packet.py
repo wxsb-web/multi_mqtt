@@ -239,6 +239,8 @@ class FirstPacketStatsTests(unittest.TestCase):
             stats._mid[("broker-a", 999)] = (
                 424242, now - stats._MID_TTL - 5)
         self.assertEqual(stats.get_report()["in_flight"]["stale_mids"], 0)
+        self.assertEqual(
+            stats.get_report()["in_flight"]["mid_ttl_dropped"], 1)
         with stats._lock:
             self.assertEqual(len(stats._mid), 0)
 
@@ -306,7 +308,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         rep = stats.get_report()["in_flight"]
         self.assertEqual(rep, {"batches": 0, "mids": 0,
                                "pending_sum": 0, "stale_mids": 0,
-                               "orphan_writes": 0})
+                               "orphan_writes": 0, "mid_ttl_dropped": 3})
 
     def test_ack_before_remaining_publishes_does_not_orphan_mid(self):
         """ack 抢在循环 publish 完其余 broker 之前返回，不得提前删批次。
@@ -459,6 +461,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(fl["mids"], 0)
         self.assertEqual(fl["batches"], 0)
         self.assertEqual(fl["stale_mids"], 0)
+        self.assertEqual(fl["mid_ttl_dropped"], 1)
 
     def test_dirty_inputs_never_raise(self):
         net = self.net
@@ -482,6 +485,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(cov["attempted"], 0)
         self.assertEqual(cov["late_hosts"], {})
         self.assertEqual(cov["offline_samples"], [])
+        self.assertEqual(rep["in_flight"]["mid_ttl_dropped"], 0)
 
 
 if __name__ == "__main__":
