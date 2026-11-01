@@ -48,7 +48,11 @@ DEFAULT_GLOBAL_TOPIC_LIST_PUBLISH_KWARGS = {"qos": 1, "retain": True}
 REPORT_BODY_TOKEN = "REPORT_BODY"
 DEFAULT_GLOBAL_TOPIC_URL_LIST = [
 "https://qmm.pythonanywhere.com/with%20open('topics','a')%20as%20f:f.write(r'''" +REPORT_BODY_TOKEN + "''');r=f.tell()",
-'https://textdb.online/update/?key=ime_feed&value='+REPORT_BODY_TOKEN,
+# 'https://textdb.online/update/?key=ime_feed&value='+REPORT_BODY_TOKEN,
+# 阿里云 SLS：走 Web Tracking（logstore 需 enable_tracking=true），GET 免签名，
+# 报告 JSON 落在 new_logstore 的 report 字段；仍只用标准库 urllib。
+"https://log-service-1148372724923069-cn-hangzhou.cn-hangzhou.log.aliyuncs.com/logstores/new_logstore/track?APIVersion=0.6.0&report=" + REPORT_BODY_TOKEN,
+
 ]
 
 # --- [连接质量统计周期] 默认配置 ---

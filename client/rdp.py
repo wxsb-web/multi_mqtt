@@ -22,6 +22,9 @@ RPC 入口(仅 html/screen 需要 server_http 注入的请求级 response 对象
     drag(x1, y1, x2, y2)              按住拖动(选择模式松手时调用)
     scroll(x, y, n)                   移动到选定坐标滚动滚轮,n 正=向上、负=向下
     input('text')                     文本逐字符敲入远端前台窗口(Unicode 键,不动剪贴板)
+    input('text', 'enter')            同上,但换行用纯 Enter(记事本/终端等普通程序)
+                                      默认 'shift' 用 Shift+Enter:聊天输入框里 Enter 是发送,
+                                      纯 Enter 会让第一行立刻发出去,整段留不住
     clipboard()                       读取远端剪贴板文本
     setclip('text')                   把文本写入远端剪贴板
     key('ctrl+shift+esc')             按键 / 组合键,加号连接
@@ -194,16 +197,27 @@ class _INPUT(ctypes.Structure):
 user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
 
 
-def type_text(text):
+def type_text(text, newline='shift'):
     """把字符串逐字符敲到远端前台窗口:SendInput Unicode 键入,支持任意语言、不占剪贴板。
-    keybd_event 的 bScan 是 BYTE,Unicode 码位会被截成低字节,中文全乱,故必须走 SendInput。"""
+    keybd_event 的 bScan 是 BYTE,Unicode 码位会被截成低字节,中文全乱,故必须走 SendInput。
+
+    换行方式由 ``newline`` 决定:
+
+    * ``'shift'``(默认):Shift+Enter。聊天输入框(Trae/Copilot 等)里 Enter 是「发送」,
+      纯 Enter 会把第一行立刻发出去;Shift+Enter 只换行,文本能整段留在输入框里。
+    * ``'enter'``:纯 Enter,适合记事本/终端这类以 Enter 为换行的普通程序。
+    """
     text = str(text)
+    newline = str(newline).strip().lower()
     sent = 0
     for ch in text:
-        if ch == '\n':                          # 换行走真实回车键,多数编辑器不认 U+000A
-            _key_event(VK['enter'])
-            time.sleep(click_delay)
-            _key_event(VK['enter'], up=True)
+        if ch == '\n':
+            if newline == 'enter':              # 多数编辑器不认 U+000A,必须走真实换行键
+                _key_event(VK['enter'])
+                time.sleep(click_delay)
+                _key_event(VK['enter'], up=True)
+            else:                               # Shift+Enter:聊天框只换行不发送
+                press('shift+enter')
             continue
         pair = (_INPUT * 2)()
         for item in pair:
@@ -379,8 +393,8 @@ def scroll(x, y, clicks=1):
     return scroll_at(x, y, clicks)
 
 
-def input(text):
-    return type_text(text)
+def input(text, newline='shift'):
+    return type_text(text, newline)
 
 
 def clipboard():
@@ -521,6 +535,13 @@ body.textfocus #inputzone { order: 1; }
         <option value="40"></option>
       </datalist>
     </label>
+    <label title="多行文本的换行方式:聊天输入框(Trae/Copilot)里 Enter 是发送,必须用 Shift+Enter 才能整段留在输入框里;记事本/终端等普通程序用 Enter">
+      换行
+      <select id="nlmode">
+        <option value="shift">Shift+Enter(聊天框,不发送)</option>
+        <option value="enter">Enter(普通程序)</option>
+      </select>
+    </label>
     <label title="关闭后本页所有请求都带 X-RDP-Log:0,server_http 不再打印这些请求的 [RPC] 访问行">
       <input type="checkbox" id="slog" checked> 服务端日志</label>
     <button id="btn-reload" class="swbtn" title="在服务端 importlib.reload 本模块,随后刷新页面:改完 rdp.py 不用重启服务即可生效;新代码有语法错误时页面保留原状并报错">重载 rdp</button>
@@ -551,6 +572,12 @@ bwEl.checked = savedBw === null ? __BW__ : savedBw === '1';
 function screenExpr() { return bwEl.checked ? MOD + '.screen(p,1)' : MOD + '.screen(p)'; }
 bwEl.onchange = () => { saveSetting('rdp_bw', bwEl.checked ? '1' : '0');
                         log('黑白模式: ' + (bwEl.checked ? '开' : '关'), 'act'); refresh(); };
+// 换行方式:默认 Shift+Enter(聊天输入框里 Enter 是发送,纯 Enter 会把第一行立刻发出去)
+const nlEl = document.getElementById('nlmode');
+const savedNl = localStorage.getItem('rdp_nl');
+nlEl.value = savedNl === 'enter' ? 'enter' : 'shift';
+nlEl.onchange = () => { saveSetting('rdp_nl', nlEl.value);
+                        log('换行方式: ' + (nlEl.value === 'enter' ? 'Enter' : 'Shift+Enter'), 'act'); };
 // 服务端日志开关:默认开(保持原行为);关掉后页面所有请求带 X-RDP-Log:0,
 // server_http 就不再为每次点击/每张自动刷新截图打一条 [RPC] 访问行
 const slogEl = document.getElementById('slog');
@@ -634,7 +661,7 @@ renderHist();
 function sendText() {
     const text = textin.value;
     if (!text) { log('输入框为空,未发送', 'err'); return; }
-    rpc(MOD + ".input('" + pyQuote(text) + "')")
+    rpc(MOD + ".input('" + pyQuote(text) + "','" + nlEl.value + "')")
         .then(() => {                        // 发送成功:清空输入,截图刷新确认远端已上屏
             textin.value = '';
             autoGrow();
