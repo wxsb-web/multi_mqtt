@@ -944,8 +944,11 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
         """basic_auth 非空时校验 Authorization 头；未通过则回 401 挑战。
 
         浏览器收到 401 + WWW-Authenticate 会弹登录框，且同源的 WebSocket
-        升级请求会自动带上凭据，因此校验统一放在 do_GET/do_POST 入口，
-        RPC、重定向、favicon、WebSocket 全部被同一层拦截。
+        升级请求会自动带上凭据。do_GET / do_POST 入口先校验一次，覆盖
+        重定向、favicon、WebSocket 这些不经过 handle_rpc 的分支；
+        handle_rpc 内部再校验一次，覆盖 WSGI / ASGI 垫片直接调用本方法的
+        路径。do_* 已校验时传 ``auth_checked=True`` 让 handle_rpc 跳过重复
+        的 base64 + 恒定时间比较，同一请求只算一次。
         """
         basic_auth = _conf(self, 'basic_auth')
         if not basic_auth:
@@ -994,7 +997,7 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(favicon_bytes)
             return
-        self.handle_rpc()
+        self.handle_rpc(auth_checked=True)
 
     def handle_websocket(self, websocket_handler):
         self.protocol_version = 'HTTP/1.1'
@@ -1034,7 +1037,7 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.check_basic_auth():
             return
-        self.handle_rpc()
+        self.handle_rpc(auth_checked=True)
 
     def _execute_coroutine(self, coro, exec_globals):
         target_loop = _conf(self, 'main_loop')
@@ -1056,10 +1059,12 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
         finally:
             loop.close()
 
-    def handle_rpc(self):
-        # 认证门必须放在 handle_rpc 内部而不只是 do_GET/do_POST：WSGI 垫片、
-        # Range 捕获等路径直接调用本方法，不经过 do_*，放在外面会被绕过。
-        if not self.check_basic_auth():
+    def handle_rpc(self, auth_checked=False):
+        # 认证门必须放在 handle_rpc 内部而不只是 do_GET/do_POST：WSGI / ASGI
+        # 垫片直接调用本方法，不经过 do_*，放在外面会被绕过。do_* 入口已经
+        # 校验过时传 auth_checked=True，避免同一请求重复做 base64 + 恒定
+        # 时间比较；默认 False 保证直接调用方仍然自行校验。
+        if not auth_checked and not self.check_basic_auth():
             return
         try:
             # path 与 query 必须切开：路由只认路径部分，query 是别名调用

@@ -15,6 +15,9 @@
 | **params**（新增） | `#alias add(x, y=3)` 换行 body | `add` + 参数注入 | 签名声明 + 默认值 + 调用方数据 | 带参数的可复用片段 |
 | **prefix**（新增） | `#alias git+` 换行 body | `git pull`（任意前缀命中输入） | 命中后的**剩余字符串**写入 `_alias_arg` | 命令前缀、快捷指令 |
 
+> HTTP 层另有 `#serve-file` 文件直出快速路径（**不是第四种模式**，不改变
+> 上面三种别名的语义），见 8.5。
+
 三条核心规则：
 
 1. **别名是程序，不是模板**——body 就是 Python 代码，按 REPL 语义执行，
@@ -529,6 +532,88 @@ server_http 职责只有三步：
 （包括不带参数的别名执行）天然串行。HTTP worker 之间、HTTP 与 MQTT
 之间互不可见对方的请求级参数。参数机制不引入新的并发原语。
 
+### 8.5 文件直出（`#serve-file`）
+
+`#serve-file` 是 server_http 在**进入执行器之前**识别的文件下载快速路径，
+不是第四种别名模式。注册方式仍是普通 plain 别名，body 首行写成规格：
+
+```
+#alias dl
+#serve-file {"path": "/tmp/a.wav", "filename": "a.wav", "content_type": "audio/wav", "rate_limit": 0, "chunk_size": 65536}
+<fallback 可执行代码>
+```
+
+#### 触发条件（全部满足才走快速路径）
+
+1. 请求方法是 **GET**（原生 handler 与 WSGI / ASGI 垫片都复用 `handle_rpc`）；
+2. 路由出的整段 code **精确等于**已注册别名名：不接受 `dl=arg`、prefix
+   展开、params 绑定，query 也不参与；
+3. 执行器 `alias` 开启，且 `executor.aliases` 中存在该记录；
+4. body 第一条非空行以 `#serve-file` 开头，其后是合法 JSON object。
+
+首行不是该形态、JSON 坏了、`path` 缺失或类型写错，一律返回 `None` 并
+只打一次 WARNING，**退回普通别名执行**。下载端点坏掉不能牵连 RPC 主流程。
+
+#### JSON 规格
+
+| 字段 | 类型 | 必填 | 默认 | 说明 |
+|---|---|---|---|---|
+| `path` | str | 是 | — | 服务端本机路径；请求时做 `expanduser` + `abspath`，建议写绝对路径 |
+| `filename` | str | 否 | `path` 的 basename（空则 `download.bin`） | 写入 `Content-Disposition`，双引号会被替换为 `_` |
+| `content_type` | str | 否 | `application/octet-stream` | 响应 `Content-Type` |
+| `rate_limit` | int | 否 | `0` | 字节/秒；`0` 全速，负数按 0 |
+| `chunk_size` | int | 否 | `65536` | 每次读写的块大小，最小 `1024` |
+
+`chunk_size` 默认值即模块常量 `SERVE_FILE_CHUNK`（64KB）；限速按累计字节数
+排时间表，不是每块固定 sleep。
+
+#### 响应与流式
+
+- 文件存在：`200` + `Content-Type` + `Content-Length` + `Content-Disposition`
+  （`attachment`）+ `Accept-Ranges: bytes`；按 `chunk_size` 循环读文件写 socket。
+  注意：当前实现**不解析 `Range`**，总是 200 全量返回，播放器拖动进度条会重下。
+- 文件不存在或不是普通文件：`404` + 纯文本 `not found: <path>`。
+- 客户端断开（`BrokenPipeError` / `ConnectionResetError`）：立即停止，记录日志，
+  不会把整个文件继续写完。
+- 下载在**请求线程**执行，不占 `self.lock`，也不进入执行器；因此慢下载期间
+  其它 HTTP / MQTT RPC 不受影响。代价是它拿不到 `request` / `q` / `response` /
+  `p` 等请求级上下文，也不会更新别名的 `hits` / `last_used`。
+
+#### 为什么只对 GET 生效
+
+- 下载是读取语义（safe / idempotent），缓存、代理、断点续传都按 GET 定义；
+- POST 的语义是“**执行代码 / 提交数据**”（params、query、请求体都属于执行语义）。
+  快速路径刻意绕过执行器，若对 POST 也生效，会静默忽略这些语义，把执行端点
+  变成文件读取；
+- **POST 一个 `#serve-file` 别名并没有被禁止**：它照常进入执行器，首行规格是
+  Python 注释，实际执行的是后面的 fallback 代码。若确实需要 POST 下载，可在
+  fallback 里用 `response.write` 分块输出（但会占执行锁），或显式放开这一判断
+  并同步修改本节语义。
+
+#### 与普通别名执行的关系
+
+- 注册、重名覆盖、`#unalias`、临时标记（`#alias dl !`）、`rpc.json` 的
+  `http_aliases` 持久化与启动恢复，全部走普通别名那一套；
+- 对执行器而言，`#serve-file {...}` 只是一行注释，所以老服务端 / MQTT 通道 /
+  非 GET 请求执行 body 时，后面的 fallback 代码仍然生效（`client/pythonanywhere_update.py`
+  的 `_serve_body` 就是按这个兼容形态生成 body 的）；
+- 规格只读 body 首行，fallback 代码可以任意长；快速路径命中时 fallback 不执行。
+
+#### 示例
+
+```
+# 注册（HTTP RPC 或 MQTT RPC 均可）
+#alias dl
+#serve-file {"path": "/data/user/0/com.qgb.xime/files/probe_60s.wav", "filename": "probe_60s.wav", "content_type": "audio/wav"}
+
+# 下载
+GET /-dl     # alias_url='dash'（默认）且 key='-'
+GET /dl      # key 为空，或 alias_url='raw'
+```
+
+安全边界：能注册别名的人本来就有 RPC 代码执行权限，因此 `path` 不做沙箱限制；
+它只是“把已有权限能读到的文件用 HTTP 直出”，不引入新的越权面。
+
 ---
 
 ## 9. 本地调用与 HTTP 同路径论证
@@ -743,3 +828,4 @@ GET /-%22add%20two%22?x=4   → r == 7（query 注入 + 默认值 y=3）
 - [x] `split_alias_call` / `#unalias` 分词 / 临时标记剥离都引号感知
 - [x] 持久化恢复按解码名重建（`build_alias_record(..., decoded_name=True)`）
 - [x] server_http：读 record（O(1)）决定是否注入 query，`alias_url` 支持 `'dash'` / `'raw'` / `'json'` 值解码
+- [x] server_http：`#serve-file` 文件直出快速路径（仅 GET 精确命中别名、坏规格回退普通执行、不占执行锁）
