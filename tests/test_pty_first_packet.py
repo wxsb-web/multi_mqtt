@@ -57,6 +57,7 @@ class _FakeNet:
     def __init__(self):
         self.lock = threading.Lock()
         self.clients = {h: _FakeClient(h) for h in HOSTS}
+        self.brokers = [(h, 1883) for h in HOSTS]
         self.message_callback = None
         self._cmq_stream_installed = False
 
@@ -192,6 +193,48 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertGreaterEqual(rows["broker-a"]["hb_gap_ms"]["min"], 20.0)
         self.assertLess(rows["broker-a"]["hb_gap_ms"]["max"], 500.0)
         self.assertEqual(rows["broker-b"]["hb_frames"], 1)
+
+    def test_heartbeat_duplicate_delivery_is_deduped(self):
+        """同一帧在同一 broker 被投递两次：记 hb_dups，不污染到达间隔。"""
+        net = self.net
+        frame = {"pty": "s1", "hb": 123456}
+        net.downlink("pty/out", frame, "broker-a")
+        net.downlink("pty/out", dict(frame), "broker-a")
+        rep = self.stats.get_report()
+        rows = {r["broker"]: r for r in rep["pty_frames"]["broker_distribution"]}
+        self.assertEqual(rows["broker-a"]["hb_frames"], 1)
+        self.assertEqual(rows["broker-a"]["hb_dups"], 1)
+        self.assertNotIn("hb_gap_ms", rows["broker-a"])
+
+    def test_first_uplink_broker_not_overwritten_by_later_batches(self):
+        """uplink first_packet_broker 取首个完成批次，不被后续批次覆盖。"""
+        net = self.net
+        net.publish_broadcast("t", {"x": 1})
+        net.clients["broker-b"].ack(1)
+        net.publish_broadcast("t", {"x": 2})
+        net.clients["broker-a"].ack(2)
+        rep = self.stats.get_report()
+        self.assertEqual(rep["uplink_publish"]["first_packet_broker"],
+                         "broker-b")
+
+    def test_stale_mid_is_reported_and_pruned_after_ttl(self):
+        stats = self.stats
+        old = time.perf_counter() - stats._MID_TTL - 5
+        with stats._lock:
+            stats._mid[("broker-a", 999)] = (424242, old)
+        self.assertEqual(stats.get_report()["in_flight"]["stale_mids"], 1)
+        with stats._lock:
+            stats._prune()
+        self.assertEqual(len(stats._mid), 0)
+
+    def test_connectivity_counts_and_disconnected_hosts(self):
+        net = self.net
+        net.clients["broker-c"].is_connected = lambda: False
+        c = self.stats.get_report()["connectivity"]
+        self.assertEqual(c["configured"], 3)
+        self.assertEqual(c["clients"], 3)
+        self.assertEqual(c["connected"], 2)
+        self.assertEqual(c["disconnected_hosts"], ["broker-c"])
 
     def test_dirty_inputs_never_raise(self):
         net = self.net

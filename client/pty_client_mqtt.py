@@ -1124,6 +1124,7 @@ class FirstPacketStats:
 
     _BATCH_MAX = 4096             # 未收到全部 on_publish 的上行批次上限
     _MID_MAX = 32768              # mid -> 批次 的在途映射上限
+    _MID_TTL = 120.0              # mid 最长在途秒数，超时视为等不到回执
     _SEEN_MAX = 16384             # 下行 seq 去重表上限
     _SID_MAX = 512                # 会话首帧 broker 表上限
 
@@ -1336,7 +1337,8 @@ class FirstPacketStats:
                 if b["win"] is None:
                     b["win"] = host
                     st["up_wins"] += 1
-                    self._first_ul_broker = host
+                    if self._first_ul_broker is None:
+                        self._first_ul_broker = host
                 if b["pending"] <= 0:
                     self._batches.pop(bid, None)
 
@@ -1395,11 +1397,16 @@ class FirstPacketStats:
                             self._dl_seen.pop(k, None)
 
         if data.get("hb") is not None:
-            # 心跳帧只用本地单调钟算「相邻两次到达的间隔」：不解析、也不
-            # 信赖远端 hb 里的时间戳，因此统计完全与远端时钟/状态无关。
+            # 心跳帧：间隔只用本地单调钟；同一帧被同一 broker 重复投递时，
+            # 用整帧内容做本地比对去重（不解析、不用远端的 hb 时间戳）。
+            key = repr(data)
             now = time.monotonic()
             with self._lock:
                 st = self._broker(broker)
+                if key == st["hb_last_key"]:
+                    st["hb_dups"] += 1
+                    return
+                st["hb_last_key"] = key
                 st["hb_cnt"] += 1
                 last = st["hb_last"]
                 st["hb_last"] = now
@@ -1417,9 +1424,12 @@ class FirstPacketStats:
             sids = dict(self._sids)
             pending_batches = len(self._batches)
             pending_mids = len(self._mid)
+            stale_mids = sum(1 for bid, _t0 in self._mid.values()
+                             if bid not in self._batches)
             uptime = time.monotonic() - self._t0
             if reset:
                 self._reset_locked()
+        connectivity = self._connectivity()
         total_req = sum(b["req_wins"] for b in brokers.values())
         total_dl = sum(b["dl_wins"] for b in brokers.values())
         total_ul = sum(b["up_wins"] for b in brokers.values())
@@ -1455,6 +1465,8 @@ class FirstPacketStats:
             }
             if st["hb_cnt"]:
                 row["hb_frames"] = st["hb_cnt"]
+            if st["hb_dups"]:
+                row["hb_dups"] = st["hb_dups"]
             if st["hb_n"]:
                 row["hb_gap_ms"] = self._lat_block(
                     st["hb_n"], st["hb_min"], st["hb_sum"], st["hb_max"])
@@ -1479,6 +1491,7 @@ class FirstPacketStats:
         return {
             "uptime_s": round(uptime, 1),
             "installed": self._installed,
+            "connectivity": connectivity,
             "requests": {
                 "n": g["req_n"],
                 "latency_ms": self._lat_block(
@@ -1504,14 +1517,39 @@ class FirstPacketStats:
                     g["up_send_sum"], g["up_send_max"]),
                 "broker_distribution": ul_rows,
             },
-            "in_flight": {"batches": pending_batches, "mids": pending_mids},
+            "in_flight": {"batches": pending_batches, "mids": pending_mids,
+                          "stale_mids": stale_mids},
             "note": ("纯被动统计：0 额外网络请求，时间全部基于本地单调钟，"
-                     "不读取也不信赖远端服务器的时间戳/状态。下行首包=第一"
-                     "份副本先到的 broker；上行首包=on_publish 先完成的 "
-                     "broker，QoS0 下只代表包已发离客户端（不代表 broker 已"
-                     "回执）。hb_gap_ms=同一 broker 相邻两次心跳帧的本地到达"
-                     "间隔（不含远端时钟）。"),
+                     "不解析也不信赖远端时间戳。下行首包=第一份副本先到的 "
+                     "broker；上行首包=on_publish 先完成的 broker，QoS0 下只"
+                     "代表包已发离客户端（不代表 broker 已回执）；"
+                     "uplink_publish.first_packet_broker=首个完成批次的首个 "
+                     "ack 所在 broker。hb_gap_ms=同一 broker 相邻两次不同心跳"
+                     "的本地到达间隔，同帧重复投递记入 hb_dups。stale_mids="
+                     "批次已结束但始终等不到 on_publish 的僵尸 mid 数。"),
         }
+
+    def _connectivity(self):
+        """配置数/客户端对象数/在线数/掉线 host：只读，异常全部吞掉。"""
+        try:
+            net = self._net
+            if net is None:
+                return {"configured": None, "clients": None,
+                        "connected": None, "disconnected_hosts": []}
+            configured = len(getattr(net, "brokers", None)
+                             or getattr(net, "broker_list", None) or ())
+            clients = getattr(net, "clients", None) or {}
+            alive, dead = [], []
+            for host, c in clients.items():
+                try:
+                    (alive if c.is_connected() else dead).append(host)
+                except Exception:
+                    dead.append(host)
+            return {"configured": configured, "clients": len(clients),
+                    "connected": len(alive), "disconnected_hosts": dead}
+        except Exception:
+            return {"configured": None, "clients": None,
+                    "connected": None, "disconnected_hosts": []}
 
     @staticmethod
     def _first_frame_broker(sids, brokers):
@@ -1538,6 +1576,7 @@ class FirstPacketStats:
             st = {
                 "dl_rx": 0, "dl_wins": 0, "dl_dups": 0,
                 "hb_cnt": 0, "hb_last": None,
+                "hb_dups": 0, "hb_last_key": None,
                 "hb_n": 0, "hb_min": None, "hb_sum": 0.0, "hb_max": None,
                 "req_wins": 0, "req_lat_n": 0, "req_lat_min": None,
                 "req_lat_sum": 0.0, "req_lat_max": None,
@@ -1561,10 +1600,16 @@ class FirstPacketStats:
             st[prefix + "_max"] = value
 
     def _prune(self):
-        """只在持锁时调用：给批次表兜底，防止 on_publish 永不回来。"""
+        """只在持锁时调用：给批次/mid 表兜底，防止 on_publish 永不回来。"""
         if len(self._batches) > self._BATCH_MAX:
             for k in list(self._batches)[:self._BATCH_MAX // 2]:
                 self._batches.pop(k, None)
+        # 超时的 mid 一定等不到 on_publish 了（正常回执最长不过数十秒），
+        # 直接丢弃，避免长期运行持续增长。
+        now = time.perf_counter()
+        for k, (_bid, t0) in list(self._mid.items()):
+            if now - t0 > self._MID_TTL:
+                self._mid.pop(k, None)
 
     def _reset_locked(self):
         self._t0 = time.monotonic()
