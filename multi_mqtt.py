@@ -98,7 +98,7 @@ BROKER_LIST = [
     ("mqtt.tyckr.io", 1883),                    # RTT: 436.0 ms | 建连:  596.2 ms (Tyckr)
     ("public-mqtt-broker.bevywise.com", 1883),  # RTT: 451.3 ms | 建连:  575.9 ms (Bevywise)
     ("demo.tbmq.io", 1883, ["demo", ""]),       # ThingsBoard TBMQ可以，下面4个全部不能用
-    ('public.runmqtt.com', 1883, ["ajbkvbp/device",'UcLNzAPGyxJbjPKF']),# mqtt.pro https://runmqtt.com/zh-Hans/public-broker
+    ('public.runmqtt.com', 1883, ["ajbkvbp/device",'kSPmkUIFWxSRgtPq']),# mqtt.pro https://runmqtt.com/zh-Hans/public-broker
     ("mqtt.flespi.io", 1883,[b'\xe6\x97\xa6\xa7\xf9\xf5\x84\xa2\x94\x95\xc2\xa7\x84\xc8\xe6\x96\xf9\x99\xa6\x95\xe5\xe9\x84\xa8\xa2\xd3\xa6\xe5\x89\x88\xe5\x81\xa2\xc3\xd8\x87\x85\x85\xf3\x84\xf9\x82\xf8\xf0\xd1\x82\x89\x91\x93\xe5\xd1\xd7\x95\xe8\xc2\xf7\xd7\xe7\xe6\x85\xd6\x82\x97\xf5'.decode('cp500'), ""]),#github q5  Flespi，将 YOUR_FLESPI_TOKEN 替换为注册后获取的 Token[reference:2]
     # ("public.mqtt.pro", 1883, ["ajbkvbp/demo", "OCDWjjOSlSexcWRG"]),        # MQTT.pro 公共沙箱，凭据定期轮换[reference:1]
     # ("io.adafruit.com", 1883, ["nagecubic","aio_"+"EiZX7901W4K4INtv13RSH6jqkEKl"]),        # Adafruit IO，需注册获取 #改成"aio_"+" 不能直接push error: GH013: Repository rule violations found for refs/heads/master.  GITHUB PUSH PROTECTION
@@ -1149,6 +1149,112 @@ class MultiMQTTManager:
         client.on_message = self._on_message
         client.on_publish = self._on_publish
         return host, port, client
+
+    def update_server_public_key(self, server_public_key_bytes):
+        """热更新接收验签公钥。
+
+        公钥只在收到消息验签（server_vk.verify）时使用，不参与建连，所以
+        这里不重建、不断开任何 client，只替换两个引用（CPython 引用赋值
+        原子，分发线程无需加锁）。
+        """
+        pem = get_standard_public_pem_bytes(server_public_key_bytes)
+        self.server_vk = ecdsa.VerifyingKey.from_pem(pem) if pem else None
+        self.server_public_key_bytes = pem
+
+    def update_brokers(self, brokers):
+        """按 host 差异热更新 broker 集合，未变化的连接保持原样。
+
+        供上层 rpc_config(broker_list_add=...) 只改一条 broker 时使用：
+          - 同一 host（大小写不敏感）换了端口/用户名/密码 = 变更，原位重建
+            该 host 的 client，旧 client 单独关闭；
+          - 新增 host 建新 client，删除 host 只关闭对应 client；
+          - 其它 host 的 paho client、分发线程、stats、周期任务全部不动，
+            新 client 连上后由 _on_connect 自动补订阅 subscribed_topics。
+
+        :return: {'added': [host...], 'updated': [host...], 'removed': [host...]}
+        """
+        if not isinstance(brokers, (list, tuple)) or not brokers:
+            raise ValueError("brokers 必须是非空列表")
+
+        new_info = {}
+        for entry in brokers:
+            unpacked = self._unpack_broker(entry)
+            if unpacked is None:
+                continue
+            new_info[unpacked[0].casefold()] = (unpacked, entry)
+        if not new_info:
+            raise ValueError("brokers 里没有合法条目")
+
+        with self.lock:
+            old_info = {}
+            for entry in self.brokers:
+                unpacked = self._unpack_broker(entry)
+                if unpacked is None:
+                    continue
+                old_info[unpacked[0].casefold()] = (unpacked, entry)
+
+        added = [key for key in new_info if key not in old_info]
+        removed = [key for key in old_info if key not in new_info]
+        changed = [
+            key for key in new_info
+            if key in old_info and new_info[key][0] != old_info[key][0]
+        ]
+
+        # 先摘掉要重建的旧 client：只动这些 host，其它连接原样保留
+        stopped = []
+        with self.lock:
+            for key in removed + changed:
+                host = old_info[key][0][0]
+                client = self.clients.pop(host, None)
+                if client is not None:
+                    stopped.append((host, client))
+            self.brokers = list(brokers)
+        for host, client in stopped:
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except Exception:
+                logger.debug("关闭旧 broker client 时异常 [%s]", host, exc_info=True)
+        for key in removed:
+            host = old_info[key][0][0]
+            with self.stats.lock:
+                self.stats.stats.pop(host, None)
+
+        for key in added + changed:
+            entry = new_info[key][1]
+            host, port, client = self._build_client(entry)
+            if client is None:
+                continue
+            try:
+                client.connect_async(host, port, keepalive=self.keepalive)
+                client.loop_start()
+                with self.lock:
+                    stopped_now = self._stop_event.is_set()
+                    if not stopped_now:
+                        self.clients[host] = client
+                if stopped_now:
+                    try:
+                        client.loop_stop()
+                    except Exception:
+                        pass
+                    continue
+            except Exception as error:
+                try:
+                    client.loop_stop()
+                except Exception:
+                    pass
+                logger.error("broker 热更新连接失败 [%s]: %s", host, error)
+
+        summary = {
+            "added": [new_info[key][0][0] for key in added],
+            "updated": [new_info[key][0][0] for key in changed],
+            "removed": [old_info[key][0][0] for key in removed],
+        }
+        if any(summary.values()):
+            logger.info(
+                "♻️ Broker 热更新: 新增=%s 变更=%s 移除=%s（其它连接不受影响）",
+                summary["added"], summary["updated"], summary["removed"])
+        return summary
 
     def _host_port_map(self):
         """返回当前 broker 配置的 {host: port}（用于恢复时的裸 TCP 探测与重建）。"""

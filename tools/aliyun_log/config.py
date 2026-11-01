@@ -10,6 +10,23 @@ import os
 
 RPC_JSON = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rpc.json")
 
+
+def _find_rpc_json():
+    """从脚本所在目录向上找仓库根的 rpc.json（目录被移动过，不写死层级）。"""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(6):
+        candidate = os.path.join(cur, "rpc.json")
+        if os.path.exists(candidate):
+            return candidate
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return RPC_JSON
+
+
+RPC_JSON = _find_rpc_json()
+
 _KEYS = ("endpoint", "ak_id", "ak_sec", "project", "logstore")
 
 

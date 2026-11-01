@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import sys
+import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -29,6 +30,9 @@ DEFAULT_PUB_KEY='ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHA
 RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
 _RPC_CONFIG_LOCK = globals().setdefault('_RPC_CONFIG_LOCK', threading.RLock())  # reload 会重造新锁对象：正攥旧锁写 rpc.json 的线程与拿新锁的线程同时进临界区，setdefault 保住同一把锁跨 reload
 gms = globals().setdefault('gms', None)  # 当前活着的服务端实例（构造/启动时自注册 gms = self），reload 重执行把名字重绑回 None——rpc_config()/apply 热配置路径（324-352 行）静默失效直到下次实例化；setdefault 让 reload 后仍指向活着的实例
+# 全部活着的服务端实例（弱引用，停止/回收后自动消失）：模块级 rpc_config()/
+# rpc_config_get() 对每个实例都生效，不再只认最后构造的 gms。
+_RPC_SERVERS = globals().setdefault('_RPC_SERVERS', weakref.WeakSet())
 
 # --- [global_topic_list 监听 topic 定期报告] 默认配置 ---
 # 命名说明：stats.get_report 是网络连接质量报告；本组是"监听 topic 列表"报告，
@@ -532,41 +536,132 @@ def _resolve_request_topic(request_topic=None, stored=None):
     return machine_topic
 
 
-def rpc_config(**updates):
-    """持久化并立即应用设置，例如 rpc_config(request_topic='sys/new/request')。"""
-    global gms
+def _live_servers():
+    """当前活着的 MQTTServer 实例（弱引用，回收后自动消失）。
+
+    模块级 rpc_config()/rpc_config_get() 对每个实例都生效，而不是只认最后
+    构造的 gms；gms 仅作兼容兜底（老代码/测试可能手动赋值）。
+    """
+    servers = [server for server in list(_RPC_SERVERS) if server is not None]
+    if not servers and gms is not None:
+        servers = [gms]
+    return servers
+
+
+def _primary_server(servers=None):
+    """取一个代表实例：优先 gms，其次最近注册的实例；没有实例返回 None。"""
+    servers = _live_servers() if servers is None else servers
+    if gms is not None and gms in servers:
+        return gms
+    return servers[-1] if servers else None
+
+
+def _merge_rpc_updates(current, updates):
+    """以某个实例当前生效配置为基线叠加显式更新，返回严格校验后的候选配置。
+
+    broker_list 走 _broker_list_base 语义：基线里 broker_list 是"生效结果"，
+    叠加时要先还原成 base，再按 broker_list_add / broker_list_del 重新合成。
+    """
+    merged = dict(current)
+    merged["broker_list"] = merged["_broker_list_base"]
+    if "broker_list" in updates:
+        merged["_broker_list_base"] = updates["broker_list"]
+    return _normalize_rpc_config({**merged, **updates})
+
+
+def set_rpc_config(*, path=None, **updates):
+    """持久化并立即应用到**所有**存活的服务端实例。
+
+    三种写法：
+    1. ``rpc_config(request_topic="new")``：热应用到所有实例并写入默认文件
+       ``RPC_CONFIG_PATH``；
+    2. ``rpc_config(path=..., request_topic="new")``：热应用并写入该文件，
+       本次不改变默认文件位置；
+    3. ``rpc_config(path=...)``（只有 path）：把该文件读入内存并热应用到
+       所有实例，同时把模块默认位置与各实例的 ``rpc_config_path`` 更新为它。
+       broker 按 host:port 逐条比对：完全相同的条目原样保留（连接不断开），
+       只有不同/新增/缺失的条目才重建或关闭。
+
+    动态只更新一条 broker（其它 broker 连接完全不受影响）：
+        rpc_config(broker_list_add=[("public.runmqtt.com", 1883,
+                                     ["ajbkvbp/device", "新密码"])])
+    broker 身份按 host:port（host 大小写不敏感）：同 host 换密码/用户名就是
+    原位替换那一条，不会新增重复条目，也不会动其它 broker 的连接。
+    """
+    global gms, RPC_CONFIG_PATH
     if not updates:
-        return rpc_config_get()
+        if path is None:
+            return rpc_config_get()
+        # 只有 path：读入该文件到内存并热应用，不写文件
+        config_path = Path(path)
+        if not config_path.exists():   # 显式给的路径，写错就当场报错
+            raise FileNotFoundError(f"rpc 配置文件不存在: {config_path}")
+        candidate = load_rpc_config(config_path)
+        servers = _live_servers()
+        if servers:
+            previous = [server._rpc_config_snapshot() for server in servers]
+            applied = []
+            try:
+                for server in servers:
+                    server.apply_rpc_config(candidate)
+                    applied.append(server)
+            except Exception:
+                for server, prev in zip(applied, previous):
+                    try:
+                        server.apply_rpc_config(prev)
+                    except Exception:
+                        logger.exception("rpc_config 回滚失败，实例配置可能已部分生效")
+                raise
+            RPC_CONFIG_PATH = config_path
+            for server in servers:
+                server.rpc_config_path = config_path
+            logger.info("配置文件位置已更新到内存并已热应用: %s（实例 %d 个）",
+                        config_path, len(servers))
+            return _primary_server(servers).rpc_config_get()
+        RPC_CONFIG_PATH = config_path
+        logger.info("配置文件位置已更新到内存: %s（暂无存活实例）", config_path)
+        return _json_rpc_config(candidate)
+    config_path = Path(path) if path is not None else RPC_CONFIG_PATH
     with _RPC_CONFIG_LOCK:
         _validate_explicit_updates(updates)   # 显式传错立刻报错，不静默回落
-        if gms is not None:
-            current = gms.get_rpc_config()
+        servers = _live_servers()
+        if servers:
+            previous = [server._rpc_config_snapshot() for server in servers]
+            candidates = [_merge_rpc_updates(prev, updates) for prev in previous]
         else:
             # 服务未启动时按 rpc.json（脏值已逐键回落默认值）算出当前配置
-            current = load_rpc_config()
-        current["broker_list"] = current["_broker_list_base"]
-        if "broker_list" in updates:
-            current["_broker_list_base"] = updates["broker_list"]
-        candidate = _normalize_rpc_config({**current, **updates})
-        previous = _normalize_rpc_config(current)
-        if gms is not None:
-            gms.apply_rpc_config(candidate)
+            previous = []
+            candidates = [_merge_rpc_updates(load_rpc_config(config_path), updates)]
+        applied = []
         try:
-            _write_rpc_config_updates(updates)
+            for server, candidate in zip(servers, candidates):
+                server.apply_rpc_config(candidate)
+                applied.append(server)
+            _write_rpc_config_updates(updates, config_path)
         except Exception:
-            if gms is not None:
-                gms.apply_rpc_config(previous)
+            for server, prev in zip(applied, previous):
+                try:
+                    server.apply_rpc_config(prev)
+                except Exception:
+                    logger.exception("rpc_config 回滚失败，实例配置可能已部分生效")
             raise
-        return rpc_config_get()
+        primary = _primary_server(servers)
+        return primary.rpc_config_get() if primary else _json_rpc_config(candidates[-1])
+rpc_config=set_config=set_rpc=rpc_set_config=rpc_config_set=set_rpc_config
 
+def get_rpc_config():
+    """返回实际生效的设置，只读、无副作用。
 
-def rpc_config_get():
-    """返回服务当前实际生效的设置；服务未启动时返回 rpc.json 合并默认值。"""
+    取存活实例内存中的最新配置；没有实例时回退 rpc.json + 代码默认值。
+    """
     with _RPC_CONFIG_LOCK:
-        if gms is not None:
-            return _json_rpc_config(gms.get_rpc_config())
+        primary = _primary_server()
+        if primary is not None:
+            return primary.rpc_config_get()
         return _json_rpc_config(load_rpc_config())
-get_config=get_rpc=get_rpc_config=rpc_get_config=rpc_config_get  
+get_config=get_rpc=rpc_get_config=rpc_config_get=get_rpc_config
+
+
 
 def _rpc_config_with_cli_overrides(
     request_topic=None, pub=None, brokers=None, global_topic_url_list=None
@@ -650,7 +745,14 @@ class MQTTServer:
         stats_print_interval=None,
         stats_ping_interval=None,
         rpc_config_source=None,
+        rpc_config_path=None,
     ):
+        # 本实例默认读写的配置文件（对象级 rpc_config(path=...) 可临时改用别的）
+        self.rpc_config_path = (
+            Path(rpc_config_path) if rpc_config_path is not None else RPC_CONFIG_PATH
+        )
+        # 注册进弱引用集合：模块级 rpc_config()/rpc_config_get() 对每个实例生效
+        _RPC_SERVERS.add(self)
         # 实例化网络层管理器（enable_crypto 默认为 False）
         if request_topic is None:
             if rpc_config_source is not None and "request_topic" in rpc_config_source:
@@ -767,12 +869,87 @@ class MQTTServer:
         else:
             logger.debug("MQTTServer 初始化完成: 验签未启用, 原因=%s", reason)
 
-    def get_rpc_config(self):
+    def _rpc_config_snapshot(self):
+        """内部用：含 _broker_list_base 的原始配置深拷贝（供合并/回滚）。"""
         with self._rpc_config_lock:
             return copy.deepcopy(self._rpc_config)
 
+    def get_rpc_config(self):
+        """唯一 getter：读取本实例内存中的最新生效配置，只读、无副作用。
+
+        get_config / get_rpc / get_rpc_config / rpc_get_config 都是它的别名，
+        不在这里做任何文件读取或配置合并。
+        """
+        return _json_rpc_config(self._rpc_config_snapshot())
+
+    def set_rpc_config(self, *, path=None, **updates):
+        """对象级 set：写入/加载配置。
+
+        1. ``rpc_config(request_topic="new")``：热应用并写入本实例默认文件
+           ``self.rpc_config_path``；
+        2. ``rpc_config(path=..., request_topic="new")``：热应用并把这一项
+           写入指定文件，本次不改变实例默认文件位置；
+        3. ``rpc_config(path=...)``（只有 path）：把该文件读入内存并热应用，
+           同时把默认文件位置更新为该文件。已存在的 broker 按 host:port
+           逐条比对：完全相同的条目原样保留（连接不断开），只有不同/新增/
+           缺失的条目才重建或关闭。
+        """
+        if not updates:
+            if path is None:
+                return self.rpc_config_get()
+            config_path = Path(path)
+            if not config_path.exists():   # 显式给的路径，写错就当场报错
+                raise FileNotFoundError(f"rpc 配置文件不存在: {config_path}")
+            with _RPC_CONFIG_LOCK:
+                previous = self._rpc_config_snapshot()
+                candidate = load_rpc_config(config_path)
+                try:
+                    self.apply_rpc_config(candidate)
+                except Exception:
+                    self.apply_rpc_config(previous)
+                    raise
+                self.rpc_config_path = config_path
+            logger.info("配置文件位置已更新到内存并已热应用: %s", config_path)
+            return self.rpc_config_get()
+        config_path = Path(path) if path is not None else self.rpc_config_path
+        with _RPC_CONFIG_LOCK:
+            _validate_explicit_updates(updates)   # 显式传错立刻报错
+            previous = self._rpc_config_snapshot()
+            candidate = _merge_rpc_updates(previous, updates)
+            self.apply_rpc_config(candidate)
+            try:
+                _write_rpc_config_updates(updates, config_path)
+            except Exception:
+                self.apply_rpc_config(previous)
+                raise
+            return self.rpc_config_get()
+
+    # get 只保留一个实现，其余名字统一指向它（set 同理）
+    get_config=get_rpc=rpc_get_config=rpc_config_get=get_rpc_config
+    rpc_config=set_config=set_rpc=rpc_set_config=rpc_config_set=set_rpc_config
+
+    def _apply_network_public_key(self, pub_key):
+        """热更新验签公钥，不碰任何 MQTT 连接。
+
+        公钥只在接收消息验签时用到（network.server_vk），与 broker/端口/
+        口令完全无关，所以换公钥绝不能重连：优先让网络层自己原子替换，
+        老网络层则直接改属性。
+        """
+        updater = getattr(self.mqtt_net, "update_server_public_key", None)
+        if callable(updater):
+            updater(pub_key)
+            return
+        pem = get_standard_public_pem_bytes(pub_key)
+        self.mqtt_net.server_vk = VerifyingKey.from_pem(pem) if pem else None
+        self.mqtt_net.server_public_key_bytes = pem
+
     def apply_rpc_config(self, config):
-        """更新服务设置；broker 或公钥变更时以新网络管理器平滑替换旧实例。
+        """更新服务设置，尽量不动已有连接。
+
+        broker 条目变化且网络层支持 update_brokers 时走原位热更新：同 host
+        换密码/端口只重建那一条 client，其它连接、分发线程、stats、周期
+        任务完全不受影响。公钥只在收包验签时使用、不参与建连，因此换公钥
+        只热替换 network.server_vk，一条连接都不动、更不重建 manager。
 
         global_topic_list 报告参数（间隔/阈值/tick 粒度）随之热生效：
         check_interval 变更时在当前 manager 上重注册周期任务。
@@ -781,13 +958,18 @@ class MQTTServer:
         candidate = _normalize_rpc_config(config)
         with self._rpc_config_lock:
             previous = self._rpc_config
-            network_changed = (
-                candidate["broker_list"] != previous["broker_list"]
-                or candidate["pub_key"] != previous["pub_key"]
-            )
+            broker_changed = candidate["broker_list"] != previous["broker_list"]
+            key_changed = candidate["pub_key"] != previous["pub_key"]
             topic_changed = candidate["request_topic"] != previous["request_topic"]
             gtl_old_check_interval = self.global_topic_list_check_interval
-            if network_changed:
+            hot_broker_update = (
+                broker_changed
+                # 只对已启动（有 client、分发线程在跑）的网络层做增量更新；
+                # 未启动时仍走整表替换 + start，避免连上却没人分发消息
+                and bool(getattr(self.mqtt_net, "clients", None))
+                and callable(getattr(self.mqtt_net, "update_brokers", None))
+            )
+            if broker_changed and not hot_broker_update:
                 replacement = MultiMQTTManager(
                     brokers=candidate["broker_list"],
                     log_messages=False,
@@ -817,6 +999,12 @@ class MQTTServer:
                 )
                 previous_net.stop()
             else:
+                if hot_broker_update:
+                    # 只改 broker：单条重建，其它 broker 的连接保持原样
+                    self.mqtt_net.update_brokers(candidate["broker_list"])
+                if key_changed:
+                    # 公钥只用于收包验签，热替换即可，不重连、不重建 manager
+                    self._apply_network_public_key(candidate["pub_key"])
                 if topic_changed:
                     self.mqtt_net.subscribe(candidate["request_topic"])
                     self.mqtt_net.unsubscribe(previous["request_topic"])

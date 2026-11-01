@@ -7,6 +7,7 @@ import time
 import unittest
 import urllib.parse
 import urllib.request
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +29,8 @@ class FakeMQTTManager:
         self.subscribed = []
         self.unsubscribed = []
         self.stopped = False
+        self.updated_brokers = []
+        self.updated_public_keys = []
         self.callback = None
         self.stats_print_interval = (
             server_mqtt.DEFAULT_STATS_PRINT_INTERVAL
@@ -62,6 +65,16 @@ class FakeMQTTManager:
         self.subscribed_topics.discard(topic)
         self.unsubscribed.append(topic)
 
+    def update_brokers(self, brokers):
+        """模拟网络层增量热更新：只改配置表，不替换 manager。"""
+        self.brokers = list(brokers)
+        self.updated_brokers.append(list(brokers))
+
+    def update_server_public_key(self, server_public_key_bytes):
+        """模拟验签公钥热更新：不碰连接。"""
+        self.server_public_key_bytes = server_public_key_bytes
+        self.updated_public_keys.append(server_public_key_bytes)
+
     def set_periodic_task(self, fn, interval=60.0):
         self.periodic_fn = fn
         self.periodic_interval = interval
@@ -77,6 +90,9 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.config_path = Path(self.temp_dir.name) / "rpc.json"
         self.path_patch = mock.patch.object(server_mqtt, "RPC_CONFIG_PATH", self.config_path)
         self.path_patch.start()
+        # 每个用例用独立的实例注册表，避免上一个用例残留实例被模块级更新连带
+        self.previous_servers = server_mqtt._RPC_SERVERS
+        server_mqtt._RPC_SERVERS = weakref.WeakSet()
         self.manager_patch = mock.patch.object(server_mqtt, "MultiMQTTManager", FakeMQTTManager)
         self.manager_patch.start()
         self.previous_gms = server_mqtt.gms
@@ -92,6 +108,7 @@ class ServerMqttConfigTests(unittest.TestCase):
 
     def tearDown(self):
         server_mqtt.gms = self.previous_gms
+        server_mqtt._RPC_SERVERS = self.previous_servers
         self.manager_patch.stop()
         self.path_patch.stop()
         self.temp_dir.cleanup()
@@ -106,7 +123,7 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(server_mqtt.load_rpc_config()["request_topic"], "new/request")
         self.assertEqual(json.loads(self.config_path.read_text())["request_topic"], "new/request")
 
-    def test_broker_and_public_key_update_replaces_live_network(self):
+    def test_broker_and_public_key_update_hot_applies_without_reconnect(self):
         previous_manager = self.server.mqtt_net
         result = server_mqtt.rpc_config(
             broker_list=[["new-broker.example", 1884]],
@@ -115,13 +132,27 @@ class ServerMqttConfigTests(unittest.TestCase):
 
         self.assertEqual(result["broker_list"], [["new-broker.example", 1884]])
         self.assertEqual(result["pub_key"], server_mqtt.DEFAULT_PUB_KEY)
-        self.assertTrue(previous_manager.stopped)
-        self.assertIsNot(self.server.mqtt_net, previous_manager)
-        self.assertEqual(self.server.mqtt_net.brokers, [("new-broker.example", 1884)])
-        self.assertIn("old/request", self.server.mqtt_net.subscribed_topics)
+        # 公钥不参与建连：换公钥 + 换 broker 也只热更，不重建 manager
+        self.assertIs(self.server.mqtt_net, previous_manager)
+        self.assertFalse(previous_manager.stopped)
+        self.assertEqual(previous_manager.brokers, [("new-broker.example", 1884)])
+        self.assertEqual(previous_manager.updated_public_keys,
+                         [server_mqtt.DEFAULT_PUB_KEY])
+        self.assertIn("old/request", previous_manager.subscribed_topics)
         stored = json.loads(self.config_path.read_text())
         self.assertEqual(stored["broker_list"], [["new-broker.example", 1884]])
         self.assertEqual(stored["pub_key"], server_mqtt.DEFAULT_PUB_KEY)
+
+    def test_public_key_only_change_never_touches_connections(self):
+        previous_manager = self.server.mqtt_net
+
+        server_mqtt.rpc_config(pub_key=server_mqtt.DEFAULT_PUB_KEY)
+
+        self.assertIs(self.server.mqtt_net, previous_manager)   # 没换 manager
+        self.assertFalse(previous_manager.stopped)              # 连接没断
+        self.assertEqual(previous_manager.updated_brokers, [])  # broker 一条没动
+        self.assertEqual(previous_manager.updated_public_keys,
+                         [server_mqtt.DEFAULT_PUB_KEY])
 
     def test_empty_public_key_is_persisted_and_disables_key_after_reload(self):
         server_mqtt._write_rpc_config_updates({"pub_key": server_mqtt.DEFAULT_PUB_KEY})
@@ -172,6 +203,140 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(self.server.mqtt_net.brokers, [
             tuple(entry) for entry in result["broker_list"]
         ])
+
+    def test_rpc_json_broker_list_replaces_builtin_with_new_password(self):
+        """rpc.json 里的 broker_list 整体替换内置列表（同 host 换密码不残留旧凭据）。"""
+        self.config_path.write_text(
+            json.dumps({
+                "broker_list": [
+                    ["public.runmqtt.com", 1883,
+                     ["ajbkvbp/device", "kSPmkUIFWxSRgtPq"]],
+                ]
+            }),
+            encoding="utf-8",
+        )
+
+        config = server_mqtt.load_rpc_config()
+
+        self.assertEqual(config["broker_list"], [
+            ("public.runmqtt.com", 1883,
+             ["ajbkvbp/device", "kSPmkUIFWxSRgtPq"]),
+        ])
+
+    def test_broker_add_same_host_new_password_hot_updates_only_one(self):
+        """动态改一条 broker：同名换密码原位替换，其它 broker 连接继续不动。"""
+        previous_manager = self.server.mqtt_net
+        new_entry = ["public.runmqtt.com", 1883,
+                     ["ajbkvbp/device", "kSPmkUIFWxSRgtPq"]]
+
+        result = server_mqtt.rpc_config(broker_list_add=[new_entry])
+
+        self.assertEqual(result["broker_list"], [
+            ["old-broker.example", 1883], new_entry])
+        self.assertIs(self.server.mqtt_net, previous_manager)   # 没换 manager
+        self.assertFalse(previous_manager.stopped)              # 其它连接没被停
+        self.assertEqual(len(previous_manager.updated_brokers), 1)
+        self.assertEqual(previous_manager.brokers, [
+            ("old-broker.example", 1883),
+            ("public.runmqtt.com", 1883,
+             ["ajbkvbp/device", "kSPmkUIFWxSRgtPq"]),
+        ])
+
+        # 再换一次密码：仍然只替换同一条，不会新增重复条目
+        second = ["public.runmqtt.com", 1883, ["ajbkvbp/device", "another-pass"]]
+        result = server_mqtt.rpc_config(broker_list_add=[second])
+        self.assertEqual(result["broker_list"], [
+            ["old-broker.example", 1883], second])
+        stored = json.loads(self.config_path.read_text())
+        self.assertEqual(stored["broker_list_add"], [second])
+
+    def test_object_level_rpc_config_applies_and_reaches_all_instances(self):
+        """实例级 get/set 可用（不再 AttributeError），模块级 set 作用于全部实例。"""
+        second = server_mqtt.MQTTServer(
+            brokers=[("second-broker.example", 1883)],
+            request_topic="second/request",
+            server_public_key_bytes=None,
+        )
+        second.mqtt_net.start()
+        second.mqtt_net.subscribe(second.request_topic)
+
+        self.assertEqual(self.server.rpc_config_get()["request_topic"], "old/request")
+        self.assertEqual(
+            self.server.rpc_config(request_topic="obj/request")["request_topic"],
+            "obj/request")
+        self.assertEqual(
+            json.loads(self.config_path.read_text())["request_topic"], "obj/request")
+
+        server_mqtt.rpc_config(request_topic="shared/request")
+        self.assertEqual(self.server.request_topic, "shared/request")
+        self.assertEqual(second.request_topic, "shared/request")
+        self.assertIn("shared/request", second.mqtt_net.subscribed_topics)
+
+    def test_rpc_config_path_argument_loads_and_hot_applies(self):
+        """get 只读内存且没有 path；set 只有 path 时读入该文件并逐条热更 broker。"""
+        second = server_mqtt.MQTTServer(
+            brokers=[("second-broker.example", 1883)],
+            request_topic="second/request",
+            server_public_key_bytes=None,
+        )
+        second.mqtt_net.start()
+
+        # get 无 path 参数，只返回内存最新状态
+        self.assertEqual(server_mqtt.rpc_config_get()["request_topic"], "old/request")
+        with self.assertRaises(TypeError):
+            server_mqtt.rpc_config_get(path="whatever.json")
+
+        # 只有 path：读入文件并热应用
+        file_b = Path(self.temp_dir.name) / "b.json"
+        file_b.write_text(json.dumps({
+            "broker_list": [
+                ["old-broker.example", 1883],
+                ["new-broker.example", 1883],
+            ],
+            "request_topic": "file/request",
+            "pub_key": None,
+        }), encoding="utf-8")
+
+        previous_manager = self.server.mqtt_net
+        result = self.server.rpc_config(path=file_b)
+        self.assertEqual(result["request_topic"], "file/request")
+        self.assertIs(self.server.mqtt_net, previous_manager)   # 没换 manager
+        self.assertFalse(previous_manager.stopped)              # 连接没断
+        self.assertEqual(len(previous_manager.updated_brokers), 1)
+        self.assertEqual(self.server.rpc_config_path, file_b)
+
+        # 另一份文件 broker 完全相同：不触发 broker 更新，连接保持
+        file_c = Path(self.temp_dir.name) / "c.json"
+        file_c.write_text(json.dumps({
+            "broker_list": [
+                ["old-broker.example", 1883],
+                ["new-broker.example", 1883],
+            ],
+            "request_topic": "file2/request",
+            "pub_key": None,
+        }), encoding="utf-8")
+        result = self.server.rpc_config(path=file_c)
+        self.assertEqual(result["request_topic"], "file2/request")
+        self.assertFalse(previous_manager.stopped)
+        self.assertEqual(len(previous_manager.updated_brokers), 1)  # 没有新增热更
+        self.assertEqual(self.server.rpc_config_path, file_c)
+
+        # 之后 set 默认写到新位置
+        self.server.rpc_config(stats_ping_interval=60)
+        stored = json.loads(file_c.read_text())
+        self.assertEqual(stored["stats_ping_interval"], 60.0)
+
+        # 模块级只有 path：所有实例一起读入并更新默认位置
+        server_mqtt.rpc_config(path=file_c)
+        self.assertEqual(second.rpc_config_path, file_c)
+        self.assertEqual(server_mqtt.RPC_CONFIG_PATH, file_c)
+        self.assertEqual(second.request_topic, "file2/request")
+        self.assertFalse(self.config_path.exists())
+
+        # 显式路径写错：当场报错，不动现有连接
+        with self.assertRaises(FileNotFoundError):
+            self.server.rpc_config(path=Path(self.temp_dir.name) / "missing.json")
+        self.assertFalse(previous_manager.stopped)
 
     def test_invalid_update_does_not_change_runtime_or_file(self):
         with self.assertRaisesRegex(ValueError, "request_topic"):
