@@ -502,6 +502,7 @@ body.textfocus #inputzone { order: 1; }
       <button id="btn-send" title="把文本逐字符敲入远端前台窗口,换行转回车键">发送</button>
     </div>
     <div id="auxrow">
+      <button id="btn-undo" title="撤销上一次编辑(等同电脑端 Ctrl+Z);「取剪贴板」覆盖整段内容也能撤销">撤销</button>
       <select id="histsel" title="选择历史输入填入输入框"><option>历史</option></select>
       <button id="btn-setclip" title="把输入框文本写入远端剪贴板">设剪贴板</button>
       <button id="btn-getclip" title="读取远端剪贴板文本到输入框">取剪贴板</button>
@@ -620,6 +621,43 @@ function autoGrow() {                       // 多行时自动长高,封顶 160p
     textin.style.height = Math.min(textin.scrollHeight, 160) + 'px';
 }
 textin.addEventListener('input', autoGrow);
+// ---------- 撤销栈:自管快照,程序化写入(取剪贴板/历史/发送后清空)也能撤销 ----------
+// 浏览器原生撤销栈在 JS 直接赋值 .value 时会被重置,所以「取剪贴板」整段覆盖之后
+// 原生 Ctrl+Z 无效;这里自己记录每次编辑前的完整文本,按钮与 Ctrl+Z 走同一套栈。
+const undoStack = [];                        // 每项 = 一次编辑前的完整文本
+const UNDO_MAX = 50;                         // 步数上限,避免长会话无限占内存
+let undoAt = 0;                              // 上次入栈时间:600ms 内的连续键入合并成一步
+let lastVal = textin.value;                  // 输入框当前已知内容,用于生成快照
+function pushUndo(prev, force) {
+    const now = Date.now();
+    if (force || now - undoAt > 600) {       // 程序化写入单独成步;纯打字按停顿分组
+        undoStack.push(prev);
+        if (undoStack.length > UNDO_MAX) undoStack.shift();
+        undoAt = force ? 0 : now;            // 程序化写入后,下一次键入另起一步
+    } else {
+        undoAt = now;
+    }
+}
+textin.addEventListener('input', () => { pushUndo(lastVal, false); lastVal = textin.value; });
+function setText(t) {                        // 所有程序化改写输入框都走这里,保证可撤销
+    if (t === textin.value) { autoGrow(); return; }
+    pushUndo(textin.value, true);
+    textin.value = t;
+    lastVal = t;
+    autoGrow();
+}
+function undoText() {
+    if (!undoStack.length) { log('没有可撤销的编辑', 'err'); return; }
+    const prev = undoStack.pop();
+    textin.value = prev;
+    lastVal = prev;
+    undoAt = 0;                              // 撤销后再输入,不与被撤销的那步合并
+    autoGrow();
+    textin.focus();
+    try { textin.setSelectionRange(prev.length, prev.length); } catch (err) {}   // 光标落到末尾
+    log('已撤销 1 步,还可撤销 ' + undoStack.length + ' 步', 'act');
+}
+document.getElementById('btn-undo').onclick = undoText;
 function pyQuote(s) {                       // 串进 Python 单引号字面量:换行必须转义
     return s.replace(/\r/g, '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n');
 }
@@ -651,8 +689,7 @@ function renderHist() {
 histsel.onchange = () => {
     const h = loadHist(), i = parseInt(histsel.value, 10);
     if (!isNaN(i) && h[i] !== undefined) {
-        textin.value = h[i];
-        autoGrow();
+        setText(h[i]);
         log('历史填入 ' + h[i].length + ' 字符', 'act');
     }
     histsel.selectedIndex = 0;               // 复位,同一项可再次选择
@@ -663,14 +700,18 @@ function sendText() {
     if (!text) { log('输入框为空,未发送', 'err'); return; }
     rpc(MOD + ".input('" + pyQuote(text) + "','" + nlEl.value + "')")
         .then(() => {                        // 发送成功:清空输入,截图刷新确认远端已上屏
-            textin.value = '';
-            autoGrow();
+            setText('');
             saveHist(text);
             scheduleRefresh();
         })
         .catch(() => {});
 }
 textin.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
+        e.preventDefault();                  // 接管原生撤销,避免浏览器栈与自管栈错位
+        undoText();
+        return;
+    }
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendText(); }
 });
 document.getElementById('btn-send').onclick = sendText;
@@ -680,8 +721,7 @@ document.getElementById('btn-setclip').onclick = () => {
 };
 document.getElementById('btn-getclip').onclick = () => {
     rpc(MOD + '.clipboard()').then(t => {
-        textin.value = t;
-        autoGrow();
+        setText(t);
         log('远程剪贴板 ' + t.length + ' 字符: ' + (t.slice(0, 80).replace(/\s+/g, ' ') || '空'), 'act');
     }).catch(() => {});
 };
