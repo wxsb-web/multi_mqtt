@@ -707,6 +707,13 @@ class FirstPacketStats:
             # 同 host 的第二条活连接/旧 client 残留（形态 B）。
             if host in sub_counts:
                 row["subscription_count"] = sub_counts[host]
+            # 逐 host 残差：rx 里既没算进 unique/dup，也没算进 hb 的帧
+            # （无 sid/seq 的非心跳下行，例如只有 pty 字段的控制帧）。
+            # = rx − wins − dups − hb_frames − hb_dups，正常应为 0；
+            # 非 0 说明还有未分类的下行路径。
+            row["unclassified"] = (
+                st["dl_rx"] - st["dl_wins"] - st["dl_dups"]
+                - st["hb_cnt"] - st["hb_dups"])
             if st["hb_n"]:
                 row["hb_gap_ms"] = self._lat_block(
                     st["hb_n"], st["hb_min"], st["hb_sum"], st["hb_max"])
@@ -854,7 +861,10 @@ class FirstPacketStats:
                      "不累加）：hb_dups>0 且 subscription_count>1 是形态 A（多个"
                      "filter 同时匹配同一帧），hb_dups>0 但 subscription_count==1"
                      " 是形态 B（单订阅仍重复，通常是同 host 的第二条活连接/旧 "
-                     "client 残留）。stale_mids="
+                     "client 残留）；subscription_count>1 且 hb_dups=0 是形态 C"
+                     "（filter 不重叠，正常，不算双投）。unclassified=rx − wins"
+                     " − dups − hb_frames − hb_dups，是既无 sid/seq、也不是心跳"
+                     "的未分类下行帧数。stale_mids="
                      "仍留在 _mid 里、但所属批次已不在 _batches 的 mid 数。"
                      "requests.observed=所有带 req_id 的帧，unmatched=匹配不到"
                      "本机 pending_requests（共用 reply topic 时多为其他设备的"
@@ -910,7 +920,10 @@ class FirstPacketStats:
                      "on_publish broker 对照（agree/disagree，disagree_hosts 按 "
                      "server_from 计）。旧版服务端不写 server_from 时整块为 0，"
                      "不影响其它统计；client_from 与本统计的下行 broker 同源，"
-                     "不重复统计。"
+                     "不重复统计。QoS0 下判断上行首达应以 server_ack."
+                     "first_packet_broker 为准（服务端实际首个收到请求的 broker），"
+                     "uplink_publish.first_packet_broker 仅代表本地写出顺序；"
+                     "两者系统性不一致时（本轮 agree=1/disagree=13）以前者为准。"
                      "注意 offline_hosts 与 pty_frames.hb_frames 可以看似矛盾："
                      "offline 只在 broadcast 那一刻采样，先看 offline_samples"
                      "的 at_s 是否集中在启动初期（那时确实还没连上），之后连上"

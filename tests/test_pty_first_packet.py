@@ -241,6 +241,22 @@ class FirstPacketStatsTests(unittest.TestCase):
         net.clients["broker-a"].subscribe("pty/+")
         self.assertEqual(row()["subscription_count"], 2)
 
+    def test_unclassified_is_residual_of_rx(self):
+        """unclassified = rx − wins − dups − hb_frames − hb_dups。"""
+        net = self.net
+        net.downlink("pty/out", {"pty": "s1", "seq": 1}, "broker-a")       # unique
+        net.downlink("pty/out", {"pty": "s1", "seq": 1}, "broker-a")       # dup
+        net.downlink("pty/out", {"pty": "s1", "hb": 1}, "broker-a")        # hb 首帧
+        net.downlink("pty/out", {"pty": "s1", "hb": 1}, "broker-a")        # hb 重复
+        net.downlink("pty/out", {"pty": "s1", "ctrl": 1}, "broker-a")      # 无 seq/hb
+        row = {r["broker"]: r for r in
+               self.stats.get_report()["pty_frames"]["broker_distribution"]}["broker-a"]
+        self.assertEqual(row["rx"], 5)
+        self.assertEqual(row["unclassified"], 1)
+        self.assertEqual(row["unclassified"],
+                         row["rx"] - row["wins"] - row["dups"]
+                         - row.get("hb_frames", 0) - row.get("hb_dups", 0))
+
     def test_first_uplink_broker_not_overwritten_by_later_batches(self):
         """uplink first_packet_broker 取首个完成批次，不被后续批次覆盖。"""
         net = self.net
