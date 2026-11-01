@@ -1167,6 +1167,10 @@ class FirstPacketStats:
         self._srv_seen = {}       # req_id -> 已计过 server_ack 的匹配回包（去重）
         self._srv_first = None    # 首个带 server_from 的匹配回包所报 broker
         self._srv_disagree_hosts = {}   # server_from -> 与发送侧首包不一致的次数
+        # host -> 当前活订阅的 topic filter 集合（区分双投形态 A/B 用）。
+        # paho 2.1 已不再维护 c._subscriptions，这里用 manager 的规范集合做
+        # 初值，再包装每个 client 的 subscribe/unsubscribe 增量维护。
+        self._sub_topics = {}
         self._brokers = {}        # host -> 计数器 dict
         self._g = {
             "req_obs": 0, "req_foreign": 0,
@@ -1247,6 +1251,16 @@ class FirstPacketStats:
 
     def _wrap_client(self, host, c):
         try:
+            # 订阅计数种子放在 _fp_wrapped 守卫之前：reset 清空 _sub_topics
+            # 后，即使 client 已包装过，下一次 _wrap_clients() 也要把初值补回。
+            # paho 2.1 没有 c._subscriptions，只能用 manager 的规范集合做初值。
+            try:
+                with self._lock:
+                    if host not in self._sub_topics:
+                        self._sub_topics[host] = set(
+                            getattr(self._net, "subscribed_topics", ()) or ())
+            except Exception:
+                pass
             if getattr(c, "_fp_wrapped", False):
                 return
             orig_pub = c.publish
@@ -1276,6 +1290,44 @@ class FirstPacketStats:
 
             c.publish = _pub
             c.on_publish = _ack
+            # 订阅计数增量维护：同一 filter 的重连重订阅按 MQTT 语义是替换，
+            # 只保留一份；只有新增另一个能匹配同一帧的 filter 才会变大（形态 A）。
+            orig_sub = getattr(c, "subscribe", None)
+            if callable(orig_sub):
+                def _sub(topic, *a, _orig=orig_sub, _host=host,
+                         _self=self, **kw):
+                    info = _orig(topic, *a, **kw)
+                    try:
+                        rc = info[0] if isinstance(info, (tuple, list)) else info
+                        if int(rc) == 0:
+                            with _self._lock:
+                                _self._sub_topics.setdefault(
+                                    _host, set()).add(topic)
+                    except Exception:
+                        pass
+                    return info
+
+                try:
+                    c.subscribe = _sub
+                except Exception:
+                    pass
+            orig_unsub = getattr(c, "unsubscribe", None)
+            if callable(orig_unsub):
+                def _unsub(topic, *a, _orig=orig_unsub, _host=host,
+                           _self=self, **kw):
+                    info = _orig(topic, *a, **kw)
+                    try:
+                        with _self._lock:
+                            _self._sub_topics.setdefault(
+                                _host, set()).discard(topic)
+                    except Exception:
+                        pass
+                    return info
+
+                try:
+                    c.unsubscribe = _unsub
+                except Exception:
+                    pass
             c._fp_wrapped = True
         except Exception:
             pass
@@ -1693,6 +1745,7 @@ class FirstPacketStats:
             last_bcast_at = self._last_bcast_at
             srv_first = self._srv_first
             srv_disagree_hosts = dict(self._srv_disagree_hosts)
+            sub_counts = {h: len(t) for h, t in self._sub_topics.items()}
             # 派生：离线之后又被检查到在线的 host（online_latest >
             # offline_latest.at_s）。启动期离线、之后才连上的 host 会出现在这里。
             recovered = sorted(
@@ -1744,6 +1797,12 @@ class FirstPacketStats:
                 row["hb_frames"] = st["hb_cnt"]
             if st["hb_dups"]:
                 row["hb_dups"] = st["hb_dups"]
+            # 与 hb_dups 并列：该 host 当前活 topic filter 数。hb_dups>0 且
+            # subscription_count>1 -> 多个 filter 同时匹配同一帧（形态 A）；
+            # hb_dups>0 但 subscription_count==1 -> 单订阅仍重复，通常是
+            # 同 host 的第二条活连接/旧 client 残留（形态 B）。
+            if host in sub_counts:
+                row["subscription_count"] = sub_counts[host]
             if st["hb_n"]:
                 row["hb_gap_ms"] = self._lat_block(
                     st["hb_n"], st["hb_min"], st["hb_sum"], st["hb_max"])
@@ -1884,7 +1943,14 @@ class FirstPacketStats:
                      "ack 所在 broker，first_packet_broker_batch/at_s 标明是"
                      "哪一批、装好统计后第几秒定下来的，可自证不是被后续批次"
                      "覆盖。hb_gap_ms=同一 broker 相邻两次不同心跳的本地到达"
-                     "间隔，同帧重复投递记入 hb_dups。stale_mids="
+                     "间隔，同帧重复投递记入 hb_dups。subscription_count=该 host"
+                     " 当前活 topic filter 数（paho 2.1 已不维护 c._subscriptions，"
+                     "由 manager 的 subscribed_topics 做初值、再包装 subscribe/"
+                     "unsubscribe 增量维护；同 filter 重订阅按 MQTT 语义是替换，"
+                     "不累加）：hb_dups>0 且 subscription_count>1 是形态 A（多个"
+                     "filter 同时匹配同一帧），hb_dups>0 但 subscription_count==1"
+                     " 是形态 B（单订阅仍重复，通常是同 host 的第二条活连接/旧 "
+                     "client 残留）。stale_mids="
                      "仍留在 _mid 里、但所属批次已不在 _batches 的 mid 数。"
                      "requests.observed=所有带 req_id 的帧，unmatched=匹配不到"
                      "本机 pending_requests（共用 reply topic 时多为其他设备的"
@@ -2078,6 +2144,7 @@ class FirstPacketStats:
         self._srv_seen.clear()
         self._srv_first = None
         self._srv_disagree_hosts.clear()
+        self._sub_topics.clear()
         self._brokers.clear()
         for k in self._g:
             self._g[k] = 0 if isinstance(self._g[k], int) else None

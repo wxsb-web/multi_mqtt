@@ -36,11 +36,22 @@ class _FakeClient:
         self.host = host
         self.mid = 0
         self.next_rc = 0
+        self.next_sub_rc = 0
         self.published = []
+        self.subscriptions = set()
         self.on_publish = None
 
     def is_connected(self):
         return True
+
+    def subscribe(self, topic, qos=0):
+        if self.next_sub_rc == 0:
+            self.subscriptions.add(topic)
+        return self.next_sub_rc, 1
+
+    def unsubscribe(self, topic):
+        self.subscriptions.discard(topic)
+        return 0, 1
 
     def publish(self, topic, payload=None, qos=0, retain=False, properties=None):
         self.mid += 1
@@ -60,6 +71,8 @@ class _FakeNet:
         self.brokers = [(h, 1883) for h in HOSTS]
         self.message_callback = None
         self._cmq_stream_installed = False
+        # manager 的规范订阅集合：统计器用它作为每条 client 的订阅计数种子。
+        self.subscribed_topics = {"pty/out", "sys/device/response"}
 
     def set_on_message(self, cb):
         self.message_callback = cb
@@ -207,6 +220,26 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(rows["broker-a"]["hb_frames"], 1)
         self.assertEqual(rows["broker-a"]["hb_dups"], 1)
         self.assertNotIn("hb_gap_ms", rows["broker-a"])
+
+    def test_subscription_count_tracks_live_filters_beside_hb_dups(self):
+        """subscription_count 与 hb_dups 并列：新增/退订/失败订阅都要反映。"""
+        net = self.net
+
+        def row():
+            return {r["broker"]: r for r in
+                    self.stats.get_report()["pty_frames"][
+                        "broker_distribution"]}["broker-a"]
+
+        net.downlink("pty/out", {"pty": "s1", "hb": 1}, "broker-a")
+        # 种子 = manager 的规范订阅集合（reply + pty 两条）
+        self.assertEqual(row()["subscription_count"], 2)
+        net.clients["broker-a"].subscribe("pty/#")      # 形态 A：多一个匹配 filter
+        self.assertEqual(row()["subscription_count"], 3)
+        net.clients["broker-a"].unsubscribe("pty/#")
+        self.assertEqual(row()["subscription_count"], 2)
+        net.clients["broker-a"].next_sub_rc = 1         # 订阅失败不计入
+        net.clients["broker-a"].subscribe("pty/+")
+        self.assertEqual(row()["subscription_count"], 2)
 
     def test_first_uplink_broker_not_overwritten_by_later_batches(self):
         """uplink first_packet_broker 取首个完成批次，不被后续批次覆盖。"""
