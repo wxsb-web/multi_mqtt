@@ -39,6 +39,16 @@ AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
     curl "http://127.0.0.1:1188/$(python -c \
 "import urllib.parse;print(urllib.parse.quote('import json;p.set_data(json.dumps(ai_bridge.run(\\\"uname -a\\\"),ensure_ascii=False))'))")"
 
+首包统计（纯被动，0 额外网络请求）
+====================================
+进程内常驻观察每个请求 / PTY 帧的**第一份副本先到哪个 broker**、请求从
+发布到首包到达的延迟，以及每次 publish_broadcast 在各 broker 的发送耗时；
+只累加计数器，不发任何额外报文（详见 045_firstpacket.py）：
+
+    curl "http://127.0.0.1:1188/r=first_packet_stats.get_report()"
+    curl "http://127.0.0.1:1188/r=first_packet_stats.get_report(reset=True)"
+    # 逐 broker 的胜率/延迟 min-avg-max；reset=True 读完清零开新窗口
+
 MCP 工具服务（Model Context Protocol，AI 客户端标准工具协议）
 ====================================================
 pip install "mcp[cli]" 后，常驻 PTY 自动以标准 MCP 工具形式持续暴露：

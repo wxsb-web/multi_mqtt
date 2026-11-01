@@ -187,6 +187,11 @@ def main(argv=None) -> int:
     transport = MqttTransport(
         request_topic=args.request_topic, reply_topic=args.reply_topic,
         private_key=args.key, allow_no_pub=args.allow)
+    # 首包统计是纯旁路观察：安装失败只告警，绝不影响主流程。
+    try:
+        first_packet_stats.install(transport)
+    except Exception:
+        _info("[pty][WARN] 首包统计未启用（不影响主流程）")
     online, total, hosts = _broker_status(transport)
     _info("MQTT 就绪：在线 broker %d/%d，建连耗时 %.1f 秒"
       % (online, total, time.monotonic() - t_conn)
