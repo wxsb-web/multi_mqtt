@@ -64,6 +64,13 @@ class FirstPacketStats:
         self._last_rx = {}        # host -> 最近一次下行到达的 monotonic 秒
         self._last_online = {}    # host -> 最近一次检查时 is_connected() 为真的 at_s
         self._last_bcast_at = None   # 最近一次 publish_broadcast 的 at_s
+        # 上行端到端确认：回包里的 server_from 是服务端「首个接到该请求的
+        # broker」，客户端本地拿不到；配合同一 req_id 的发送侧首个 on_publish
+        # broker 才能看出“包先排出 socket”与“服务端先收到”是否同一条路。
+        self._req_send_win = {}   # req_id -> 发送侧首个 on_publish 的 broker
+        self._srv_seen = {}       # req_id -> 已计过 server_ack 的匹配回包（去重）
+        self._srv_first = None    # 首个带 server_from 的匹配回包所报 broker
+        self._srv_disagree_hosts = {}   # server_from -> 与发送侧首包不一致的次数
         self._brokers = {}        # host -> 计数器 dict
         self._g = {
             "req_obs": 0, "req_foreign": 0,
@@ -80,6 +87,7 @@ class FirstPacketStats:
             "up_send_sum": 0.0, "up_send_max": None,
             "mid_orphan_write": 0,
             "mid_ttl_dropped": 0,
+            "srv_observed": 0, "srv_agree": 0, "srv_disagree": 0,
         }
 
     # ---------------------------- 安装 ----------------------------
@@ -233,6 +241,14 @@ class FirstPacketStats:
             })
         cfg = self._configured_hosts()
         absent = cfg - present if cfg else set()
+        # 请求的 req_id 记在批次上：回包带 server_from 时，要用同一 req_id 的
+        # 发送侧首个 on_publish broker 做对照。去掉签名部分，与 pending_requests
+        # 的键保持一致。
+        req_id = None
+        if isinstance(payload_dict, dict):
+            rid = payload_dict.get("req_id")
+            if isinstance(rid, str) and rid:
+                req_id = rid.split("|", 1)[0]
         bid = None
         try:
             with self._lock:
@@ -244,7 +260,8 @@ class FirstPacketStats:
                                       "attemptable": attemptable,
                                       "seen": set(), "absent": absent,
                                       "offline": offline_info,
-                                      "online": online_now}
+                                      "online": online_now,
+                                      "req_id": req_id}
                 self._g["up_calls"] += 1
                 self._last_bcast_at = at_s
                 self._prune()
@@ -387,6 +404,15 @@ class FirstPacketStats:
                 if b["win"] is None:
                     b["win"] = host
                     st["up_wins"] += 1
+                    # 同一 req_id 的发送侧首包 broker：只记第一次（republish 会
+                    # 再发一遍同 req_id，但服务端按 req_id 去重只认首份，对照
+                    # 必须以首份的发送顺序为准）。
+                    rid = b.get("req_id")
+                    if rid and rid not in self._req_send_win:
+                        if len(self._req_send_win) >= self._SEEN_MAX:
+                            self._req_send_win.pop(
+                                next(iter(self._req_send_win)), None)
+                        self._req_send_win[rid] = host
                     if self._first_ul_broker is None:
                         self._first_ul_broker = host
                         self._first_ul_broker_at = (
@@ -432,6 +458,29 @@ class FirstPacketStats:
                 if lat >= 0:
                     self._lat_add(st, "req_lat", lat)
                     self._lat_add(g, "req_lat", lat)
+                # 端到端上行确认：回包里的 server_from 是服务端首个接到该请求
+                # 的 broker（客户端本地拿不到）。同一 req_id 只计一次，避免
+                # 多服务端/迟到副本把 observed 放大；缺字段（旧版服务端）或
+                # 非字符串一律跳过，只降级不报错。
+                srv = data.get("server_from")
+                if (isinstance(base, str) and base
+                        and isinstance(srv, str) and srv
+                        and base not in self._srv_seen):
+                    if len(self._srv_seen) >= self._SEEN_MAX:
+                        self._srv_seen.pop(next(iter(self._srv_seen)), None)
+                    self._srv_seen[base] = True
+                    g["srv_observed"] += 1
+                    self._broker(srv)["srv_wins"] += 1
+                    if self._srv_first is None:
+                        self._srv_first = srv
+                    send_win = self._req_send_win.get(base)
+                    if send_win is not None:
+                        if send_win == srv:
+                            g["srv_agree"] += 1
+                        else:
+                            g["srv_disagree"] += 1
+                            self._srv_disagree_hosts[srv] = (
+                                self._srv_disagree_hosts.get(srv, 0) + 1)
             return
 
         sid = data.get("pty") or data.get("s5") or data.get("stream")
@@ -546,6 +595,8 @@ class FirstPacketStats:
                              if bid not in self._batches)
             uptime = time.monotonic() - self._t0
             last_bcast_at = self._last_bcast_at
+            srv_first = self._srv_first
+            srv_disagree_hosts = dict(self._srv_disagree_hosts)
             # 派生：离线之后又被检查到在线的 host（online_latest >
             # offline_latest.at_s）。启动期离线、之后才连上的 host 会出现在这里。
             recovered = sorted(
@@ -558,6 +609,7 @@ class FirstPacketStats:
         total_req = sum(b["req_wins"] for b in brokers.values())
         total_dl = sum(b["dl_wins"] for b in brokers.values())
         total_ul = sum(b["up_wins"] for b in brokers.values())
+        total_srv = sum(b["srv_wins"] for b in brokers.values())
 
         def pct(v, total):
             return round(100.0 * v / total, 1) if total else 0.0
@@ -615,6 +667,17 @@ class FirstPacketStats:
                 "send_ms": self._lat_block(
                     st["up_send_n"], st["up_send_min"],
                     st["up_send_sum"], st["up_send_max"]),
+            })
+
+        srv_rows = []
+        for host, st in sorted(brokers.items(),
+                               key=lambda kv: -kv[1]["srv_wins"]):
+            if not st["srv_wins"]:
+                continue
+            srv_rows.append({
+                "broker": host,
+                "wins": st["srv_wins"],
+                "win_pct": pct(st["srv_wins"], total_srv),
             })
 
         return {
@@ -693,6 +756,23 @@ class FirstPacketStats:
                         None if last_bcast_at is None
                         else round(uptime - last_bcast_at, 1)),
                 },
+                "server_ack": {
+                    # 只统计本机匹配到 pending_requests、且回包里带合法
+                    # server_from 的响应；同一 req_id 只计一次。
+                    "observed": g["srv_observed"],
+                    "broker_distribution": srv_rows,
+                    "first_packet_broker": srv_first,
+                    # 与同一 req_id 的发送侧首个 on_publish broker 对照：
+                    # agree=同一条路；disagree=包先排出 socket 的 broker 与
+                    # 服务端实际先收到的 broker 不同（disagree_hosts 按
+                    # server_from 计）。发送侧首包未知（批次还没等到 ack）
+                    # 时两者都不计。
+                    "vs_send_first": {
+                        "agree": g["srv_agree"],
+                        "disagree": g["srv_disagree"],
+                        "disagree_hosts": srv_disagree_hosts,
+                    },
+                },
                 "broker_distribution": ul_rows,
             },
             "in_flight": {"batches": pending_batches, "mids": pending_mids,
@@ -754,6 +834,14 @@ class FirstPacketStats:
                      "broadcast_idle_s=最近一次 broadcast 距今秒数（None=还没广播），"
                      "它很大时 offline/online_latest 停止更新属正常，不能读成"
                      "“现在仍离线”。"
+                     "uplink_publish.server_ack 用回包里的 server_from（服务端"
+                     "首个接到该请求的 broker）做端到端上行确认：observed=带该"
+                     "字段的匹配回包数（同一 req_id 只计一次），broker_distribution"
+                     "按 server_from 统计；vs_send_first 与同一 req_id 的发送侧首个"
+                     "on_publish broker 对照（agree/disagree，disagree_hosts 按 "
+                     "server_from 计）。旧版服务端不写 server_from 时整块为 0，"
+                     "不影响其它统计；client_from 与本统计的下行 broker 同源，"
+                     "不重复统计。"
                      "注意 offline_hosts 与 pty_frames.hb_frames 可以看似矛盾："
                      "offline 只在 broadcast 那一刻采样，先看 offline_samples"
                      "的 at_s 是否集中在启动初期（那时确实还没连上），之后连上"
@@ -827,6 +915,7 @@ class FirstPacketStats:
                 "up_send_n": 0, "up_send_min": None,
                 "up_send_sum": 0.0, "up_send_max": None,
                 "up_wins": 0,
+                "srv_wins": 0,
             }
             self._brokers[host] = st
         return st
@@ -889,6 +978,10 @@ class FirstPacketStats:
         self._last_rx.clear()
         self._last_online.clear()
         self._last_bcast_at = None
+        self._req_send_win.clear()
+        self._srv_seen.clear()
+        self._srv_first = None
+        self._srv_disagree_hosts.clear()
         self._brokers.clear()
         for k in self._g:
             self._g[k] = 0 if isinstance(self._g[k], int) else None

@@ -435,6 +435,55 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(cov["recovered_since_offline"], ["broker-b"])
         self.assertGreaterEqual(cov["broadcast_idle_s"], 0.0)
 
+    def test_server_ack_records_server_from_and_agrees_with_send_first(self):
+        """回包 server_from = 服务端首收 broker：observed/首包/agree 全通。"""
+        net = self.net
+        net.publish_broadcast("sys/device/request",
+                              {"req_id": "req-1", "code": "1"})
+        net.clients["broker-a"].ack(1)      # 发送侧首包先排出 socket
+        with self.tr.node.lock:
+            self.tr.node.pending_requests["req-1"] = {
+                "start_time": time.perf_counter()}
+        net.downlink("sys/device/response",
+                     {"req_id": "req-1", "server_from": "broker-a"},
+                     "broker-c")
+        sa = self.stats.get_report()["uplink_publish"]["server_ack"]
+        self.assertEqual(sa["observed"], 1)
+        self.assertEqual(sa["first_packet_broker"], "broker-a")
+        self.assertEqual(sa["broker_distribution"],
+                         [{"broker": "broker-a", "wins": 1, "win_pct": 100.0}])
+        self.assertEqual(sa["vs_send_first"],
+                         {"agree": 1, "disagree": 0, "disagree_hosts": {}})
+
+    def test_server_ack_disagree_dedups_and_degrades(self):
+        """发送侧与服务端首收不同要记 disagree；重复/坏字段/未匹配都不计。"""
+        net = self.net
+        net.publish_broadcast("t", {"req_id": "req-2"})
+        net.clients["broker-a"].ack(1)      # 发送侧首包 = broker-a
+        with self.tr.node.lock:
+            self.tr.node.pending_requests["req-2"] = {
+                "start_time": time.perf_counter()}
+            self.tr.node.pending_requests["req-3"] = {
+                "start_time": time.perf_counter()}
+        net.downlink("reply", {"req_id": "req-2", "server_from": "broker-b"},
+                     "broker-c")
+        # 同一 req_id 的第二份回包（多服务端/迟到副本）不得重复计 observed
+        net.downlink("reply", {"req_id": "req-2", "server_from": "broker-a"},
+                     "broker-a")
+        # server_from 非字符串：跳过，不抛异常
+        net.downlink("reply", {"req_id": "req-3", "server_from": 0}, "broker-a")
+        # 未匹配本机 pending 的回包：不参与 server_ack
+        net.downlink("reply", {"req_id": "other", "server_from": "broker-a"},
+                     "broker-a")
+        sa = self.stats.get_report()["uplink_publish"]["server_ack"]
+        self.assertEqual(sa["observed"], 1)
+        self.assertEqual(sa["first_packet_broker"], "broker-b")
+        self.assertEqual(sa["broker_distribution"],
+                         [{"broker": "broker-b", "wins": 1, "win_pct": 100.0}])
+        self.assertEqual(sa["vs_send_first"],
+                         {"agree": 0, "disagree": 1,
+                          "disagree_hosts": {"broker-b": 1}})
+
     def test_uplink_late_host_keeps_seen_subset_of_attempted(self):
         """预测时离线、真正扇出时已连上：不得造成 seen > attempted。"""
         c = self.net.clients["broker-c"]
@@ -530,6 +579,12 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(cov["offline_samples"], [])
         self.assertEqual(cov["recovered_since_offline"], [])
         self.assertIsNone(cov["broadcast_idle_s"])
+        sa = rep["uplink_publish"]["server_ack"]
+        self.assertEqual(sa["observed"], 0)
+        self.assertEqual(sa["broker_distribution"], [])
+        self.assertIsNone(sa["first_packet_broker"])
+        self.assertEqual(sa["vs_send_first"],
+                         {"agree": 0, "disagree": 0, "disagree_hosts": {}})
         self.assertEqual(rep["in_flight"]["mid_ttl_dropped"], 0)
 
 
