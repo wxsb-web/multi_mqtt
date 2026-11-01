@@ -367,6 +367,8 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(cov["offline"], 0)
         self.assertEqual(cov["offline_hosts"], {})
         self.assertEqual(cov["offline_samples"], [])
+        self.assertEqual(set(cov["online_latest"]), set(HOSTS))
+        self.assertEqual(cov["offline_latest"], {})
         # 恒等式：attempted == seen + blind，且 seen 永远是 attempted 的子集
         self.assertLessEqual(cov["seen"], cov["attempted"])
         self.assertEqual(cov["attempted"], cov["seen"] + cov["blind"])
@@ -392,6 +394,9 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertIn("socket", sample)
         self.assertGreaterEqual(sample["rx_age_s"], 0.0)
         self.assertEqual(cov["offline_latest"]["broker-c"]["host"], "broker-c")
+        # broker-c 全程未连上 -> 没有 online 记录；另两 host 有
+        self.assertNotIn("broker-c", cov["online_latest"])
+        self.assertIn("broker-a", cov["online_latest"])
 
     def test_offline_latest_keeps_steady_state_after_timeline_rolls(self):
         """稳态离线不能被 10 条时间轴窗口挤掉：每个 host 都要留最近一次。"""

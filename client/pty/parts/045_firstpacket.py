@@ -62,6 +62,7 @@ class FirstPacketStats:
         self._offline_samples = []   # 最近 10 条 offline 现场（滚动，看时间轴）
         self._offline_latest = {}    # host -> 该 host 最近一次离线现场（有界）
         self._last_rx = {}        # host -> 最近一次下行到达的 monotonic 秒
+        self._last_online = {}    # host -> 最近一次检查时 is_connected() 为真的 at_s
         self._brokers = {}        # host -> 计数器 dict
         self._g = {
             "req_obs": 0, "req_foreign": 0,
@@ -191,12 +192,14 @@ class FirstPacketStats:
         attemptable = set()
         present = set()
         offline_info = []
+        online_now = {}
         try:
             with self._lock:
                 last_rx = dict(self._last_rx)
         except Exception:
             last_rx = {}
         now_mono = time.monotonic()
+        at_s = round(now_mono - self._t0, 1)
         for host, c in items:
             present.add(host)
             try:
@@ -205,6 +208,7 @@ class FirstPacketStats:
                 connected = False
             if connected:
                 attemptable.add(host)
+                online_now[host] = at_s
                 continue
             # 现场快照：用来区分「真掉线」和「paho 状态机假离线 / 僵尸 client」。
             # rx_age_s=该 host 最近一次下行到达距今几秒，若它明明在收心跳却
@@ -220,7 +224,7 @@ class FirstPacketStats:
                 socket_alive = False
             offline_info.append({
                 "host": host,
-                "at_s": round(now_mono - self._t0, 1),
+                "at_s": at_s,
                 "state": state,
                 "socket": socket_alive,
                 "rx_age_s": (None if last is None
@@ -238,7 +242,8 @@ class FirstPacketStats:
                                       "published": None, "done": False,
                                       "attemptable": attemptable,
                                       "seen": set(), "absent": absent,
-                                      "offline": offline_info}
+                                      "offline": offline_info,
+                                      "online": online_now}
                 self._g["up_calls"] += 1
                 self._prune()
         except Exception:
@@ -300,6 +305,11 @@ class FirstPacketStats:
                 self._offline_samples.append(dict(info))
             if len(self._offline_samples) > 10:
                 del self._offline_samples[:len(self._offline_samples) - 10]
+            # 每个 host 最近一次「检查时 is_connected() 为真」的时刻：与
+            # offline_latest 配对，才能判断“离线后是否恢复”，而不是把
+            # “最后一次检查到离线”误读成“进入离线后一直没恢复”。
+            for h, online_at in b.get("online", {}).items():
+                self._last_online[h] = online_at
             if isinstance(published, int):
                 g["up_pub_n"] += 1
                 g["up_pub_sum"] += published
@@ -524,6 +534,7 @@ class FirstPacketStats:
             late = dict(self._late)
             offline_latest = {k: dict(v)
                               for k, v in self._offline_latest.items()}
+            online_latest = dict(self._last_online)
             offline_samples = [dict(s) for s in self._offline_samples]
             sids = dict(self._sids)
             pending_batches = len(self._batches)
@@ -660,6 +671,10 @@ class FirstPacketStats:
                     # 每个 host 只留最近一次离线现场：稳态离线不会被时间轴
                     # 滚动窗口挤掉，用于回答“它现在到底还离线吗”。
                     "offline_latest": offline_latest,
+                    # host -> 最近一次检查时 is_connected() 为真的 at_s。
+                    # 与 offline_latest 配对：online_latest > offline_latest.at_s
+                    # 表示离线后已恢复；两者都停在启动期则说明广播只发生在启动期。
+                    "online_latest": online_latest,
                 },
                 "broker_distribution": ul_rows,
             },
@@ -705,8 +720,14 @@ class FirstPacketStats:
                      "下行）却 is_connected()=False，说明是 paho 状态判断或 client"
                      " 对象错位（僵尸连接），不是真掉线；socket=False 才是真断。"
                      "offline_latest 按 host 只留最近一次离线现场（数量受 host 数"
-                     "上限约束），因此稳态的离线事件不会像时间轴样本那样被挤掉；"
-                     "判断是启动初期还是稳态，先看它的 at_s。"
+                     "上限约束），因此稳态的离线事件不会像时间轴样本那样被挤掉。"
+                     "at_s 的口径是「最近一次在 broadcast 检查时被判离线的时刻」，"
+                     "不是「进入离线状态的时刻」（统计不追踪状态跃迁），所以若一个"
+                     "host 之后又恢复，at_s 只会停在最后一次判离线的那一批，不会"
+                     "指示它何时恢复。要判断是否恢复，配合同一份报告里的 "
+                     "online_latest（最近一次检查时 is_connected() 为真的 at_s）："
+                     "online_latest > offline_latest.at_s 表示离线后已恢复；两者都"
+                     "停在启动期，说明所有 broadcast 都发生在启动初期。"
                      "注意 offline_hosts 与 pty_frames.hb_frames 可以看似矛盾："
                      "offline 只在 broadcast 那一刻采样，先看 offline_samples"
                      "的 at_s 是否集中在启动初期（那时确实还没连上），之后连上"
@@ -840,6 +861,7 @@ class FirstPacketStats:
         self._offline_samples.clear()
         self._offline_latest.clear()
         self._last_rx.clear()
+        self._last_online.clear()
         self._brokers.clear()
         for k in self._g:
             self._g[k] = 0 if isinstance(self._g[k], int) else None
