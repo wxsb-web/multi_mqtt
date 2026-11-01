@@ -40,6 +40,7 @@ class _FakeClient:
         self.published = []
         self.subscriptions = set()
         self.on_publish = None
+        self.sync_ack = False   # True = on_publish 在 publish() 返回前触发
 
     def is_connected(self):
         return True
@@ -57,6 +58,9 @@ class _FakeClient:
         self.mid += 1
         info = _Info(self.mid, rc=self.next_rc)
         self.published.append((topic, qos, info.mid))
+        if self.sync_ack and self.on_publish is not None:
+            # 模拟 paho 在 publish() 返回前就完成写出并回调 on_publish
+            self.on_publish(self, self.host, info.mid, None, None)
         return info
 
     def ack(self, mid):
@@ -241,6 +245,143 @@ class FirstPacketStatsTests(unittest.TestCase):
         net.clients["broker-a"].subscribe("pty/+")
         self.assertEqual(row()["subscription_count"], 2)
 
+    def test_early_ack_is_matched_not_left_pending(self):
+        """on_publish 早于登记：暂存并在登记时匹配，不再等 120s TTL。"""
+        net = self.net
+        net.clients["broker-a"].sync_ack = True
+        net.publish_broadcast("t", {"x": 1})
+        net.clients["broker-a"].sync_ack = False
+        rep = self.stats.get_report()
+        block = rep["in_flight"]
+        self.assertEqual(block["ack_early_matched"], 1)
+        self.assertEqual(block["ack_early_pending"], 0)
+        self.assertEqual(block["ack_without_mid"], 0)
+        self.assertEqual(block["ack_without_mid"],
+                         block["ack_before_reg"] + block["ack_after_drop"])
+        # broker-a 的 mid 已被早到 ack 消费，只剩另外两个 host 在途
+        self.assertEqual(block["mids"], 2)
+        self.assertEqual(block["mid_ttl_dropped"], 0)
+        # 守恒：queued == send_ms.n + mid_ttl_dropped + mids
+        queued = sum(r["queued"] for r in
+                     rep["uplink_publish"]["broker_distribution"])
+        self.assertEqual(queued, rep["uplink_publish"]["send_ms"]["n"]
+                         + block["mid_ttl_dropped"] + block["mids"])
+
+    def test_late_ack_after_ttl_drop_is_classified(self):
+        """_mid 已被 TTL 回收后才到的 ack：记 ack_after_drop，不误判早到。"""
+        net = self.net
+        net.publish_broadcast("t", {"x": 1})
+        stats = self.stats
+        with stats._lock:
+            for k in list(stats._mid):
+                bid, _t0 = stats._mid[k]
+                stats._mid[k] = (bid, time.perf_counter() - 300)
+            stats._prune()
+        net.clients["broker-a"].ack(1)
+        block = stats.get_report()["in_flight"]
+        self.assertEqual(block["ack_after_drop"], 1)
+        self.assertEqual(block["ack_early_pending"], 0)
+        self.assertEqual(block["ack_without_mid"], 1)
+        self.assertEqual(block["ack_without_mid"],
+                         block["ack_before_reg"] + block["ack_after_drop"])
+
+    def test_early_ack_without_registration_expires(self):
+        """早到 ack 始终等不到登记：_EARLY_TTL 后记 ack_before_reg，不泄漏。"""
+        stats = self.stats
+        stats._note_publish_ack("broker-a", 999)
+        block = stats.get_report()["in_flight"]
+        self.assertEqual(block["ack_early_pending"], 1)
+        self.assertEqual(block["ack_before_reg"], 0)
+        with stats._lock:
+            stats._early_acks[("broker-a", 999)] = time.perf_counter() - 300
+        block = stats.get_report()["in_flight"]
+        self.assertEqual(block["ack_early_pending"], 0)
+        self.assertEqual(block["ack_before_reg"], 1)
+        self.assertEqual(block["ack_without_mid"], 1)
+        self.assertEqual(block["ack_without_mid"],
+                         block["ack_before_reg"] + block["ack_after_drop"])
+        # 新增诊断字段：能直接看出过期 ack 属于哪个 host、多大年龄。
+        self.assertEqual(block["ack_before_reg_hosts"], {"broker-a": 1})
+        sample = block["ack_before_reg_samples"][0]
+        self.assertEqual(sample["host"], "broker-a")
+        self.assertEqual(sample["mid"], 999)
+        self.assertEqual(sample["source"], "unknown")
+        self.assertEqual(sample["reason"], "ttl")
+        self.assertGreaterEqual(sample["age_ms"], 200000.0)
+        self.assertEqual(block["early_acks_key"], "(host, mid)")
+        self.assertEqual(block["early_ttl_s"], stats._EARLY_TTL)
+        self.assertEqual(block["early_ack_source"],
+                         {"business_matched": 0, "ping_dropped": 0,
+                          "unknown_expired": 1})
+
+    def test_foreign_publish_ack_is_discarded(self):
+        """非 broadcast publish（stats QoS1 ping）的 ack 不得污染早到/未归属。"""
+        c = self.net.clients["broker-a"]
+        info = c.publish("multi_mqtt/ping_rtt/broker-a", b"", qos=1)
+        c.ack(info.mid)
+        block = self.stats.get_report()["in_flight"]
+        self.assertEqual(block["ack_foreign"], 1)
+        self.assertEqual(block["ack_early_pending"], 0)
+        self.assertEqual(block["ack_before_reg"], 0)
+        self.assertEqual(block["ack_without_mid"], 0)
+
+    def test_ping_ack_arriving_before_foreign_marker_is_claimed(self):
+        """paho 在 publish() 返回前回调 on_publish 的竞态：ping ack 先被暂存，
+        随后 _note_foreign_publish 必须把它认领掉，不能留在 _early_acks 里
+        过期成 ack_before_reg。"""
+        c = self.net.clients["broker-a"]
+        c.sync_ack = True          # on_publish 早于 _note_foreign_publish
+        c.publish("multi_mqtt/ping_rtt/broker-a", b"", qos=1)
+        c.sync_ack = False
+        block = self.stats.get_report()["in_flight"]
+        self.assertEqual(block["ack_foreign"], 1)
+        self.assertEqual(block["ack_early_pending"], 0)
+        self.assertEqual(block["ack_before_reg"], 0)
+        self.assertEqual(block["ack_without_mid"], 0)
+        self.assertEqual(block["early_ack_source"]["ping_dropped"], 1)
+
+    def test_same_mid_across_hosts_is_isolated(self):
+        """不同 broker 的相同 mid 必须各自占一个槽（key 带 host），不能串台。"""
+        stats = self.stats
+        stats._note_publish_ack("broker-a", 7)
+        stats._note_publish_ack("broker-b", 7)
+        block = stats.get_report()["in_flight"]
+        self.assertEqual(block["ack_early_pending"], 2)
+        # 认领 broker-b 的 ping ack：只清 broker-b 的槽，broker-a 不受影响。
+        stats._note_foreign_publish("broker-b", _Info(7))
+        with stats._lock:
+            self.assertIn(("broker-a", 7), stats._early_acks)
+            self.assertNotIn(("broker-b", 7), stats._early_acks)
+        block = stats.get_report()["in_flight"]
+        self.assertEqual(block["ack_early_pending"], 1)
+        self.assertEqual(block["ack_foreign"], 1)
+        self.assertEqual(block["ack_before_reg"], 0)
+
+    def test_recovery_same_tick_is_separated_from_recovered(self):
+        """online_latest == offline_latest.at_s：方向不可判，单列不并入 recovered。"""
+        net = self.net
+        net.clients["broker-a"].is_connected = lambda: False
+        net.publish_broadcast("t", {"x": 1})
+        with self.stats._lock:
+            self.stats._last_online["broker-a"] = \
+                self.stats._offline_latest["broker-a"]["at_s"]
+        cov = self.stats.get_report()["uplink_publish"]["coverage"]
+        self.assertEqual(cov["recovery_same_tick"], ["broker-a"])
+        self.assertNotIn("broker-a", cov["recovered_since_offline"])
+
+    def test_report_carries_process_and_subscription_provenance(self):
+        """跨进程/会话排查字段：pid、forked、sessions、订阅集合。"""
+        self.net.downlink("pty/out", {"pty": "s1", "seq": 1}, "broker-a")
+        self.net.downlink("pty/out", {"pty": "s2", "seq": 1}, "broker-b")
+        rep = self.stats.get_report()
+        proc = rep["process"]
+        self.assertEqual(proc["pid"], proc["current_pid"])
+        self.assertFalse(proc["forked"])
+        self.assertGreaterEqual(proc["object_age_s"], 0.0)
+        self.assertEqual(rep["pty_frames"]["sessions"], 2)
+        self.assertEqual(rep["subscriptions"]["topics"],
+                         ["pty/out", "sys/device/response"])
+
     def test_unclassified_is_residual_of_rx(self):
         """unclassified = rx − wins − dups − hb_frames − hb_dups。"""
         net = self.net
@@ -330,6 +471,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(sample["topic"], "sys/device/response")
         self.assertEqual(sample["broker"], "broker-a")
         self.assertEqual(sample["keys"], ["code", "ok", "req_id"])
+        self.assertGreaterEqual(sample["at_s"], 0.0)
         self.assertNotIn("print(1)", str(req["unmatched_samples"]))
         rows = {r["broker"]: r for r in req["broker_distribution"]}
         self.assertEqual(rows["broker-a"]["unmatched"], 2)
@@ -339,7 +481,34 @@ class FirstPacketStatsTests(unittest.TestCase):
             self.net.downlink("t/%d" % i, {"req_id": "r-%d" % i}, "broker-a")
         req = self.stats.get_report()["requests"]
         self.assertEqual(len(req["unmatched_samples"]), 5)
+        # 滚动窗口：保留最近 5 条（不是启动最初 5 条），否则稍晚的请求
+        # 永远不可能出现在样本里。
+        self.assertEqual(req["unmatched_samples"][-1]["req_id"], "r-19")
+        self.assertEqual(req["unmatched_samples"][0]["req_id"], "r-15")
         self.assertLessEqual(len(req["unmatched_topics"]), 8)
+
+    def test_unmatched_sample_max_is_runtime_adjustable(self):
+        """样本上限可在 RPC 运行期调整，调小立刻裁剪，非法输入立即报错。"""
+        stats = self.stats
+        self.assertEqual(
+            stats.get_report()["requests"]["unmatched_sample_max"],
+            stats._UNMATCHED_SAMPLE_MAX)
+        self.assertEqual(stats.set_unmatched_sample_max(10), 10)
+        for i in range(20):
+            self.net.downlink("t", {"req_id": "r-%d" % i}, "broker-a")
+        req = stats.get_report()["requests"]
+        self.assertEqual(req["unmatched_sample_max"], 10)
+        self.assertEqual(len(req["unmatched_samples"]), 10)
+        self.assertEqual(req["unmatched_samples"][-1]["req_id"], "r-19")
+        stats.set_unmatched_sample_max(3)
+        req = stats.get_report()["requests"]
+        self.assertEqual([s["req_id"] for s in req["unmatched_samples"]],
+                         ["r-17", "r-18", "r-19"])
+        stats.set_unmatched_sample_max(0)
+        self.assertEqual(stats.get_report()["requests"]["unmatched_samples"], [])
+        for bad in (-1, 257, True, 1.5, "5", None):
+            with self.assertRaises(ValueError):
+                stats.set_unmatched_sample_max(bad)
 
     def test_prune_timeout_mid_also_releases_batch(self):
         """TTL 清理 mid 时必须同步扣 pending，否则批次永远挂着。"""
@@ -357,7 +526,19 @@ class FirstPacketStatsTests(unittest.TestCase):
         rep = stats.get_report()["in_flight"]
         self.assertEqual(rep, {"batches": 0, "mids": 0,
                                "pending_sum": 0, "stale_mids": 0,
-                               "orphan_writes": 0, "mid_ttl_dropped": 3})
+                               "orphan_writes": 0, "mid_ttl_dropped": 3,
+                               "ack_early_pending": 0,
+                               "ack_early_matched": 0, "ack_before_reg": 0,
+                               "ack_after_drop": 0, "ack_without_mid": 0,
+                               "ack_foreign": 0,
+                               "early_ack_source": {
+                                   "business_matched": 0,
+                                   "ping_dropped": 0,
+                                   "unknown_expired": 0},
+                               "early_acks_key": "(host, mid)",
+                               "early_ttl_s": stats._EARLY_TTL,
+                               "ack_before_reg_hosts": {},
+                               "ack_before_reg_samples": []})
 
     def test_ack_before_remaining_publishes_does_not_orphan_mid(self):
         """ack 抢在循环 publish 完其余 broker 之前返回，不得提前删批次。
@@ -419,6 +600,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(set(cov["online_latest"]), set(HOSTS))
         self.assertEqual(cov["offline_latest"], {})
         self.assertEqual(cov["recovered_since_offline"], [])
+        self.assertEqual(cov["recovery_same_tick"], [])
         self.assertIsNotNone(cov["broadcast_idle_s"])
         self.assertGreaterEqual(cov["broadcast_idle_s"], 0.0)
         # 恒等式：attempted == seen + blind，且 seen 永远是 attempted 的子集
@@ -635,6 +817,10 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(sa["vs_send_first"],
                          {"agree": 0, "disagree": 0, "disagree_hosts": {}})
         self.assertEqual(rep["in_flight"]["mid_ttl_dropped"], 0)
+        self.assertEqual(rep["in_flight"]["ack_without_mid"], 0)
+        self.assertEqual(rep["in_flight"]["ack_early_pending"], 0)
+        self.assertEqual(rep["in_flight"]["ack_early_matched"], 0)
+        self.assertEqual(rep["in_flight"]["ack_foreign"], 0)
 
 
 if __name__ == "__main__":

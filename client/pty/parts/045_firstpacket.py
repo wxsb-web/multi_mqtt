@@ -29,18 +29,42 @@ class FirstPacketStats:
     _BATCH_MAX = 4096             # 未收到全部 on_publish 的上行批次上限
     _MID_MAX = 32768              # mid -> 批次 的在途映射上限
     _MID_TTL = 120.0              # mid 最长在途秒数，超时视为等不到回执
+    _EARLY_MAX = 4096             # 早到 ack 暂存上限
+    _EARLY_TTL = 60.0             # 早到 ack 等登记的最长秒数，超时算未归属
+    _DROPPED_MAX = 4096           # 已 TTL 回收的 mid 标记上限
+    _DROPPED_TTL = 480.0          # 该标记保留秒数，用于识别迟到 ack
+    _FOREIGN_MAX = 4096           # 非广播 publish 的 mid 标记上限
+    _FOREIGN_TTL = 60.0           # 该标记保留秒数，用于丢弃其 on_publish
+    _EARLY_SAMPLE_MAX = 8         # 过期早到 ack 的现场样本上限
+    _UNMATCHED_SAMPLE_MAX = 5     # 未匹配回包的滚动样本上限（保留最近几条）
     _SEEN_MAX = 16384             # 下行 seq 去重表上限
     _SID_MAX = 512                # 会话首帧 broker 表上限
 
     def __init__(self):
         self._lock = threading.Lock()
         self._t0 = time.monotonic()
+        self._born = self._t0          # 对象创建时刻，reset 不重置
+        self._pid = os.getpid()
+        self._created_epoch = time.time()
         self._installed = False
         self._net = None
         self._node = None
         self._tls = threading.local()
         self._batches = {}        # bid -> {"t0","pending","win","published"}
         self._mid = {}            # (host, mid) -> (bid, publish_start)
+        # on_publish 可能早于 _note_publish_call 登记到达（paho 在 publish()
+        # 返回前就写出并回调）。早到 ack 先暂存在这里，登记时再消费，避免
+        # mid 写出后永远等不到第二次 ack、120s 后被 TTL 回收。
+        self._early_acks = {}     # (host, mid) -> ack 到达的 monotonic 秒
+        # _mid 被 TTL 回收的标记：用于把「回收后才到的迟到 ack」与早到区分开。
+        self._dropped_mids = {}   # (host, mid) -> 标记时间
+        # 非 broadcast publish（stats QoS1 ping 等）的 mid：它们的 on_publish
+        # 不属于业务批次，直接丢弃并计数，不能当成早到 ack 暂存。
+        self._foreign_mids = {}   # (host, mid) -> 记录时间
+        # 过期早到 ack 的现场：按 host 分布 + 最近几条样本（含 mid/age/source），
+        # 用于回答“ack_before_reg 到底是谁的 ack”。
+        self._early_expired_hosts = {}
+        self._early_expired_samples = []
         self._batch_seq = 0
         self._dl_seen = {}        # (sid, seq) -> 首达 broker
         self._sids = {}           # sid -> 首帧 broker（仅展示用）
@@ -91,6 +115,15 @@ class FirstPacketStats:
             "up_send_sum": 0.0, "up_send_max": None,
             "mid_orphan_write": 0,
             "mid_ttl_dropped": 0,
+            # ack_without_mid 恒等于 ack_before_reg + ack_after_drop：
+            #   早到且始终没等到登记（含暂存过期） -> ack_before_reg
+            #   _mid 已被 TTL 回收之后才到           -> ack_after_drop
+            # 早到但在登记时成功匹配的记 ack_early_matched（不进 without_mid）。
+            "ack_early_matched": 0,
+            "ack_before_reg": 0,
+            "ack_after_drop": 0,
+            "ack_without_mid": 0,
+            "ack_foreign": 0,
             "srv_observed": 0, "srv_agree": 0, "srv_disagree": 0,
         }
 
@@ -178,6 +211,12 @@ class FirstPacketStats:
                     bid = getattr(_self._tls, "batch", None)
                     if bid is not None:
                         _self._note_publish_call(bid, _host, info, t0)
+                    else:
+                        # 不属于任何 broadcast 的 publish（如 stats 的 QoS1
+                        # ping、业务直发）：它的 on_publish 会在没有登记槽时
+                        # 到达，必须标记出来直接丢弃，否则会被误存成“早到
+                        # ack”，过期后污染 ack_before_reg。
+                        _self._note_foreign_publish(_host, info)
                 except Exception:
                     pass
                 return info
@@ -407,6 +446,8 @@ class FirstPacketStats:
                 b["seen"].add(host)
             if not ok:
                 st["up_failed"] += 1
+                if mid is not None:
+                    self._early_acks.pop((host, mid), None)
                 return
             st["up_queued"] += 1
             if mid is None:
@@ -415,6 +456,17 @@ class FirstPacketStats:
             # 同一个 (host, mid) 可能因客户端重建而复用：先扣回旧记录的
             # pending，否则旧批次会永远等一个不会来的 ack。
             self._drop_mid(key)
+            # 早到 ack 必须在这里消费，且必须在 b is None 的 orphan 分支之前：
+            # 否则 ack 已暂存、登记路径却提前 return，暂存项只能等 _EARLY_TTL
+            # 过期，变成泄漏式的 ack_before_reg。
+            early = self._early_acks.pop(key, None)
+            if early is not None:
+                self._g["ack_early_matched"] += 1
+                lat = (early - t0) * 1000.0
+                if lat >= 0:
+                    self._add_send(host, lat)
+                self._settle_win(b, host, bid)
+                return
             if b is None:
                 # 批次已被结束/淘汰：这条 mid 永远等不到归属批次，写进去
                 # 只会制造 stale_mids。计入 orphan 便于定位（正常应为 0）。
@@ -425,6 +477,99 @@ class FirstPacketStats:
                 for k in list(self._mid)[:self._MID_MAX // 2]:
                     self._drop_mid(k)
             self._mid[key] = (bid, t0)
+
+    def _add_send(self, host, lat):
+        """记一条发送耗时样本（持锁调用）。"""
+        st = self._broker(host)
+        self._lat_add(st, "up_send", lat)
+        self._lat_add(self._g, "up_send", lat)
+
+    def _settle_win(self, b, host, bid):
+        """批次首个完成的 ack：记首包竞速与 req_id -> 发送侧首包映射。
+
+        早到 ack 与正常 ack 共用，保证两种路径口径一致；b is None（批次已
+        结束/淘汰）时只丢首包样本，不影响已记的发送耗时。
+        """
+        if b is None or b.get("win") is not None:
+            return
+        b["win"] = host
+        self._broker(host)["up_wins"] += 1
+        rid = b.get("req_id")
+        if rid and rid not in self._req_send_win:
+            if len(self._req_send_win) >= self._SEEN_MAX:
+                self._req_send_win.pop(next(iter(self._req_send_win)), None)
+            self._req_send_win[rid] = host
+        if self._first_ul_broker is None:
+            self._first_ul_broker = host
+            self._first_ul_broker_at = time.monotonic() - self._t0
+            self._first_ul_bid = bid
+
+    def _stage_early(self, key, now):
+        """暂存早到 ack；超限按 FIFO 淘汰，被淘汰的算未归属（持锁调用）。"""
+        if key in self._early_acks:
+            return
+        if len(self._early_acks) >= self._EARLY_MAX:
+            old_key = next(iter(self._early_acks))
+            old_at = self._early_acks.pop(old_key, now)
+            self._expire_early(old_key, old_at, now, "evicted")
+        self._early_acks[key] = now
+
+    def _expire_early(self, key, at, now, reason):
+        """早到 ack 等不到登记：计入 ack_before_reg，并留 host 分布/样本。
+
+        来源只能标 unknown：它既没等到业务登记，也没被 _foreign_mids 认领
+        （认领的会走 ack_foreign）。持锁调用。
+        """
+        try:
+            host, mid = key
+        except Exception:
+            host, mid = None, None
+        self._g["ack_before_reg"] += 1
+        self._g["ack_without_mid"] += 1
+        self._early_expired_hosts[host] = (
+            self._early_expired_hosts.get(host, 0) + 1)
+        self._early_expired_samples.append({
+            "host": host,
+            "mid": mid,
+            "age_ms": round(max(0.0, now - at) * 1000.0, 1),
+            "source": "unknown",
+            "reason": reason,
+        })
+        if len(self._early_expired_samples) > self._EARLY_SAMPLE_MAX:
+            del self._early_expired_samples[
+                :len(self._early_expired_samples) - self._EARLY_SAMPLE_MAX]
+
+    def _mark_dropped(self, key):
+        """标记一个被 TTL 回收的 mid，用于识别之后的迟到 ack（持锁调用）。"""
+        if len(self._dropped_mids) >= self._DROPPED_MAX:
+            self._dropped_mids.pop(next(iter(self._dropped_mids)), None)
+        self._dropped_mids[key] = time.perf_counter()
+
+    def _note_foreign_publish(self, host, info):
+        """记录一次非 broadcast publish 的 mid（stats QoS1 ping / 业务直发）。
+
+        这类 publish 没有批次登记，其 on_publish 若走 _note_publish_ack 会被
+        当成“早到 ack”暂存，_EARLY_TTL 后转成 ack_before_reg，把业务口径
+        污染。这里先按 (host, mid) 打标，ack 到达时直接丢弃并计入
+        ack_foreign（不持锁调用，内部加锁）。
+        """
+        try:
+            mid = getattr(info, "mid", None)
+        except Exception:
+            mid = None
+        if mid is None:
+            return
+        key = (host, mid)
+        with self._lock:
+            # on_publish 也可能早于这次打标（paho 在 publish() 返回前就回调）：
+            # 先把已暂存的同名 ack 认领掉，否则它会一直等到过期，变成一条
+            # 与业务无关的 ack_before_reg。
+            if self._early_acks.pop(key, None) is not None:
+                self._g["ack_foreign"] += 1
+                return
+            if len(self._foreign_mids) >= self._FOREIGN_MAX:
+                self._foreign_mids.pop(next(iter(self._foreign_mids)), None)
+            self._foreign_mids[key] = time.perf_counter()
 
     def _drop_mid(self, key):
         """丢弃一条在途 mid，并同步扣减所属批次的 pending（持锁调用）。"""
@@ -439,37 +584,42 @@ class FirstPacketStats:
                 self._batches.pop(bid, None)
 
     def _note_publish_ack(self, host, mid):
-        """paho on_publish：包已发离该 broker 连接，算发送耗时/首达竞速。"""
+        """paho on_publish：包已发离该 broker 连接，算发送耗时/首达竞速。
+
+        rec 为空分三种情况：
+          ① 早到：登记前就回调 -> 暂存进 _early_acks，登记时消费；
+          ② 迟到：_mid 已被 TTL 回收 -> 记 ack_after_drop；
+          ③ 既非早到也没登记 -> 同 ① 暂存，_EARLY_TTL 过期后记 ack_before_reg。
+        注意「ack_without_mid 与 mid_ttl_dropped 同量级」只能说明时间错位
+        存在（①或②至少一类大量出现），不能直接证明方向是早到。
+        """
         now = time.perf_counter()
         with self._lock:
-            rec = self._mid.pop((host, mid), None)
+            key = (host, mid)
+            # 非 broadcast publish（stats QoS1 ping 等）的 ack：不属于业务
+            # 首包口径，直接丢弃并计数；否则会以“早到 ack”身份暂存，过期
+            # 后变成 ack_before_reg（与业务发布无关的假异常）。
+            if key in self._foreign_mids:
+                self._foreign_mids.pop(key, None)
+                self._g["ack_foreign"] += 1
+                return
+            rec = self._mid.pop(key, None)
             if rec is None:
+                if key in self._dropped_mids:
+                    self._dropped_mids.pop(key, None)
+                    self._g["ack_after_drop"] += 1
+                    self._g["ack_without_mid"] += 1
+                    return
+                self._stage_early(key, now)
                 return
             bid, t0 = rec
             lat = (now - t0) * 1000.0
-            st = self._broker(host)
-            self._lat_add(st, "up_send", lat)
-            self._lat_add(self._g, "up_send", lat)
+            if lat >= 0:
+                self._add_send(host, lat)
             b = self._batches.get(bid)
             if b is not None:
                 b["pending"] -= 1
-                if b["win"] is None:
-                    b["win"] = host
-                    st["up_wins"] += 1
-                    # 同一 req_id 的发送侧首包 broker：只记第一次（republish 会
-                    # 再发一遍同 req_id，但服务端按 req_id 去重只认首份，对照
-                    # 必须以首份的发送顺序为准）。
-                    rid = b.get("req_id")
-                    if rid and rid not in self._req_send_win:
-                        if len(self._req_send_win) >= self._SEEN_MAX:
-                            self._req_send_win.pop(
-                                next(iter(self._req_send_win)), None)
-                        self._req_send_win[rid] = host
-                    if self._first_ul_broker is None:
-                        self._first_ul_broker = host
-                        self._first_ul_broker_at = (
-                            time.monotonic() - self._t0)
-                        self._first_ul_bid = bid
+                self._settle_win(b, host, bid)
                 if b["done"] and b["pending"] <= 0:
                     self._batches.pop(bid, None)
 
@@ -581,8 +731,10 @@ class FirstPacketStats:
     def _note_unmatched(self, topic, data, broker):
         """记录一条「不是本机请求的回包」的来源（持锁调用）。
 
-        只保留按 topic 的计数（最多 8 个）和最多 5 条样本；样本只含 topic、
-        broker、req_id 与键名，绝不保存 code 等业务内容，避免统计变成数据副本。
+        只保留按 topic 的计数（最多 8 个）和最多 5 条滚动样本；样本只含
+        at_s、topic、broker、req_id 与键名，绝不保存 code 等业务内容。
+        at_s=记录时的 uptime 秒，用来和外部请求的时间对齐；样本保留最近
+        几条（FIFO 淘汰），不是只留启动最初那几条。
         """
         try:
             t = str(topic)
@@ -591,16 +743,35 @@ class FirstPacketStats:
                 drop = min(self._unmatched_topics,
                            key=lambda k: self._unmatched_topics[k])
                 self._unmatched_topics.pop(drop, None)
-            if len(self._unmatched_samples) < 5:
-                rid = data.get("req_id")
-                self._unmatched_samples.append({
-                    "topic": t,
-                    "broker": broker,
-                    "req_id": rid if isinstance(rid, str) else repr(rid),
-                    "keys": sorted(str(k) for k in data.keys()),
-                })
+            rid = data.get("req_id")
+            self._unmatched_samples.append({
+                "at_s": round(time.monotonic() - self._t0, 1),
+                "topic": t,
+                "broker": broker,
+                "req_id": rid if isinstance(rid, str) else repr(rid),
+                "keys": sorted(str(k) for k in data.keys()),
+            })
+            if len(self._unmatched_samples) > self._UNMATCHED_SAMPLE_MAX:
+                del self._unmatched_samples[
+                    :len(self._unmatched_samples) - self._UNMATCHED_SAMPLE_MAX]
         except Exception:
             pass
+
+    def set_unmatched_sample_max(self, n):
+        """运行期调整未匹配回包样本上限（RPC 用，显式输入非法即报错）。
+
+        上限只约束样本列表长度，不影响计数；调小会立刻裁掉最老的样本。
+        RPC 用法：/r=first_packet_stats.set_unmatched_sample_max(20)
+        """
+        if isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= 256:
+            raise ValueError("unmatched_sample_max 必须是 0..256 的整数")
+        with self._lock:
+            self._UNMATCHED_SAMPLE_MAX = n
+            if n == 0:
+                self._unmatched_samples.clear()
+            elif len(self._unmatched_samples) > n:
+                del self._unmatched_samples[:-n]
+        return n
 
     # ---------------------------- 报告 ----------------------------
 
@@ -631,6 +802,7 @@ class FirstPacketStats:
             first_req_at = self._first_req_broker_at
             unmatched_topics = dict(self._unmatched_topics)
             unmatched_samples = list(self._unmatched_samples)
+            unmatched_sample_max = self._UNMATCHED_SAMPLE_MAX
             blind = dict(self._blind)
             absent = dict(self._absent)
             offline = dict(self._offline)
@@ -642,6 +814,10 @@ class FirstPacketStats:
             sids = dict(self._sids)
             pending_batches = len(self._batches)
             pending_mids = len(self._mid)
+            early_pending = len(self._early_acks)
+            early_expired_hosts = dict(self._early_expired_hosts)
+            early_expired_samples = [dict(s)
+                                     for s in self._early_expired_samples]
             pending_sum = sum(b["pending"] for b in self._batches.values())
             stale_mids = sum(1 for bid, _t0 in self._mid.values()
                              if bid not in self._batches)
@@ -652,10 +828,29 @@ class FirstPacketStats:
             sub_counts = {h: len(t) for h, t in self._sub_topics.items()}
             # 派生：离线之后又被检查到在线的 host（online_latest >
             # offline_latest.at_s）。启动期离线、之后才连上的 host 会出现在这里。
+            # 用严格 >：at_s 只精确到 0.1s，若两者相等，说明同一粒度内既被
+            # 检查到离线、也被检查到在线，先后方向不可判，单列 same_tick，
+            # 不并入 recovered（否则可能把“最后仍离线”误报成已恢复）。
             recovered = sorted(
                 h for h, at in online_latest.items()
                 if h in offline_latest
                 and at > offline_latest[h].get("at_s", -1))
+            same_tick = sorted(
+                h for h, at in online_latest.items()
+                if h in offline_latest
+                and at == offline_latest[h].get("at_s"))
+            pid = self._pid
+            current_pid = os.getpid()
+            object_age = time.monotonic() - self._born
+            expected_topics = set()
+            try:
+                net = self._net
+                if net is not None:
+                    expected_topics = {
+                        str(t) for t in
+                        (getattr(net, "subscribed_topics", None) or ())}
+            except Exception:
+                expected_topics = set()
             if reset:
                 self._reset_locked()
         connectivity = self._connectivity()
@@ -749,6 +944,17 @@ class FirstPacketStats:
         return {
             "uptime_s": round(uptime, 1),
             "installed": self._installed,
+            # 跨进程排查：pid 是创建本统计对象时的进程，current_pid 是现在
+            # 提供这份报告的进程。forked=True 说明统计状态被 fork 继承
+            # （计数器沿用父进程，此时 hb_frames 与 uptime 可能对不上）；
+            # 正常应为 False；object_age_s 是对象创建至今（reset 不影响），
+            # 与 uptime_s 不等说明期间做过 reset，计数只覆盖 reset 之后。
+            "process": {"pid": pid, "current_pid": current_pid,
+                        "forked": current_pid != pid,
+                        "created_at": round(self._created_epoch, 1),
+                        "object_age_s": round(object_age, 1)},
+            "subscriptions": {"count": len(expected_topics),
+                              "topics": sorted(expected_topics)},
             "connectivity": connectivity,
             "requests": {
                 "n": g["req_n"],
@@ -756,6 +962,9 @@ class FirstPacketStats:
                 "unmatched": g["req_foreign"],
                 "unmatched_topics": unmatched_topics,
                 "unmatched_samples": unmatched_samples,
+                # 当前生效的样本上限，可用
+                # /r=first_packet_stats.set_unmatched_sample_max(n) 运行期调整。
+                "unmatched_sample_max": unmatched_sample_max,
                 "latency_ms": self._lat_block(
                     g["req_lat_n"], g["req_lat_min"],
                     g["req_lat_sum"], g["req_lat_max"]),
@@ -768,6 +977,9 @@ class FirstPacketStats:
             "pty_frames": {
                 "unique": g["dl_unique"],
                 "duplicates": g["dl_dups"],
+                # 本窗口见过多少个不同 sid，= 条并发/残留的 PTY 会话数。
+                # >1 时每个会话各自发心跳，hb_frames 会大于 uptime/心跳间隔。
+                "sessions": len(sids),
                 "first_frame_broker": self._first_frame_broker(sids, brokers),
                 "broker_distribution": dl_rows,
             },
@@ -815,6 +1027,7 @@ class FirstPacketStats:
                     "online_latest": online_latest,
                     # 派生：离线后又被检查到在线的 host 名单。
                     "recovered_since_offline": recovered,
+                    "recovery_same_tick": same_tick,
                     # 最近一次 broadcast 距今多少秒；None=本窗口还没广播过。
                     # 数值大说明广播早就停了，此时 offline/online_latest 停止
                     # 更新是正常现象，不代表 host 现在仍离线。
@@ -845,7 +1058,30 @@ class FirstPacketStats:
                           "pending_sum": pending_sum,
                           "stale_mids": stale_mids,
                           "orphan_writes": g["mid_orphan_write"],
-                          "mid_ttl_dropped": g["mid_ttl_dropped"]},
+                          "mid_ttl_dropped": g["mid_ttl_dropped"],
+                          "ack_early_pending": early_pending,
+                          "ack_early_matched": g["ack_early_matched"],
+                          "ack_before_reg": g["ack_before_reg"],
+                          "ack_after_drop": g["ack_after_drop"],
+                          "ack_without_mid": g["ack_without_mid"],
+                          "ack_foreign": g["ack_foreign"],
+                          # 早到 ack 的来源分流：matched=登记时匹配上的业务
+                          # ack；ping_dropped=被 _foreign_mids 认领的非广播
+                          # （stats QoS1 ping / 业务直发）；unknown_expired=
+                          # 既没等到登记、也没被认领，只能记为未归属。
+                          "early_ack_source": {
+                              "business_matched": g["ack_early_matched"],
+                              "ping_dropped": g["ack_foreign"],
+                              "unknown_expired": g["ack_before_reg"]},
+                          # 现场口径自证：_early_acks 的 key 是否带 host。
+                          "early_acks_key": "(host, mid)",
+                          "early_ttl_s": self._EARLY_TTL,
+                          # ack_before_reg 里已过期（TTL/容量淘汰）的 ack 按
+                          # host 分布，以及最近几条 {host, mid, age_ms,
+                          # source, reason}。source 恒为 unknown，因为被认领的
+                          # 已走 ack_foreign，不会留在这里。
+                          "ack_before_reg_hosts": early_expired_hosts,
+                          "ack_before_reg_samples": early_expired_samples},
             "note": ("纯被动统计：0 额外网络请求，时间全部基于本地单调钟，"
                      "不解析也不信赖远端时间戳。下行首包=第一份副本先到的 "
                      "broker；上行首包=on_publish 先完成的 broker，QoS0 下只"
@@ -870,7 +1106,10 @@ class FirstPacketStats:
                      "本机 pending_requests（共用 reply topic 时多为其他设备的"
                      "回包），后者不计入首包分布与延迟，unmatched_topics/"
                      "unmatched_samples 用来确认它来自哪个 topic、哪个 broker"
-                     "（样本只留键名，不保存内容）。in_flight 健康时恒有 "
+                     "（滚动保留最近 unmatched_sample_max 条，默认 5，可在 RPC 里"
+                     "用 first_packet_stats.set_unmatched_sample_max(n) 调 0..256；"
+                     "每条带 at_s=记录时的 uptime 秒，便于和外部请求时间对齐；"
+                     "只留键名，不保存内容）。in_flight 健康时恒有 "
                      "mids==pending_sum 且 stale_mids==orphan_writes==0："
                      "stale_mids>0 表示有 mid 指向已回收批次，orphan_writes>0 "
                      "表示写入时批次就已不存在。mid_ttl_dropped=等不到 "
@@ -879,6 +1118,33 @@ class FirstPacketStats:
                      "（QoS0 的 on_publish 只在包写出 socket 时触发；连接在写出"
                      "前失效、或旧 client 被重建而未写完，就永远等不到回执，只能"
                      "在 TTL 到期时静默回收，这里把这条路径显式计数）。"
+                     "ack_without_mid 恒等于 ack_before_reg + ack_after_drop："
+                     "早到 ack 先暂存进 _early_acks，登记时匹配成功记 "
+                     "ack_early_matched（正常计入 send_ms/首包，不进 without_mid）；"
+                     "ack_before_reg=早到但超过 _EARLY_TTL 仍没等到登记（正常"
+                     "应≈0；非 0 说明有 ack 不属于任何 broadcast publish，或登记"
+                     "路径没走到）。early_ack_source 按来源分流同一批早到 ack："
+                     "business_matched=登记时匹配上的业务 ack（正常路径），"
+                     "ping_dropped=被 _foreign_mids 认领的非广播 ack（stats QoS1 "
+                     "ping 等，不进业务 in-flight），unknown_expired=既没等到登记"
+                     "也没被认领（即 ack_before_reg，需要继续找来源）。"
+                     "early_acks_key=\"(host, mid)\" 自证早到 ack 的索引带 host，"
+                     "不同 broker 的相同 mid 不会互相覆盖；early_ttl_s 是 "
+                     "_EARLY_TTL 的当前实际值。ack_before_reg_hosts 给出过期 ack "
+                     "按 host 的分布，ack_before_reg_samples 给出最近几条 "
+                     "{host, mid, age_ms, source, reason}（reason=ttl 或 evicted），"
+                     "source 恒为 unknown（被认领的已计入 ack_foreign）。"
+                     "ack_foreign=非 broadcast publish（stats 的 "
+                     "QoS1 ping、业务直发等）的 on_publish 次数：按 (host, mid) 打"
+                     "标后直接丢弃，不计入 ack_without_mid；若 ack_before_reg 仍"
+                     "增长，说明还有未识别的直发来源。"
+                     "ack_after_drop=_mid 已被 TTL 回收之后才到的迟到 ack。"
+                     "ack_early_pending=当前暂存、还没等到登记的早到 ack 数。"
+                     "注意：ack_without_mid 与 mid_ttl_dropped 同量级只能证明"
+                     "「时间错位存在」（早到或迟到至少一类大量出现），不能证明"
+                     "方向；方向要看匹配后 mid_ttl_dropped 是否下降。若早到匹配"
+                     "生效，mid_ttl_dropped 应显著下降、send_ms.n 相应上升，且 "
+                     "queued == send_ms.n + mid_ttl_dropped + mids 仍成立。"
                      "uplink_publish.coverage 用来"
                      "定位“某个 broker 上行全缺席”：predicted=广播开始前预测该"
                      "发的 host 次数，attempted=predicted∪seen（因此恒有 "
@@ -909,7 +1175,24 @@ class FirstPacketStats:
                      "（online_latest > offline_latest.at_s）：只包含被广播检查到"
                      "恢复的 host；若广播停止后 host 才恢复（如 dashboard/hivemq），"
                      "它不会出现在此列表，需看 hb_frames 与 uptime/5 的差值判断"
-                     "实际上线时间。"
+                     "实际上线时间（前提是 pty_frames.sessions==1；sessions>1 时"
+                     "每个会话各自发心跳，hb_frames 约为 sessions×uptime/5，不能"
+                     "直接用 uptime/5 推上线时间）。"
+                     "recovery_same_tick=online_latest 与 offline_latest.at_s 相等的"
+                     "host：at_s 只精确到 0.1s，相等表示同一粒度内既检查到离线也"
+                     "检查到在线，先后不可判，故单列而不并入 recovered_since_offline"
+                     "（保持严格 > 的保守口径）。"
+                     "process.pid 是创建统计对象时的进程，current_pid 是当前提供"
+                     "报告的进程，forked=True 说明统计状态被 fork 继承（计数器跨"
+                     "进程延续，hb_frames 与 uptime 会失去可比性）；object_age_s 是"
+                     "对象年龄（reset 不清零），与 uptime_s 不等说明做过 reset。"
+                     "subscriptions.topics 是本进程登记在 subscribed_topics 的 filter"
+                     "集合：某 broker 能收回包却疑似收不到 pty 时，先核对 pty topic"
+                     "是否在此集合、再看该 host 的 subscription_count 与 rx。"
+                     "subscription_count 常态为 2，是 pty out 与 device response 两条"
+                     "不同 filter；只有 hb_dups>0 时才是同一帧被多条匹配投递。"
+                     "某 host wins=0 但 rx 很大、dups≈rx-hb_frames，说明它收到了帧、"
+                     "只是每次都比别的 broker 晚，不是没订阅上。"
                      "broadcast_idle_s=最近一次 broadcast 距今秒数（None=还没广播），"
                      "它很大时 offline/online_latest 停止更新属正常，不能读成"
                      "“现在仍离线”。"
@@ -923,7 +1206,8 @@ class FirstPacketStats:
                      "不重复统计。QoS0 下判断上行首达应以 server_ack."
                      "first_packet_broker 为准（服务端实际首个收到请求的 broker），"
                      "uplink_publish.first_packet_broker 仅代表本地写出顺序；"
-                     "两者系统性不一致时（本轮 agree=1/disagree=13）以前者为准。"
+                     "两者系统性不一致时以前者为准，偏差程度看 vs_send_first "
+                     "的 agree/disagree 与 disagree_hosts。"
                      "注意 offline_hosts 与 pty_frames.hb_frames 可以看似矛盾："
                      "offline 只在 broadcast 那一刻采样，先看 offline_samples"
                      "的 at_s 是否集中在启动初期（那时确实还没连上），之后连上"
@@ -931,8 +1215,10 @@ class FirstPacketStats:
                      "状态判断或 client 对象错位。brokers_queued 是窗口内每批"
                      "实际入队数，connectivity.connected 是查询瞬间值，不同源。"
                      "requests.observed 依赖 multi_mqtt 在 message_callback 之前"
-                     "按 req_id 的全局去重（TTL≈60s），同一 req_id 在 TTL 内"
-                     "只计一次；超过 TTL 的重复投递会再计一次。"),
+                     "按 req_id 的全局去重（dedup_ttl=max(30, timestamp_window+30)，"
+                     "默认 timestamp_window=400 → 430s），同一 req_id 在该窗口内"
+                     "只计一次；超过窗口的重复投递会再计一次。统计器自己不维护"
+                     "req_id 缓存，observed 直接来自回调，所以口径就是去重后的结果。"),
         }
 
     def _connectivity(self):
@@ -1032,15 +1318,35 @@ class FirstPacketStats:
         for k, (_bid, t0) in list(self._mid.items()):
             if now - t0 > self._MID_TTL:
                 self._drop_mid(k)
+                # 记下这个 mid 已被回收：之后如果 on_publish 才到，就能区分
+                # 成“迟到 ack”，不会误当成早到而永远暂存。
+                self._mark_dropped(k)
                 # 显式计数：mid 等不到 on_publish、被 TTL 静默回收的次数。
                 # 报告里 send_ms.n 与 queued 的差额应等于它，否则说明还有
                 # 别的丢样本路径（批次淘汰/orphan）。
                 self._g["mid_ttl_dropped"] += 1
+        # 早到 ack 等登记超过 _EARLY_TTL 仍未等到 -> 未归属，计入
+        # ack_before_reg；正常的 publish 调用返回就在微秒级，过期即泄漏。
+        for k, at in list(self._early_acks.items()):
+            if now - at > self._EARLY_TTL:
+                self._early_acks.pop(k, None)
+                self._expire_early(k, at, now, "ttl")
+        for k, at in list(self._dropped_mids.items()):
+            if now - at > self._DROPPED_TTL:
+                self._dropped_mids.pop(k, None)
+        for k, at in list(self._foreign_mids.items()):
+            if now - at > self._FOREIGN_TTL:
+                self._foreign_mids.pop(k, None)
 
     def _reset_locked(self):
         self._t0 = time.monotonic()
         self._batches.clear()
         self._mid.clear()
+        self._early_acks.clear()
+        self._dropped_mids.clear()
+        self._foreign_mids.clear()
+        self._early_expired_hosts.clear()
+        self._early_expired_samples.clear()
         self._dl_seen.clear()
         self._sids.clear()
         self._first_req_broker = None
