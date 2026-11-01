@@ -373,7 +373,10 @@ def _capture_full(scope, body):
 async def _serve_byte_range(scope, body, send, group1, group2):
     status, headers, out = await asyncio.get_running_loop().run_in_executor(
         None, _capture_full, scope, body)
-    if not 200 <= status < 300:
+    # 只对 200 全量输出做外层切片；206 说明内层（例如 #serve-file）已经
+    # 解析过 Range 并返回了正确的 Content-Range，再切一次会把片段的
+    # 字节再按原区间截断。416 等非 200 也直接透传。
+    if status != 200:
         await _send_response(send, status, headers, out)
         return
 

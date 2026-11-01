@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, asyncio, textwrap, inspect, ast, hmac, weakref, json, os, tempfile, time
+import sys, io, re, urllib.parse, threading, traceback, struct, base64, hashlib, socket, logging, stat, hmac, weakref, json, os, tempfile, time, ast
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from pathlib import Path
@@ -121,6 +121,13 @@ def _update_persisted_aliases(updates=None, deletes=(), path=None):
             document.pop(ALIAS_CONFIG_KEY, None)
         config_path = _alias_config_path(path)
         config_path.parent.mkdir(parents=True, exist_ok=True)
+        # mkstemp 在 POSIX 上固定创建 0600；直接 replace 会把 rpc.json 原本
+        # 的 0644 等权限改掉，换成另一个用户运行的服务就可能读不到。写临时
+        # 文件后先恢复原文件权限，再原子替换。
+        try:
+            existing_mode = stat.S_IMODE(os.stat(config_path).st_mode)
+        except OSError:
+            existing_mode = None
         handle, temp_name = tempfile.mkstemp(
             prefix=config_path.name + '.', suffix='.tmp',
             dir=str(config_path.parent))
@@ -128,6 +135,8 @@ def _update_persisted_aliases(updates=None, deletes=(), path=None):
             with os.fdopen(handle, 'w', encoding='utf-8') as temp_file:
                 json.dump(document, temp_file, ensure_ascii=False, indent=2)
                 temp_file.write('\n')
+            if existing_mode is not None:
+                os.chmod(temp_name, existing_mode)
             os.replace(temp_name, config_path)
         except BaseException:
             try:
@@ -361,7 +370,7 @@ class WebSocket:
         fragments = []
         while True:
             header = self._read_exact(2)
-            if not header:
+            if header is None:
                 return None
             first, second = header
             final = bool(first & 0x80)
@@ -369,20 +378,39 @@ class WebSocket:
             masked = bool(second & 0x80)
             length = second & 0x7f
             if length == 126:
-                length = struct.unpack('!H', self._read_exact(2))[0]
+                extended = self._read_exact(2)
+                if extended is None:
+                    return None
+                length = struct.unpack('!H', extended)[0]
             elif length == 127:
-                length = struct.unpack('!Q', self._read_exact(8))[0]
-            mask = self._read_exact(4) if masked else b''
-            payload = bytearray(self._read_exact(length))
-            if masked:
-                for index in range(length):
-                    payload[index] ^= mask[index % 4]
+                extended = self._read_exact(8)
+                if extended is None:
+                    return None
+                length = struct.unpack('!Q', extended)[0]
+            # RFC 6455 §5.1：客户端到服务端的帧必须 mask。不 mask 是协议
+            # 错误，应 1002 关闭；静默接受会让实现偏离规范并掩盖异常客户端。
+            if not masked:
+                self.close(1002, 'client frames must be masked')
+                return None
+            mask = self._read_exact(4)
+            if mask is None:
+                return None
+            raw_payload = self._read_exact(length)
+            if raw_payload is None:
+                return None
+            payload = bytearray(raw_payload)
+            for index in range(length):
+                payload[index] ^= mask[index % 4]
             if opcode == 0x8:
                 self.close()
                 return None
             if opcode == 0x9:
                 self._send_control(0xA, payload)
                 continue
+            if opcode == 0x0 and not fragments:
+                # continuation 作为首帧没有可续的消息，1002 协议错误。
+                self.close(1002, 'unexpected continuation frame')
+                return None
             if opcode in (0x1, 0x0):
                 fragments.append(bytes(payload))
                 if final:
@@ -390,27 +418,41 @@ class WebSocket:
                 continue
             if opcode == 0xA:
                 continue
-            raise ValueError(f'unsupported WebSocket opcode: {opcode}')
+            if opcode == 0x2:
+                # 合法但服务端不支持 binary；1003 表示不支持的数据类型。
+                self.close(1003, 'binary frames are not supported')
+                return None
+            self.close(1002, 'unsupported WebSocket opcode')
+            return None
 
-    def close(self):
-        if not self.closed:
-            self.closed = True
-            try:
-                with self.send_lock:
-                    self.socket.sendall(b'\x88\x00')
-            except OSError:
-                pass
+    def close(self, code=None, reason=''):
+        if self.closed:
+            return
+        self.closed = True
+        payload = b''
+        if code is not None:
+            payload = (
+                struct.pack('!H', int(code))
+                + str(reason).encode('utf-8')[:123])
+        try:
+            with self.send_lock:
+                self.socket.sendall(bytes((0x88, len(payload))) + payload)
+        except OSError:
+            pass
 
     def _send_control(self, opcode, payload=b''):
         with self.send_lock:
             self.socket.sendall(bytes((0x80 | opcode, len(payload))) + payload)
 
     def _read_exact(self, size):
+        """读满 size 字节；对端中途断开返回 None，不能用 ``if not data``
+        判断——长度为 0 的 payload 合法返回 b''，部分读取不能被当成完整帧。
+        """
         data = b''
         while len(data) < size:
             chunk = self.socket.recv(size - len(data))
             if not chunk:
-                return b''
+                return None
             data += chunk
         return data
 
@@ -755,9 +797,16 @@ def parse_serve_file(code):
     if not isinstance(code, str):
         return None
     head = code.lstrip().partition('\n')[0].strip()
-    if not head.startswith(SERVE_FILE_MARKER):
+    # 必须是精确的标记，或标记后紧跟空白再跟 JSON；`#serve-filex {...}`
+    # 不能被当成规格，否则每次请求都会走坏 JSON 告警。
+    if head == SERVE_FILE_MARKER:
+        payload = ''
+    elif (head.startswith(SERVE_FILE_MARKER)
+          and len(head) > len(SERVE_FILE_MARKER)
+          and head[len(SERVE_FILE_MARKER)].isspace()):
+        payload = head[len(SERVE_FILE_MARKER):].strip()
+    else:
         return None
-    payload = head[len(SERVE_FILE_MARKER):].strip()
     try:
         spec = json.loads(payload)
         if not isinstance(spec, dict):
@@ -805,6 +854,57 @@ def _serve_file_spec(executor, code):
     return parse_serve_file(info.get('code'))
 
 
+# 单段 Range：bytes=start-end / bytes=start- / bytes=-suffix。
+# 多段 Range 或其它单位不解析，按全量 200 处理（RFC 允许忽略）。
+_RANGE_SPEC_RE = re.compile(r'bytes=(\d*)-(\d*)$', re.IGNORECASE)
+
+
+def _content_disposition(filename):
+    """构造兼容非 ASCII 的附件头：ASCII fallback + RFC 5987 filename*。
+
+    中文文件名直接塞进 filename="..." 会被 http.server 的 latin-1 编码
+    拒绝（UnicodeEncodeError）；filename* 用 UTF-8 百分号编码传递原名，
+    老客户端仍能拿到 ASCII fallback。
+    """
+    name = str(filename or '') or 'download.bin'
+    # fallback 直接进 header，必须只保留可打印 ASCII；NUL / 其它控制字符
+    # 虽然能被 latin-1 编码，但会污染响应头。
+    fallback = ''.join(
+        char for char in name.encode('ascii', 'ignore').decode('ascii')
+        if 0x20 <= ord(char) < 0x7f and char != '"')
+    fallback = fallback.replace('\\', '_') or 'download.bin'
+    return "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (
+        fallback, urllib.parse.quote(name, safe=''))
+
+
+def _parse_range_header(value, size):
+    """解析单段 Range，返回 (start, end) / 'unsatisfiable' / None。
+
+    语法非法（含多段/其它单位）返回 None，调用方维持全量 200；
+    合法但越界返回 'unsatisfiable'，调用方回 416。
+    """
+    match = _RANGE_SPEC_RE.match(value.strip())
+    if not match:
+        return None
+    first, last = match.group(1), match.group(2)
+    if not first and not last:
+        return None
+    try:
+        if not first:
+            suffix = int(last)
+            if suffix <= 0:
+                return 'unsatisfiable'
+            start, end = max(0, size - suffix), size - 1
+        else:
+            start = int(first)
+            end = min(int(last), size - 1) if last else size - 1
+    except ValueError:
+        return None
+    if size == 0 or start >= size or start > end:
+        return 'unsatisfiable'
+    return start, end
+
+
 def _stream_alias_file(handler, spec):
     """在请求线程里直接流式输出文件（不经过执行器，不占执行锁）。
 
@@ -812,6 +912,9 @@ def _stream_alias_file(handler, spec):
     的下载会把锁占 5 分钟，期间所有 RPC 排队超时；客户端中途取消还会让
     服务端继续慢慢写完整个文件。这里直接读文件写 socket，客户端一断开
     （BrokenPipe/ConnectionReset）立即收手。
+
+    单段 Range 直接按 206 + Content-Range 输出，浏览器/播放器拖动进度条
+    不再需要重下全量；多段 Range 忽略为 200。
     """
     path = os.path.abspath(os.path.expanduser(spec['path']))
     try:
@@ -830,13 +933,37 @@ def _stream_alias_file(handler, spec):
             pass
         return
 
-    handler.send_response(200)
+    headers = getattr(handler, 'headers', None)
+    range_header = headers.get('Range') if headers is not None else None
+    parsed = _parse_range_header(range_header, size) if range_header else None
+    if parsed == 'unsatisfiable':
+        body = b'Requested Range Not Satisfiable'
+        handler.send_response(416)
+        handler.send_header('Content-Range', 'bytes */%d' % size)
+        handler.send_header('Content-Type', 'text/plain; charset=utf-8')
+        handler.send_header('Content-Length', str(len(body)))
+        handler.end_headers()
+        try:
+            handler.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return
+    if parsed:
+        start, end = parsed
+        status, expected = 206, end - start + 1
+        content_range = 'bytes %d-%d/%d' % (start, end, size)
+    else:
+        start, end = 0, size - 1
+        status, expected = 200, size
+        content_range = None
+
+    handler.send_response(status)
     handler.send_header('Content-Type', spec['content_type'])
-    handler.send_header('Content-Length', str(size))
-    handler.send_header(
-        'Content-Disposition',
-        'attachment; filename="%s"' % spec['filename'].replace('"', '_'))
+    handler.send_header('Content-Length', str(expected))
+    handler.send_header('Content-Disposition', _content_disposition(spec['filename']))
     handler.send_header('Accept-Ranges', 'bytes')
+    if content_range:
+        handler.send_header('Content-Range', content_range)
     handler.end_headers()
 
     rate = spec['rate_limit']
@@ -845,8 +972,11 @@ def _stream_alias_file(handler, spec):
     started = time.monotonic()
     try:
         with open(path, 'rb') as source:
-            while True:
-                block = source.read(chunk)
+            if start:
+                source.seek(start)
+            remaining = expected
+            while remaining > 0:
+                block = source.read(min(chunk, remaining))
                 if not block:
                     break
                 if rate > 0:
@@ -856,9 +986,23 @@ def _stream_alias_file(handler, spec):
                         time.sleep(gap)
                 handler.wfile.write(block)
                 sent += len(block)
+                remaining -= len(block)
     except (BrokenPipeError, ConnectionResetError):
         logging.getLogger('app').info(
-            '文件直出客户端提前断开 %s (%d/%d bytes)', path, sent, size)
+            '文件直出客户端提前断开 %s (%d/%d bytes)', path, sent, expected)
+        return
+    except OSError as error:
+        # 头已发出，不能再 send_error(500)（headers already sent）；记录后
+        # 关连接，让客户端立即收到 EOF 而不是挂在 keep-alive 上等字节。
+        logging.getLogger('app').warning(
+            '文件直出 I/O 错误 %s (%d/%d bytes): %s', path, sent, expected, error)
+        handler.close_connection = True
+        return
+    if sent != expected:
+        logging.getLogger('app').warning(
+            '文件直出长度不一致 %s (sent=%d expected=%d total=%d range=%s)',
+            path, sent, expected, size, parsed)
+        handler.close_connection = True
 
 
 def _root_alias_code(handler):
@@ -995,7 +1139,11 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'max-age=86400')
             self.send_header('Content-Length', str(len(favicon_bytes)))
             self.end_headers()
-            self.wfile.write(favicon_bytes)
+            try:
+                self.wfile.write(favicon_bytes)
+            except (BrokenPipeError, ConnectionResetError):
+                # 客户端在 favicon 响应前断开，不应冒到 BaseHTTPRequestHandler。
+                pass
             return
         self.handle_rpc(auth_checked=True)
 
@@ -1005,9 +1153,15 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
         if not key or self.headers.get('Sec-WebSocket-Version') != '13':
             self.send_error(400, 'WebSocket version 13 and key are required')
             return
-        accept = base64.b64encode(hashlib.sha1(
-            (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')
-        ).digest()).decode('ascii')
+        try:
+            accept = base64.b64encode(hashlib.sha1(
+                (key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')
+            ).digest()).decode('ascii')
+        except UnicodeEncodeError:
+            # Sec-WebSocket-Key 由客户端控制；非 ASCII 无法按 RFC 计算
+            # SHA-1 Accept 值，回 400，避免异常冒到 BaseHTTPRequestHandler。
+            self.send_error(400, 'Sec-WebSocket-Key must be ASCII')
+            return
         self.send_response(101, 'Switching Protocols')
         self.send_header('Upgrade', 'websocket')
         self.send_header('Connection', 'Upgrade')
@@ -1038,26 +1192,6 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
         if not self.check_basic_auth():
             return
         self.handle_rpc(auth_checked=True)
-
-    def _execute_coroutine(self, coro, exec_globals):
-        target_loop = _conf(self, 'main_loop')
-        if not target_loop or not target_loop.is_running():
-            for value in exec_globals.values():
-                if hasattr(value, '_loop') and isinstance(value._loop, asyncio.AbstractEventLoop) and value._loop.is_running():
-                    target_loop = value._loop
-                    break
-                if isinstance(value, asyncio.AbstractEventLoop) and value.is_running():
-                    target_loop = value
-                    break
-        if target_loop and target_loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(coro, target_loop)
-            return future.result()
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
 
     def handle_rpc(self, auth_checked=False):
         # 认证门必须放在 handle_rpc 内部而不只是 do_GET/do_POST：WSGI / ASGI
@@ -1138,13 +1272,15 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
             if not _is_alias_call(executor, code):
                 try:
                     ast.parse(code)
-                except SyntaxError:
+                except (SyntaxError, ValueError):
+                    # ValueError：源码含 NUL（ast.parse('a\x00')）；它不属于
+                    # SyntaxError，不一起捕获会直接冒到外层 500。
                     rescued = _rescue_path_syntax(code)
                     if rescued is not code and rescued != code:
                         try:
                             ast.parse(rescued)
                             code = rescued
-                        except SyntaxError:
+                        except (SyntaxError, ValueError):
                             pass
 
             class ResponseWrapper:
@@ -1179,9 +1315,10 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                         if 'Content-Type' not in self.headers:
                             self.handler.send_header(
                                 'Content-Type', 'application/octet-stream')
-                        # 告知浏览器本资源支持 Range：播放中可直接拖动跳转。
-                        self.handler.send_header('Accept-Ranges', 'bytes')
-                        # 流式响应长度未知，不发送 Content-Length
+                        # 流式响应长度未知，不发送 Content-Length。
+                        # 也不能声明 Accept-Ranges：这里没有缓冲完整结果，
+                        # 无法对 Range 请求返回 206；WSGI / ASGI 垫片在外层
+                        # 捕获完整输出后才实现 Range，与原生 handler 不同。
                         self.handler.end_headers()
                         self._streamed = True
                     if data:
@@ -1471,7 +1608,7 @@ def build_arg_parser():
     )
     # 同时接受 --key 与仓库里常见的 -key / -k 写法；key 值本身可以就是
     # '-'（argparse 把单独的 '-' 当值而非选项），此时 URL 为 /-<code>。
-    parser.add_argument('--port', '-port', '-p', type=int, default=1144)
+    parser.add_argument('--port', '-port', '-p', type=int, default=1133)
     parser.add_argument('--ip', '--host', '-host', default='0.0.0.0')
     parser.add_argument('--key', '-key', '-k', default='',
                         help="URL 前缀，如 - 时 URL 为 /-<code>")

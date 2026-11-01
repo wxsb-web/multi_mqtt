@@ -71,6 +71,42 @@ class ServerHttpTests(unittest.TestCase):
             server.server_close()
             # thread.join(timeout=2)
 
+    def test_non_ascii_websocket_key_returns_400(self):
+        server = server_http.start_rpc_server(
+            port=0,
+            ip="127.0.0.1",
+            websocket_handler=lambda _handler, websocket, request: None,
+        )
+        try:
+            with socket.create_connection(("127.0.0.1", server.server_port)) as client:
+                client.sendall(
+                    b"GET /ws HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    b"Upgrade: websocket\r\n"
+                    b"Connection: Upgrade\r\n"
+                    b"Sec-WebSocket-Version: 13\r\n"
+                    b"Sec-WebSocket-Key: \xff\r\n\r\n"
+                )
+                first = client.recv(1024).split(b"\r\n", 1)[0]
+            self.assertIn(b"400", first)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_nul_byte_code_uses_structured_500(self):
+        server = server_http.start_rpc_server(port=0, ip="127.0.0.1")
+        try:
+            url = (f"http://127.0.0.1:{server.server_port}/"
+                   + urllib.parse.quote('a\x00', safe=''))
+            with self.assertRaises(urllib.error.HTTPError) as context:
+                urllib.request.urlopen(url, timeout=10)
+            self.assertEqual(context.exception.code, 500)
+            self.assertIn(
+                'Traceback', context.exception.read().decode('utf-8', 'replace'))
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_module_can_be_imported_from_its_directory(self):
         result = subprocess.run(
             [sys.executable, "-c", "import server_http; print(server_http.start_rpc_server.__name__)"],
@@ -346,6 +382,18 @@ class ServeFileSpecParseTests(unittest.TestCase):
         ):
             self.assertIsNone(server_http.parse_serve_file(code), code)
 
+    def test_marker_requires_word_boundary(self):
+        # '#serve-filex' 不是规格，不能为了它每次请求打坏 JSON 告警。
+        with self.assertNoLogs('app', level='WARNING'):
+            self.assertIsNone(server_http.parse_serve_file(
+                '#serve-filex {"path": "/tmp/a"}\nr=1'))
+
+    def test_content_disposition_filters_control_chars(self):
+        value = server_http._content_disposition('bad\x00na\x01me.bin')
+        self.assertNotIn('\x00', value)
+        self.assertNotIn('\x01', value)
+        self.assertIn('badname.bin', value)
+
 
 class ServeFileAliasTests(unittest.TestCase):
     """文件直出别名：请求线程里直接流式输出，不占执行器锁。"""
@@ -460,6 +508,153 @@ class ServeFileAliasTests(unittest.TestCase):
         thread.join(15)
         self.assertEqual(seen.get('total'), 64 * 1024, seen)
 
+    @staticmethod
+    def _temp_content(content):
+        handle, path = tempfile.mkstemp(prefix='mm_serve_', suffix='.bin')
+        with os.fdopen(handle, 'wb') as file:
+            file.write(content)
+        return path
+
+    def test_range_request_returns_206_slice(self):
+        path = self._temp_content(b'0123456789')
+        self.addCleanup(os.unlink, path)
+        server = self._start()
+        self._mount(server, 'blob', {'path': path})
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{server.server_port}/blob',
+            headers={'Range': 'bytes=2-5'})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.headers['Content-Range'], 'bytes 2-5/10')
+            self.assertEqual(response.headers['Content-Length'], '4')
+            self.assertEqual(response.read(), b'2345')
+
+    def test_suffix_range_returns_tail(self):
+        path = self._temp_content(b'0123456789')
+        self.addCleanup(os.unlink, path)
+        server = self._start()
+        self._mount(server, 'blob', {'path': path})
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{server.server_port}/blob',
+            headers={'Range': 'bytes=-3'})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.headers['Content-Range'], 'bytes 7-9/10')
+            self.assertEqual(response.read(), b'789')
+
+    def test_unsatisfiable_range_returns_416(self):
+        path = self._temp_content(b'0123456789')
+        self.addCleanup(os.unlink, path)
+        server = self._start()
+        self._mount(server, 'blob', {'path': path})
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{server.server_port}/blob',
+            headers={'Range': 'bytes=20-30'})
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(request, timeout=10)
+        self.assertEqual(context.exception.code, 416)
+        self.assertEqual(
+            context.exception.headers['Content-Range'], 'bytes */10')
+
+    def test_non_ascii_filename_uses_rfc5987(self):
+        path = self._temp_content(b'data')
+        self.addCleanup(os.unlink, path)
+        server = self._start()
+        self._mount(server, 'blob', {
+            'path': path, 'filename': '中文音频.wav', 'content_type': 'audio/wav'})
+        url = f'http://127.0.0.1:{server.server_port}/blob'
+        with urllib.request.urlopen(url, timeout=10) as response:
+            disposition = response.headers['Content-Disposition']
+            self.assertIn("filename*=UTF-8''", disposition)
+            self.assertIn(
+                urllib.parse.quote('中文音频.wav', safe=''), disposition)
+
+
+class AliasPersistencePermissionTests(unittest.TestCase):
+    """rpc.json 原子替换后必须保留原权限位（mkstemp 默认是 0600）。"""
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX 权限位才有意义')
+    def test_update_preserves_existing_mode(self):
+        handle, path = tempfile.mkstemp(prefix='mm_alias_', suffix='.json')
+        os.close(handle)
+        self.addCleanup(os.unlink, path)
+        with open(path, 'w', encoding='utf-8') as file:
+            json.dump({}, file)
+        os.chmod(path, 0o644)
+        self.assertTrue(
+            server_http._update_persisted_aliases({'a': 'r=1'}, path=path))
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+        with open(path, encoding='utf-8') as file:
+            self.assertEqual(json.load(file)['http_aliases']['a'], 'r=1')
+
+
+class _FakeSocket:
+    """按 recv(size) 切片返回预设数据；耗尽后返回 b'' 模拟断开。"""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.sent = []
+
+    def recv(self, size):
+        while self.chunks and not self.chunks[0]:
+            self.chunks.pop(0)
+        if not self.chunks:
+            return b''
+        chunk = self.chunks[0]
+        if len(chunk) <= size:
+            self.chunks.pop(0)
+            return chunk
+        self.chunks[0] = chunk[size:]
+        return chunk[:size]
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+
+class WebSocketPartialReadTests(unittest.TestCase):
+    """TCP 半包、mask 规范与不支持的 opcode 都要优雅关闭。"""
+
+    @staticmethod
+    def _websocket(chunks):
+        fake = _FakeSocket(chunks)
+        class Handler:
+            connection = fake
+        return server_http.WebSocket(Handler()), fake
+
+    @staticmethod
+    def _close_code(fake):
+        frame = fake.sent[-1]
+        assert frame[0] == 0x88, frame
+        return int.from_bytes(frame[2:4], 'big')
+
+    def test_partial_header_returns_none(self):
+        websocket, _fake = self._websocket([b'\x81'])
+        self.assertIsNone(websocket.receive())
+
+    def test_partial_masked_payload_returns_none(self):
+        websocket, _fake = self._websocket([b'\x81\x85abcdxy'])
+        self.assertIsNone(websocket.receive())
+
+    def test_zero_length_payload_is_not_disconnect(self):
+        # 0x81 0x80 + 4 字节 mask + 0 字节 payload
+        websocket, _fake = self._websocket([b'\x81\x80abcd'])
+        self.assertEqual(websocket.receive(), '')
+
+    def test_unmasked_client_frame_closes_1002(self):
+        websocket, fake = self._websocket([b'\x81\x01A'])
+        self.assertIsNone(websocket.receive())
+        self.assertEqual(self._close_code(fake), 1002)
+
+    def test_binary_frame_closes_1003(self):
+        websocket, fake = self._websocket([b'\x82\x81abcdX'])
+        self.assertIsNone(websocket.receive())
+        self.assertEqual(self._close_code(fake), 1003)
+
+    def test_continuation_without_message_closes_1002(self):
+        websocket, fake = self._websocket([b'\x80\x81abcdX'])
+        self.assertIsNone(websocket.receive())
+        self.assertEqual(self._close_code(fake), 1002)
+
 
 class CliArgsTests(unittest.TestCase):
     """命令行参数拼写（--basic_auth / -basic_auth / -basic-auth 同义）。"""
@@ -476,7 +671,7 @@ class CliArgsTests(unittest.TestCase):
         self.assertEqual(args.alias_url, "dash")
         self.assertEqual(args.root_alias, "root")
         self.assertTrue(args.persist_aliases)
-        self.assertEqual(args.port, 1144)
+        self.assertEqual(args.port,1133)
 
     def test_cli_basic_auth_value_gates_requests(self):
         # start_rpc_server 把 basic_auth 写进 RPCRequestHandler 类属性，同进程

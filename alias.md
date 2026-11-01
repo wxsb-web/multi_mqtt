@@ -549,7 +549,8 @@ server_http 职责只有三步：
 2. 路由出的整段 code **精确等于**已注册别名名：不接受 `dl=arg`、prefix
    展开、params 绑定，query 也不参与；
 3. 执行器 `alias` 开启，且 `executor.aliases` 中存在该记录；
-4. body 第一条非空行以 `#serve-file` 开头，其后是合法 JSON object。
+4. body 第一条非空行精确为 `#serve-file` 或 `#serve-file <JSON>`（标记后必须是
+   空白；`#serve-filex ...` 不算规格），JSON 合法且是 object。
 
 首行不是该形态、JSON 坏了、`path` 缺失或类型写错，一律返回 `None` 并
 只打一次 WARNING，**退回普通别名执行**。下载端点坏掉不能牵连 RPC 主流程。
@@ -571,10 +572,17 @@ server_http 职责只有三步：
 
 - 文件存在：`200` + `Content-Type` + `Content-Length` + `Content-Disposition`
   （`attachment`）+ `Accept-Ranges: bytes`；按 `chunk_size` 循环读文件写 socket。
-  注意：当前实现**不解析 `Range`**，总是 200 全量返回，播放器拖动进度条会重下。
+  带单段 `Range` 时返回 `206` + `Content-Range`，支持 `bytes=start-end`、
+  `bytes=start-`、`bytes=-suffix`；多段或语法非法按 200 全量，越界单段返回
+  `416` + `Content-Range: bytes */<size>`。
+- `Content-Disposition` 同时给 ASCII fallback 的 `filename=` 与 RFC 5987 的
+  `filename*=UTF-8''...`，中文文件名不会触发 http.server 的 latin-1 编码错误。
 - 文件不存在或不是普通文件：`404` + 纯文本 `not found: <path>`。
 - 客户端断开（`BrokenPipeError` / `ConnectionResetError`）：立即停止，记录日志，
   不会把整个文件继续写完。
+- 传输中文件被截断或发生其它 `OSError`：记录 warning 并关闭连接，不再尝试
+  `send_error(500)`（头已发出会警告 headers already sent）；文件增长时按已声明的
+  `Content-Length` 截断，避免多发字节。
 - 下载在**请求线程**执行，不占 `self.lock`，也不进入执行器；因此慢下载期间
   其它 HTTP / MQTT RPC 不受影响。代价是它拿不到 `request` / `q` / `response` /
   `p` 等请求级上下文，也不会更新别名的 `hits` / `last_used`。

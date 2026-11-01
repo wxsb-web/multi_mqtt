@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -194,6 +195,34 @@ class AsgiApplicationTests(unittest.TestCase):
             headers=[("Range", "bytes=0-")])
         self.assertEqual(status, 200)
         self.assertEqual(out, b"abcdef")
+
+    def test_serve_file_range_is_not_resliced(self):
+        # 内层 #serve-file 已返回 206 片段；外层 Range 捕获不能再按原区间
+        # 切一次，否则字节和 Content-Range 都会错。
+        handle, path = tempfile.mkstemp(prefix='mm_asgi_serve_', suffix='.bin')
+        with os.fdopen(handle, 'wb') as file:
+            file.write(b'0123456789')
+        self.addCleanup(os.unlink, path)
+        executor = server_http.RPCRequestHandler.executor
+        previous = executor.aliases.get('blob')
+
+        def restore():
+            if previous is None:
+                executor.aliases.pop('blob', None)
+            else:
+                executor.aliases['blob'] = previous
+
+        self.addCleanup(restore)
+        executor.aliases['blob'] = {
+            'code': '#serve-file ' + json.dumps({'path': path}) + '\nr=1',
+            'created': 0, 'updated': 0, 'hits': 0, 'last_used': None,
+        }
+        status, headers, out = _call_asgi_path(
+            f'/{server_http_asgi.RPC_KEY}blob',
+            headers=[('Range', 'bytes=2-5')])
+        self.assertEqual(status, 206)
+        self.assertEqual(headers.get('Content-Range'), 'bytes 2-5/10')
+        self.assertEqual(out, b'2345')
 
 
 def _drive_websocket(path, handler):
