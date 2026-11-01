@@ -63,6 +63,7 @@ class FirstPacketStats:
         self._offline_latest = {}    # host -> 该 host 最近一次离线现场（有界）
         self._last_rx = {}        # host -> 最近一次下行到达的 monotonic 秒
         self._last_online = {}    # host -> 最近一次检查时 is_connected() 为真的 at_s
+        self._last_bcast_at = None   # 最近一次 publish_broadcast 的 at_s
         self._brokers = {}        # host -> 计数器 dict
         self._g = {
             "req_obs": 0, "req_foreign": 0,
@@ -245,6 +246,7 @@ class FirstPacketStats:
                                       "offline": offline_info,
                                       "online": online_now}
                 self._g["up_calls"] += 1
+                self._last_bcast_at = at_s
                 self._prune()
         except Exception:
             bid = None
@@ -543,6 +545,13 @@ class FirstPacketStats:
             stale_mids = sum(1 for bid, _t0 in self._mid.values()
                              if bid not in self._batches)
             uptime = time.monotonic() - self._t0
+            last_bcast_at = self._last_bcast_at
+            # 派生：离线之后又被检查到在线的 host（online_latest >
+            # offline_latest.at_s）。启动期离线、之后才连上的 host 会出现在这里。
+            recovered = sorted(
+                h for h, at in online_latest.items()
+                if h in offline_latest
+                and at > offline_latest[h].get("at_s", -1))
             if reset:
                 self._reset_locked()
         connectivity = self._connectivity()
@@ -675,6 +684,14 @@ class FirstPacketStats:
                     # 与 offline_latest 配对：online_latest > offline_latest.at_s
                     # 表示离线后已恢复；两者都停在启动期则说明广播只发生在启动期。
                     "online_latest": online_latest,
+                    # 派生：离线后又被检查到在线的 host 名单。
+                    "recovered_since_offline": recovered,
+                    # 最近一次 broadcast 距今多少秒；None=本窗口还没广播过。
+                    # 数值大说明广播早就停了，此时 offline/online_latest 停止
+                    # 更新是正常现象，不代表 host 现在仍离线。
+                    "broadcast_idle_s": (
+                        None if last_bcast_at is None
+                        else round(uptime - last_bcast_at, 1)),
                 },
                 "broker_distribution": ul_rows,
             },
@@ -732,6 +749,11 @@ class FirstPacketStats:
                      "启动初期而之后没有新广播，它不会更新，此时判断某 host 是否"
                      "已上线要看 pty_frames.hb_frames 与 uptime/5 的差值（每少 1 帧"
                      "≈ 晚 5 秒上线），而不是看 online_latest。"
+                     "recovered_since_offline=离线后又被检查到在线的 host 名单"
+                     "（online_latest > offline_latest.at_s）；"
+                     "broadcast_idle_s=最近一次 broadcast 距今秒数（None=还没广播），"
+                     "它很大时 offline/online_latest 停止更新属正常，不能读成"
+                     "“现在仍离线”。"
                      "注意 offline_hosts 与 pty_frames.hb_frames 可以看似矛盾："
                      "offline 只在 broadcast 那一刻采样，先看 offline_samples"
                      "的 at_s 是否集中在启动初期（那时确实还没连上），之后连上"
@@ -866,6 +888,7 @@ class FirstPacketStats:
         self._offline_latest.clear()
         self._last_rx.clear()
         self._last_online.clear()
+        self._last_bcast_at = None
         self._brokers.clear()
         for k in self._g:
             self._g[k] = 0 if isinstance(self._g[k], int) else None

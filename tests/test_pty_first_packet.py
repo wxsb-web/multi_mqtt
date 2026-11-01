@@ -369,6 +369,9 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(cov["offline_samples"], [])
         self.assertEqual(set(cov["online_latest"]), set(HOSTS))
         self.assertEqual(cov["offline_latest"], {})
+        self.assertEqual(cov["recovered_since_offline"], [])
+        self.assertIsNotNone(cov["broadcast_idle_s"])
+        self.assertGreaterEqual(cov["broadcast_idle_s"], 0.0)
         # 恒等式：attempted == seen + blind，且 seen 永远是 attempted 的子集
         self.assertLessEqual(cov["seen"], cov["attempted"])
         self.assertEqual(cov["attempted"], cov["seen"] + cov["blind"])
@@ -416,6 +419,21 @@ class FirstPacketStatsTests(unittest.TestCase):
         # 时间轴只剩最后 10 条（第 10-12 批），而 latest 覆盖到第 12 批
         self.assertGreaterEqual(cov["offline_latest"]["broker-a"]["at_s"],
                                 cov["offline_samples"][0]["at_s"])
+
+    def test_recovered_since_offline_detects_recovery(self):
+        """先离线后在线：recovered_since_offline 必须点名该 host。"""
+        c = self.net.clients["broker-b"]
+        c.is_connected = lambda: False
+        self.net.publish_broadcast("t", {"x": 1})      # broker-b 判离线
+        time.sleep(0.3)                                # 拉开 at_s 至少 0.1s
+        c.is_connected = lambda: True
+        self.net.publish_broadcast("t", {"x": 2})      # broker-b 判在线
+        cov = self.stats.get_report()["uplink_publish"]["coverage"]
+        self.assertEqual(cov["offline_latest"]["broker-b"]["host"], "broker-b")
+        self.assertGreater(cov["online_latest"]["broker-b"],
+                           cov["offline_latest"]["broker-b"]["at_s"])
+        self.assertEqual(cov["recovered_since_offline"], ["broker-b"])
+        self.assertGreaterEqual(cov["broadcast_idle_s"], 0.0)
 
     def test_uplink_late_host_keeps_seen_subset_of_attempted(self):
         """预测时离线、真正扇出时已连上：不得造成 seen > attempted。"""
@@ -510,6 +528,8 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(cov["attempted"], 0)
         self.assertEqual(cov["late_hosts"], {})
         self.assertEqual(cov["offline_samples"], [])
+        self.assertEqual(cov["recovered_since_offline"], [])
+        self.assertIsNone(cov["broadcast_idle_s"])
         self.assertEqual(rep["in_flight"]["mid_ttl_dropped"], 0)
 
 
