@@ -59,7 +59,8 @@ class FirstPacketStats:
         self._absent = {}         # host -> 不在 net.clients 快照里的批次数
         self._offline = {}        # host -> 在 clients 里但 is_connected() 为假的批次数
         self._late = {}           # host -> 快照后才连上、却已进 wrapper 的批次数
-        self._offline_samples = []   # 最多 10 条 offline 现场，定位“假离线”
+        self._offline_samples = []   # 最近 10 条 offline 现场（滚动，看时间轴）
+        self._offline_latest = {}    # host -> 该 host 最近一次离线现场（有界）
         self._last_rx = {}        # host -> 最近一次下行到达的 monotonic 秒
         self._brokers = {}        # host -> 计数器 dict
         self._g = {
@@ -293,6 +294,9 @@ class FirstPacketStats:
                 if h is None:
                     continue
                 self._offline[h] = self._offline.get(h, 0) + 1
+                # 同一 host 只保留最近一次现场：这样每个 host 的稳态离线
+                # 都不会被滚动窗口挤掉（滚动窗口只适合看时间轴）。
+                self._offline_latest[h] = dict(info)
                 self._offline_samples.append(dict(info))
             if len(self._offline_samples) > 10:
                 del self._offline_samples[:len(self._offline_samples) - 10]
@@ -518,6 +522,8 @@ class FirstPacketStats:
             absent = dict(self._absent)
             offline = dict(self._offline)
             late = dict(self._late)
+            offline_latest = {k: dict(v)
+                              for k, v in self._offline_latest.items()}
             offline_samples = [dict(s) for s in self._offline_samples]
             sids = dict(self._sids)
             pending_batches = len(self._batches)
@@ -651,6 +657,9 @@ class FirstPacketStats:
                     "offline_hosts": offline,
                     "absent_hosts": absent,
                     "offline_samples": offline_samples,
+                    # 每个 host 只留最近一次离线现场：稳态离线不会被时间轴
+                    # 滚动窗口挤掉，用于回答“它现在到底还离线吗”。
+                    "offline_latest": offline_latest,
                 },
                 "broker_distribution": ul_rows,
             },
@@ -691,10 +700,13 @@ class FirstPacketStats:
                      "扇出时已连上（旧口径下正是 seen>attempted 的来源），"
                      "offline_hosts=在 clients 里但当时 is_connected() 为假，"
                      "absent_hosts=配置里有但当时不在 net.clients。"
-                     "offline_samples（最多 10 条滚动样本）给出每次判离线时的 "
+                     "offline_samples（最近 10 条滚动样本）给出每次判离线时的 "
                      "at_s/state/socket/rx_age_s：rx_age_s 很小（该 host 刚收过"
                      "下行）却 is_connected()=False，说明是 paho 状态判断或 client"
                      " 对象错位（僵尸连接），不是真掉线；socket=False 才是真断。"
+                     "offline_latest 按 host 只留最近一次离线现场（数量受 host 数"
+                     "上限约束），因此稳态的离线事件不会像时间轴样本那样被挤掉；"
+                     "判断是启动初期还是稳态，先看它的 at_s。"
                      "注意 offline_hosts 与 pty_frames.hb_frames 可以看似矛盾："
                      "offline 只在 broadcast 那一刻采样，先看 offline_samples"
                      "的 at_s 是否集中在启动初期（那时确实还没连上），之后连上"
@@ -826,6 +838,7 @@ class FirstPacketStats:
         self._offline.clear()
         self._late.clear()
         self._offline_samples.clear()
+        self._offline_latest.clear()
         self._last_rx.clear()
         self._brokers.clear()
         for k in self._g:

@@ -391,6 +391,26 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertIn("state", sample)
         self.assertIn("socket", sample)
         self.assertGreaterEqual(sample["rx_age_s"], 0.0)
+        self.assertEqual(cov["offline_latest"]["broker-c"]["host"], "broker-c")
+
+    def test_offline_latest_keeps_steady_state_after_timeline_rolls(self):
+        """稳态离线不能被 10 条时间轴窗口挤掉：每个 host 都要留最近一次。"""
+        for c in self.net.clients.values():
+            c.is_connected = lambda: False
+        for _ in range(12):
+            self.net.publish_broadcast("t", {"x": 1})
+        cov = self.stats.get_report()["uplink_publish"]["coverage"]
+        self.assertEqual(cov["offline"], 36)          # 3 host × 12 批
+        self.assertEqual(len(cov["offline_samples"]), 10)
+        self.assertEqual(set(cov["offline_latest"]), set(HOSTS))
+        for host in HOSTS:
+            latest = cov["offline_latest"][host]
+            self.assertEqual(latest["host"], host)
+            self.assertEqual(latest["state"], "")
+            self.assertFalse(latest["socket"])
+        # 时间轴只剩最后 10 条（第 10-12 批），而 latest 覆盖到第 12 批
+        self.assertGreaterEqual(cov["offline_latest"]["broker-a"]["at_s"],
+                                cov["offline_samples"][0]["at_s"])
 
     def test_uplink_late_host_keeps_seen_subset_of_attempted(self):
         """预测时离线、真正扇出时已连上：不得造成 seen > attempted。"""
