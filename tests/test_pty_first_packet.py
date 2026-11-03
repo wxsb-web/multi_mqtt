@@ -137,14 +137,16 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(up["brokers_queued"]["min"], 3)
         self.assertEqual(up["send_ms"]["n"], 3)
         self.assertLessEqual(up["send_ms"]["min"], up["send_ms"]["max"])
-        rows = {r["broker"]: r for r in up["broker_distribution"]}
-        self.assertEqual(rows["broker-b"]["wins"], 1)
-        self.assertEqual(rows["broker-b"]["queued"], 1)
-        self.assertEqual(rows["broker-a"]["wins"], 0)
+        rows = rep["brokers"]
+        self.assertEqual(rows["broker-b"]["uplink"]["wins"], 1)
+        self.assertEqual(rows["broker-b"]["uplink"]["queued"], 1)
+        self.assertEqual(rows["broker-a"]["uplink"]["wins"], 0)
         self.assertEqual(rep["in_flight"]["mids"], 0)
         self.assertEqual(rep["in_flight"]["batches"], 0)
         # pending_sum 必须与在途 mid 数一致，否则说明有批次没被释放
         self.assertEqual(rep["in_flight"]["pending_sum"], 0)
+        # 峰值是历史高位：当前 mids 归零后仍保留 3 的记录
+        self.assertEqual(rep["in_flight"]["peak_mids"], 3)
 
     def test_uplink_failed_publish_not_counted_as_queued(self):
         net = self.net
@@ -152,10 +154,9 @@ class FirstPacketStatsTests(unittest.TestCase):
         net.publish_broadcast("t", {"x": 1})
         net.clients["broker-a"].next_rc = 0
         rep = self.stats.get_report()
-        rows = {r["broker"]: r for r in
-                rep["uplink_publish"]["broker_distribution"]}
-        self.assertEqual(rows["broker-a"]["queued"], 0)
-        self.assertEqual(rows["broker-a"]["failed"], 1)
+        rows = rep["brokers"]
+        self.assertEqual(rows["broker-a"]["uplink"]["queued"], 0)
+        self.assertEqual(rows["broker-a"]["uplink"]["failed"], 1)
         self.assertEqual(rep["uplink_publish"]["brokers_queued"]["min"], 2)
 
     def test_downlink_request_first_packet_and_latency(self):
@@ -184,15 +185,16 @@ class FirstPacketStatsTests(unittest.TestCase):
         pf = rep["pty_frames"]
         self.assertEqual(pf["unique"], 2)
         self.assertEqual(pf["duplicates"], 1)
-        rows = {r["broker"]: r for r in pf["broker_distribution"]}
-        self.assertEqual(rows["broker-b"]["wins"], 1)
-        self.assertEqual(rows["broker-b"]["dups"], 0)   # 重复副本由 a 先到
-        self.assertEqual(rows["broker-a"]["wins"], 1)
-        self.assertEqual(rows["broker-a"]["dups"], 1)
-        self.assertEqual(rows["broker-a"]["rx"], 4)
-        self.assertEqual(rows["broker-a"]["hb_frames"], 2)
-        self.assertEqual(rows["broker-a"]["hb_gap_ms"]["n"], 1)
-        self.assertGreaterEqual(rows["broker-a"]["hb_gap_ms"]["min"], 20.0)
+        rows = rep["brokers"]
+        self.assertEqual(rows["broker-b"]["downlink"]["wins"], 1)
+        self.assertEqual(rows["broker-b"]["downlink"]["dups"], 0)  # 重复副本由 a 先到
+        self.assertEqual(rows["broker-a"]["downlink"]["wins"], 1)
+        self.assertEqual(rows["broker-a"]["downlink"]["dups"], 1)
+        self.assertEqual(rows["broker-a"]["downlink"]["rx"], 4)
+        self.assertEqual(rows["broker-a"]["downlink"]["hb_frames"], 2)
+        self.assertEqual(rows["broker-a"]["downlink"]["hb_gap_ms"]["n"], 1)
+        self.assertGreaterEqual(
+            rows["broker-a"]["downlink"]["hb_gap_ms"]["min"], 20.0)
 
     def test_heartbeat_gap_uses_local_clock_only(self):
         """hb 里塞离谱的远端时间戳也不影响统计：只按本地到达间隔计算。"""
@@ -206,12 +208,14 @@ class FirstPacketStatsTests(unittest.TestCase):
         rep = self.stats.get_report()
         pf = rep["pty_frames"]
         self.assertNotIn("hb_baseline_ms", pf)
-        rows = {r["broker"]: r for r in pf["broker_distribution"]}
-        self.assertEqual(rows["broker-a"]["hb_frames"], 2)
-        self.assertEqual(rows["broker-a"]["hb_gap_ms"]["n"], 1)
-        self.assertGreaterEqual(rows["broker-a"]["hb_gap_ms"]["min"], 20.0)
-        self.assertLess(rows["broker-a"]["hb_gap_ms"]["max"], 500.0)
-        self.assertEqual(rows["broker-b"]["hb_frames"], 1)
+        rows = rep["brokers"]
+        self.assertEqual(rows["broker-a"]["downlink"]["hb_frames"], 2)
+        self.assertEqual(rows["broker-a"]["downlink"]["hb_gap_ms"]["n"], 1)
+        self.assertGreaterEqual(
+            rows["broker-a"]["downlink"]["hb_gap_ms"]["min"], 20.0)
+        self.assertLess(
+            rows["broker-a"]["downlink"]["hb_gap_ms"]["max"], 500.0)
+        self.assertEqual(rows["broker-b"]["downlink"]["hb_frames"], 1)
 
     def test_heartbeat_duplicate_delivery_is_deduped(self):
         """同一帧在同一 broker 被投递两次：记 hb_dups，不污染到达间隔。"""
@@ -220,19 +224,19 @@ class FirstPacketStatsTests(unittest.TestCase):
         net.downlink("pty/out", frame, "broker-a")
         net.downlink("pty/out", dict(frame), "broker-a")
         rep = self.stats.get_report()
-        rows = {r["broker"]: r for r in rep["pty_frames"]["broker_distribution"]}
-        self.assertEqual(rows["broker-a"]["hb_frames"], 1)
-        self.assertEqual(rows["broker-a"]["hb_dups"], 1)
-        self.assertNotIn("hb_gap_ms", rows["broker-a"])
+        row = rep["brokers"]["broker-a"]["downlink"]
+        self.assertEqual(row["hb_frames"], 1)
+        self.assertEqual(row["hb_dups"], 1)
+        # 新结构恒有 hb_gap_ms 键：没有不同心跳就没有间隔样本
+        self.assertEqual(row["hb_gap_ms"]["n"], 0)
+        self.assertIsNone(row["hb_gap_ms"]["min"])
 
     def test_subscription_count_tracks_live_filters_beside_hb_dups(self):
         """subscription_count 与 hb_dups 并列：新增/退订/失败订阅都要反映。"""
         net = self.net
 
         def row():
-            return {r["broker"]: r for r in
-                    self.stats.get_report()["pty_frames"][
-                        "broker_distribution"]}["broker-a"]
+            return self.stats.get_report()["brokers"]["broker-a"]["downlink"]
 
         net.downlink("pty/out", {"pty": "s1", "hb": 1}, "broker-a")
         # 种子 = manager 的规范订阅集合（reply + pty 两条）
@@ -255,6 +259,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         block = rep["in_flight"]
         self.assertEqual(block["ack_early_matched"], 1)
         self.assertEqual(block["ack_early_pending"], 0)
+        self.assertEqual(block["peak_ack_early_pending"], 1)
         self.assertEqual(block["ack_without_mid"], 0)
         self.assertEqual(block["ack_without_mid"],
                          block["ack_before_reg"] + block["ack_after_drop"])
@@ -262,8 +267,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(block["mids"], 2)
         self.assertEqual(block["mid_ttl_dropped"], 0)
         # 守恒：queued == send_ms.n + mid_ttl_dropped + mids
-        queued = sum(r["queued"] for r in
-                     rep["uplink_publish"]["broker_distribution"])
+        queued = sum(r["uplink"]["queued"] for r in rep["brokers"].values())
         self.assertEqual(queued, rep["uplink_publish"]["send_ms"]["n"]
                          + block["mid_ttl_dropped"] + block["mids"])
 
@@ -381,6 +385,8 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(rep["pty_frames"]["sessions"], 2)
         self.assertEqual(rep["subscriptions"]["topics"],
                          ["pty/out", "sys/device/response"])
+        self.assertEqual(rep["subscriptions"]["seeded"],
+                         {h: 2 for h in HOSTS})
 
     def test_unclassified_is_residual_of_rx(self):
         """unclassified = rx − wins − dups − hb_frames − hb_dups。"""
@@ -390,8 +396,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         net.downlink("pty/out", {"pty": "s1", "hb": 1}, "broker-a")        # hb 首帧
         net.downlink("pty/out", {"pty": "s1", "hb": 1}, "broker-a")        # hb 重复
         net.downlink("pty/out", {"pty": "s1", "ctrl": 1}, "broker-a")      # 无 seq/hb
-        row = {r["broker"]: r for r in
-               self.stats.get_report()["pty_frames"]["broker_distribution"]}["broker-a"]
+        row = self.stats.get_report()["brokers"]["broker-a"]["downlink"]
         self.assertEqual(row["rx"], 5)
         self.assertEqual(row["unclassified"], 1)
         self.assertEqual(row["unclassified"],
@@ -412,10 +417,9 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(rep["uplink_publish"]["first_packet_broker_batch"], 1)
         self.assertIsNotNone(
             rep["uplink_publish"]["first_packet_broker_at_s"])
-        rows = {r["broker"]: r for r in
-                rep["uplink_publish"]["broker_distribution"]}
-        self.assertEqual(rows["broker-b"]["wins"], 1)
-        self.assertEqual(rows["broker-a"]["wins"], 1)
+        rows = rep["brokers"]
+        self.assertEqual(rows["broker-b"]["uplink"]["wins"], 1)
+        self.assertEqual(rows["broker-a"]["uplink"]["wins"], 1)
 
     def test_stale_mid_is_reported_and_pruned_after_ttl(self):
         stats = self.stats
@@ -447,13 +451,15 @@ class FirstPacketStatsTests(unittest.TestCase):
         """同一 reply topic 上其他设备的回包：只计 observed/unmatched。"""
         self.net.downlink("reply", {"req_id": "20260101_000000.000",
                                     "r": "1"}, "broker-a")
-        rep = self.stats.get_report()["requests"]
+        full = self.stats.get_report()
+        rep = full["requests"]
         self.assertEqual(rep["n"], 0)
         self.assertEqual(rep["observed"], 1)
         self.assertEqual(rep["unmatched"], 1)
-        rows = {r["broker"]: r for r in rep["broker_distribution"]}
-        self.assertEqual(rows["broker-a"]["wins"], 0)
-        self.assertEqual(rows["broker-a"]["unmatched"], 1)
+        self.assertEqual(rep["unmatched_rate"], 1.0)
+        row = full["brokers"]["broker-a"]["downlink"]
+        self.assertEqual(row["req_wins"], 0)
+        self.assertEqual(row["unmatched"], 1)
         self.assertEqual(rep["latency_ms"]["n"], 0)
 
     def test_unmatched_reply_records_topic_broker_and_keys(self):
@@ -464,7 +470,8 @@ class FirstPacketStatsTests(unittest.TestCase):
                       "code": "print(1)"}, "broker-a")
         net.downlink("sys/device/response",
                      {"req_id": "20260101_000000.124"}, "broker-a")
-        req = self.stats.get_report()["requests"]
+        full = self.stats.get_report()
+        req = full["requests"]
         self.assertEqual(req["unmatched"], 2)
         self.assertEqual(req["unmatched_topics"], {"sys/device/response": 2})
         sample = req["unmatched_samples"][0]
@@ -473,8 +480,8 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(sample["keys"], ["code", "ok", "req_id"])
         self.assertGreaterEqual(sample["at_s"], 0.0)
         self.assertNotIn("print(1)", str(req["unmatched_samples"]))
-        rows = {r["broker"]: r for r in req["broker_distribution"]}
-        self.assertEqual(rows["broker-a"]["unmatched"], 2)
+        self.assertEqual(
+            full["brokers"]["broker-a"]["downlink"]["unmatched"], 2)
 
     def test_unmatched_samples_are_bounded(self):
         for i in range(20):
@@ -527,6 +534,10 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(rep, {"batches": 0, "mids": 0,
                                "pending_sum": 0, "stale_mids": 0,
                                "orphan_writes": 0, "mid_ttl_dropped": 3,
+                               "mid_ttl_dropped_by_broker": {
+                                   "broker-a": 1, "broker-b": 1,
+                                   "broker-c": 1},
+                               "peak_mids": 3, "peak_ack_early_pending": 0,
                                "ack_early_pending": 0,
                                "ack_early_matched": 0, "ack_before_reg": 0,
                                "ack_after_drop": 0, "ack_without_mid": 0,
@@ -678,11 +689,13 @@ class FirstPacketStatsTests(unittest.TestCase):
         net.downlink("sys/device/response",
                      {"req_id": "req-1", "server_from": "broker-a"},
                      "broker-c")
-        sa = self.stats.get_report()["uplink_publish"]["server_ack"]
+        rep = self.stats.get_report()
+        sa = rep["uplink_publish"]["server_ack"]
         self.assertEqual(sa["observed"], 1)
         self.assertEqual(sa["first_packet_broker"], "broker-a")
-        self.assertEqual(sa["broker_distribution"],
-                         [{"broker": "broker-a", "wins": 1, "win_pct": 100.0}])
+        ul = rep["brokers"]["broker-a"]["uplink"]
+        self.assertEqual(ul["server_ack_wins"], 1)
+        self.assertEqual(ul["server_ack_win_pct"], 100.0)
         self.assertEqual(sa["vs_send_first"],
                          {"agree": 1, "disagree": 0, "disagree_hosts": {}})
 
@@ -706,11 +719,13 @@ class FirstPacketStatsTests(unittest.TestCase):
         # 未匹配本机 pending 的回包：不参与 server_ack
         net.downlink("reply", {"req_id": "other", "server_from": "broker-a"},
                      "broker-a")
-        sa = self.stats.get_report()["uplink_publish"]["server_ack"]
+        rep = self.stats.get_report()
+        sa = rep["uplink_publish"]["server_ack"]
         self.assertEqual(sa["observed"], 1)
         self.assertEqual(sa["first_packet_broker"], "broker-b")
-        self.assertEqual(sa["broker_distribution"],
-                         [{"broker": "broker-b", "wins": 1, "win_pct": 100.0}])
+        ul = rep["brokers"]["broker-b"]["uplink"]
+        self.assertEqual(ul["server_ack_wins"], 1)
+        self.assertEqual(ul["server_ack_win_pct"], 100.0)
         self.assertEqual(sa["vs_send_first"],
                          {"agree": 0, "disagree": 1,
                           "disagree_hosts": {"broker-b": 1}})
@@ -756,7 +771,8 @@ class FirstPacketStatsTests(unittest.TestCase):
         # 因此下一次 _wrap_clients() 会跳过它。
         c.publish = raw_publish
         net.publish_broadcast("t", {"x": 1})
-        rep = self.stats.get_report()["uplink_publish"]
+        full = self.stats.get_report()
+        rep = full["uplink_publish"]
         cov = rep["coverage"]
         self.assertEqual(cov["predicted"], 3)
         self.assertEqual(cov["attempted"], 3)
@@ -765,10 +781,9 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(cov["blind_hosts"], {"broker-a": 1})
         self.assertEqual(cov["late"], 0)
         self.assertEqual(cov["attempted"], cov["seen"] + cov["blind"])
-        # broker-a 上行样本为 0，因此它会从 broker_distribution 里整行消失；
-        # 这正是需要 blind_hosts 点名它的原因。
-        rows = {r["broker"]: r for r in rep["broker_distribution"]}
-        self.assertNotIn("broker-a", rows)
+        # broker-a 上行样本为 0：统一视图里该行仍在但 queued 恒为 0，
+        # blind_hosts 点名它，不让它从报表里静默消失。
+        self.assertEqual(full["brokers"]["broker-a"]["uplink"]["queued"], 0)
 
     def test_report_prunes_stale_mid_without_uplink_traffic(self):
         """get_report 自己触发一次 _prune，长时间没有上行也要能回收超时 mid。"""
@@ -801,7 +816,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(rep["requests"]["n"], 0)
         self.assertEqual(rep["pty_frames"]["unique"], 0)
         self.assertEqual(rep["uplink_publish"]["calls"], 0)
-        self.assertEqual(rep["uplink_publish"]["broker_distribution"], [])
+        self.assertEqual(rep["brokers"], {})
         self.assertIsNone(rep["uplink_publish"]["first_packet_broker"])
         cov = rep["uplink_publish"]["coverage"]
         self.assertEqual(cov["predicted"], 0)
@@ -812,7 +827,6 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertIsNone(cov["broadcast_idle_s"])
         sa = rep["uplink_publish"]["server_ack"]
         self.assertEqual(sa["observed"], 0)
-        self.assertEqual(sa["broker_distribution"], [])
         self.assertIsNone(sa["first_packet_broker"])
         self.assertEqual(sa["vs_send_first"],
                          {"agree": 0, "disagree": 0, "disagree_hosts": {}})
@@ -821,6 +835,108 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertEqual(rep["in_flight"]["ack_early_pending"], 0)
         self.assertEqual(rep["in_flight"]["ack_early_matched"], 0)
         self.assertEqual(rep["in_flight"]["ack_foreign"], 0)
+
+
+    def test_reset_does_not_lock_min_at_zero(self):
+        """回归：reset 后 min 类字段回到 None 重新采样，不得被归零锁死。"""
+        net = self.net
+        net.publish_broadcast("t", {"x": 1})      # 3 个 broker 全入队
+        rep = self.stats.get_report()
+        self.assertEqual(rep["uplink_publish"]["brokers_queued"]["min"], 3)
+        self.assertIsNone(rep["requests"]["latency_ms"]["min"])
+        self.stats.get_report(reset=True)
+        net.publish_broadcast("t", {"x": 2})
+        rep = self.stats.get_report()
+        # 旧 bug：reset 把 up_pub_min 归成 0，新窗口 min 永远是 0
+        self.assertEqual(rep["uplink_publish"]["brokers_queued"]["min"], 3)
+        self.assertEqual(rep["uplink_publish"]["brokers_queued"]["avg"], 3.0)
+        self.assertIsNone(rep["requests"]["latency_ms"]["min"])
+
+    def test_latency_blocks_carry_percentiles_and_jitter(self):
+        """延迟块带 p50/p90/p95/p99 与 jitter(=std)，来自滚动样本库。"""
+        net = self.net
+        now = time.perf_counter()
+        with self.tr.node.lock:
+            for i in range(5):
+                self.tr.node.pending_requests["rq-%d" % i] = {
+                    "start_time": now - 0.010 * (i + 1)}
+        for i in range(5):
+            net.downlink("sys/device/response", {"req_id": "rq-%d" % i},
+                         "broker-a")
+        lat = self.stats.get_report()["requests"]["latency_ms"]
+        for q in ("p50", "p90", "p95", "p99"):
+            self.assertIsNotNone(lat[q])
+        self.assertEqual(lat["jitter"], lat["std"])
+        self.assertEqual(lat["n"], 5)
+        # 分位数来自样本库：值必须落在 [min, max] 区间内
+        self.assertGreaterEqual(lat["p50"], lat["min"])
+        self.assertLessEqual(lat["p99"], lat["max"])
+
+    def _age_conn(self, seconds=10.0):
+        """把统计窗口与连接记录整体回拨：快速测试里 uptime 可能不足一个
+        时钟刻度（span=0 时 online_ratio 为 None），回拨后才有可判定的比率。"""
+        with self.stats._lock:
+            self.stats._t0 -= seconds
+            for rec in self.stats._conn_state.values():
+                rec["since"] -= seconds
+
+    def test_connection_events_track_online_ratio(self):
+        """on_connect/on_disconnect 翻状态计数，online_ratio 是累计口径。"""
+        c = self.net.clients["broker-a"]
+        c.on_disconnect(c, None)          # 包装器已挂在 client 上
+        c.on_connect(c, None)
+        c.on_disconnect(c, None)
+        self._age_conn()
+        conn = self.stats.get_report()["brokers"]["broker-a"]["connection"]
+        self.assertEqual(conn["connect_events"], 1)
+        self.assertEqual(conn["disconnect_events"], 2)
+        self.assertEqual(conn["reconnect_count"], 0)   # connect_events-1
+        self.assertEqual(conn["current"], "offline")
+        self.assertIsNotNone(conn["last_disconnect_at_s"])
+        self.assertGreaterEqual(conn["online_ratio"], 0.0)
+        self.assertLessEqual(conn["online_ratio"], 1.0)
+
+    def test_health_block_summarizes_scores_without_advice(self):
+        """health 层只陈述数据：评分 + 按阈值归类的名单，不含任何主观建议。"""
+        c = self.net.clients["broker-c"]
+        c.on_disconnect(c, None)      # 全窗口离线 -> online_ratio<0.5 -> dead
+        self._age_conn()
+        health = self.stats.get_report()["health"]
+        self.assertIsInstance(health["overall_score"], float)
+        self.assertIn("broker-c", health["degraded_brokers"])
+        self.assertNotIn("recommendation", health)
+        self.assertNotIn("建议", str(health))
+
+    def test_snapshots_diff_counters_per_window(self):
+        """时间切片：累计计数与锚点求差；窗口内 min/max/分位为 None。"""
+        net = self.net
+        with self.tr.node.lock:
+            self.tr.node.pending_requests["req-1"] = {
+                "start_time": time.perf_counter() - 0.020}
+        net.downlink("sys/device/response", {"req_id": "req-1"}, "broker-a")
+        # 回拨窗口起点，逼出一次滚动封窗
+        self.stats._snap_at = time.monotonic() - self.stats._SNAP_INTERVAL - 1
+        rep = self.stats.get_report()
+        self.assertEqual(len(rep["snapshots"]), 1)
+        win = rep["snapshots"][0]
+        self.assertGreater(win["window_end_s"], win["window_start_s"])
+        row = win["brokers"]["broker-a"]
+        self.assertEqual(row["downlink"]["latency_ms"]["n"], 1)
+        self.assertIsNone(row["downlink"]["latency_ms"]["min"])
+        self.assertIsNone(row["downlink"]["latency_ms"]["max"])
+        self.assertIsNotNone(row["downlink"]["latency_ms"]["avg"])
+        self.assertIsNone(row["trend"])   # 窗口行本身不带趋势
+
+    def test_brokers_view_covers_quiet_hosts_and_is_dict(self):
+        """统一视图：按 host 键 O(1) 查找，安静的节点也有完整行。"""
+        rep = self.stats.get_report()
+        self.assertEqual(set(rep["brokers"]), set(HOSTS))
+        row = rep["brokers"]["broker-b"]
+        for sec in ("connection", "downlink", "uplink"):
+            self.assertIn(sec, row)
+        self.assertIn(row["role"], ("primary", "backup", "degraded", "dead"))
+        self.assertIn(row["trend"], (None, "stable", "improving",
+                                     "degrading", "oscillating"))
 
 
 if __name__ == "__main__":
