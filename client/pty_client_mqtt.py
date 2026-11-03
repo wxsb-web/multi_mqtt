@@ -2074,7 +2074,8 @@ class FirstPacketStats:
                 "unique": g["dl_unique"],
                 "duplicates": g["dl_dups"],
                 # 本窗口见过多少个不同 sid，= 条并发/残留的 PTY 会话数。
-                # >1 时每个会话各自发心跳，hb_frames 会大于 uptime/心跳间隔。
+                # 心跳是全局唯一源、与会话数无关：不论几个会话都约每 5s 一帧，
+                # 因此 sessions>1 不会让 hb_frames 变成 sessions×uptime/5。
                 "sessions": len(sids),
                 "first_frame_broker": self._first_frame_broker(sids, brokers),
                 "broker_distribution": dl_rows,
@@ -2196,7 +2197,8 @@ class FirstPacketStats:
                      "client 残留）；subscription_count>1 且 hb_dups=0 是形态 C"
                      "（filter 不重叠，正常，不算双投）。unclassified=rx − wins"
                      " − dups − hb_frames − hb_dups，是既无 sid/seq、也不是心跳"
-                     "的未分类下行帧数。stale_mids="
+                     "的未分类下行帧数；unclassified>0 通常与多会话或新消息类型"
+                     "同时出现，字段本身只表示残差，不代表统计错误。stale_mids="
                      "仍留在 _mid 里、但所属批次已不在 _batches 的 mid 数。"
                      "requests.observed=所有带 req_id 的帧，unmatched=匹配不到"
                      "本机 pending_requests（共用 reply topic 时多为其他设备的"
@@ -2271,9 +2273,9 @@ class FirstPacketStats:
                      "（online_latest > offline_latest.at_s）：只包含被广播检查到"
                      "恢复的 host；若广播停止后 host 才恢复（如 dashboard/hivemq），"
                      "它不会出现在此列表，需看 hb_frames 与 uptime/5 的差值判断"
-                     "实际上线时间（前提是 pty_frames.sessions==1；sessions>1 时"
-                     "每个会话各自发心跳，hb_frames 约为 sessions×uptime/5，不能"
-                     "直接用 uptime/5 推上线时间）。"
+                     "实际上线时间（心跳是全局唯一源：不论 sessions 多少都约每"
+                     " 5s 一帧，hb_frames ≈ uptime/5 与 sessions 无关，多会话"
+                     "不会让帧数翻倍；明显少于 uptime/5 才是丢帧或晚上线）。"
                      "recovery_same_tick=online_latest 与 offline_latest.at_s 相等的"
                      "host：at_s 只精确到 0.1s，相等表示同一粒度内既检查到离线也"
                      "检查到在线，先后不可判，故单列而不并入 recovered_since_offline"
