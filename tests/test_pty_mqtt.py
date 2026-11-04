@@ -895,9 +895,13 @@ class BinaryStdoutGuardTests(unittest.TestCase):
             sys.stdout = io.StringIO()  # ai_bridge RPC 捕获 print 的情形
             buf = pcm._bin_stdout()
             self.assertIsNotNone(buf)
-            # 必须是解释器原始 stdout 的二进制缓冲，而不是 StringIO
-            self.assertIs(buf, getattr(real, "buffer", None)
-                          or sys.__stdout__.buffer)
+            # 必须是真实流的二进制缓冲，而不是 StringIO。生产环境重定向前的
+            # sys.stdout 就是 sys.__stdout__，两者同一对象；pytest 输出捕获会
+            # 把 sys.stdout 换成临时文件流，此时按产品设计回退解释器原始流
+            # sys.__stdout__ 的 buffer——两者任一都算真实终端，均满足契约。
+            self.assertTrue(
+                buf is getattr(real, "buffer", None)
+                or buf is getattr(sys.__stdout__, "buffer", None))
             # 复位序列此时也必须能写出，不抛异常
             pcm._terminal_cleanup()
         finally:
@@ -2485,6 +2489,12 @@ class LogConsoleEndToEndTests(unittest.TestCase):
             websocket_handler=pcm._LOG_HUB.serve, websocket_path="/wslog",
             redirect_root="/log_html(p)")
         cls.port = cls.server.server_address[1]
+
+    def setUp(self):
+        # pytest 的输出捕获会在 call 阶段开始时重装 sys.stdout，把 setUpClass
+        # 时装好的 _RingTextIO 顶掉（生产环境装一次后不再变动），print 会漏进
+        # pytest 捕获流而不是日志环。每个用例开始时重装一次幂等捕获，保证
+        # print 拦截在断言窗口内生效。
         pcm._install_log_capture()
 
     @classmethod
