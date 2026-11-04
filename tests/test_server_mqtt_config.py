@@ -1518,12 +1518,61 @@ class JsonPreserveWriteTests(unittest.TestCase):
             '{\n  "pub_key": "abc",\n'
             '  "request_topic": "TestDevice_123456"\n}\n')
 
-    def test_invalid_file_falls_back_to_full_write(self):
+    def test_invalid_file_rejected_without_force(self):
+        # 非空错误文件默认拒绝覆盖：抛 ValueError 且文件一个字节不动
+        text = '{ broken json'
+        self._write_text(text)
+        with self.assertRaises(ValueError):
+            rpc_config.update_json_document(self.config_path, {"a": 1})
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"), text)
+
+    def test_invalid_file_full_write_with_force(self):
         self._write_text('{ broken json')
-        rpc_config.update_json_document(self.config_path, {"a": 1})
+        rpc_config.update_json_document(self.config_path, {"a": 1},
+                                        force_write=True)
         self.assertEqual(
             json.loads(self.config_path.read_text(encoding="utf-8")),
             {"a": 1})
+
+    def test_empty_file_written_without_force(self):
+        self._write_text('')
+        rpc_config.update_json_document(self.config_path, {"a": 1})
+        self.assertEqual(
+            json.loads(self.config_path.read_text(encoding="utf-8")), {"a": 1})
+
+    def test_missing_file_written_without_force(self):
+        rpc_config.update_json_document(self.config_path, {"a": 1})
+        self.assertEqual(
+            json.loads(self.config_path.read_text(encoding="utf-8")), {"a": 1})
+
+    def test_write_rpc_config_updates_force_passthrough(self):
+        self._write_text('{ broken json')
+        with self.assertRaises(ValueError):
+            rpc_config._write_rpc_config_updates(
+                {"request_topic": "t"}, self.config_path)
+        rpc_config._write_rpc_config_updates(
+            {"request_topic": "t"}, self.config_path, force_write=True)
+        self.assertEqual(
+            json.loads(self.config_path.read_text(encoding="utf-8")),
+            {"request_topic": "t"})
+
+    def test_set_rpc_config_force_write_parameter(self):
+        # set_rpc_config 默认拒绝覆盖非空错误文件，force_write=True 才整文件写
+        text = '{ broken json'
+        self._write_text(text)
+        with mock.patch.object(server_mqtt, "gms", None), \
+                mock.patch.object(server_mqtt, "_RPC_SERVERS",
+                                  weakref.WeakSet()):
+            with self.assertRaises(ValueError):
+                server_mqtt.set_rpc_config(
+                    path=self.config_path, request_topic="t/request")
+            self.assertEqual(self.config_path.read_text(encoding="utf-8"), text)
+            server_mqtt.set_rpc_config(
+                path=self.config_path, force_write=True,
+                request_topic="t/request")
+        self.assertEqual(
+            json.loads(self.config_path.read_text(encoding="utf-8")),
+            {"request_topic": "t/request"})
 
 
 if __name__ == "__main__":

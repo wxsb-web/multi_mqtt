@@ -113,9 +113,10 @@ def load_rpc_config(path=None):
         RPC_CONFIG_PATH if path is None else path)
 
 
-def _write_rpc_config_updates(updates, path=None):
+def _write_rpc_config_updates(updates, path=None, force_write=False):
     return _rpc_config._write_rpc_config_updates(
-        updates, RPC_CONFIG_PATH if path is None else path)
+        updates, RPC_CONFIG_PATH if path is None else path,
+        force_write=force_write)
 
 
 def _resolve_request_topic(request_topic=None, stored=None):
@@ -143,8 +144,13 @@ def _primary_server(servers=None):
     return servers[-1] if servers else None
 
 
-def set_rpc_config(*, path=None, **updates):
+def set_rpc_config(*, path=None, force_write=False, **updates):
     """持久化并立即应用到**所有**存活的服务端实例。
+
+    ``force_write``：写入语义见 ``rpc_config.update_json_document``——正确 JSON
+    或空文件/缺失文件直接写（文本级按键改写保留原格式）；非空且非法的错误文件
+    默认抛 ``ValueError`` 拒绝覆盖（保护用户手写内容），只有 ``force_write=True``
+    才退化为整文件标准化写入。
 
     三种写法：
     1. ``rpc_config(request_topic="new")``：热应用到所有实例并写入默认文件
@@ -211,7 +217,7 @@ def set_rpc_config(*, path=None, **updates):
             for server, candidate in zip(servers, candidates):
                 server.apply_rpc_config(candidate)
                 applied.append(server)
-            _write_rpc_config_updates(updates, config_path)
+            _write_rpc_config_updates(updates, config_path, force_write=force_write)
         except Exception:
             for server, prev in zip(applied, previous):
                 try:
@@ -460,8 +466,12 @@ class MQTTServer:
         """
         return _json_rpc_config(self._rpc_config_snapshot())
 
-    def set_rpc_config(self, *, path=None, **updates):
+    def set_rpc_config(self, *, path=None, force_write=False, **updates):
         """对象级 set：写入/加载配置。
+
+        ``force_write`` 语义同模块级 ``set_rpc_config``：正确 JSON 或空文件/
+        缺失文件直接写；非空且非法的错误文件默认抛 ``ValueError`` 拒绝覆盖，
+        仅 ``force_write=True`` 时整文件标准化写入。
 
         1. ``rpc_config(request_topic="new")``：热应用并写入本实例默认文件
            ``self.rpc_config_path``；
@@ -496,7 +506,7 @@ class MQTTServer:
             candidate = _merge_rpc_updates(previous, updates)
             self.apply_rpc_config(candidate)
             try:
-                _write_rpc_config_updates(updates, config_path)
+                _write_rpc_config_updates(updates, config_path, force_write=force_write)
             except Exception:
                 self.apply_rpc_config(previous)
                 raise

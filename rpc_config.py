@@ -572,14 +572,17 @@ def _remove_entry(text, entries, key):
     return text[:start] + text[end:]
 
 
-def update_json_document(path, updates=None, deletes=()):
+def update_json_document(path, updates=None, deletes=(), force_write=False):
     """按键文本级改写 JSON 文件：只动被改键对应文本，其余字节原样保留。
 
     - 已有键：原位把值文本替换为单行紧凑 JSON；
     - 新增键：按最后一个顶层键的缩进追加一行（单行文件行内追加）；
     - 删除键：连同相邻逗号一并移除；
-    - 文件缺失 / 非法 JSON / 顶层非 object：无可保留结构，退化为
-      :func:`write_json_document` 整文件写入（只含 updates 键）。
+    - 文件缺失 / 空文件：无可保留结构，直接整文件写入（只含 updates 键），
+      不需要 force_write；
+    - 非空错误文件（非法 JSON / 顶层非 object）：默认抛 ValueError 拒绝
+      覆盖，保护用户手写内容；只有 ``force_write=True`` 才退化为
+      :func:`write_json_document` 整文件标准化写入（只含 updates 键）。
 
     不加锁，调用方持 CONFIG_LOCK（与 write_json_document 同约定）。
     """
@@ -589,18 +592,31 @@ def update_json_document(path, updates=None, deletes=()):
     if not updates and not deletes:
         return
     text = None
-    if config_path.exists():
+    error = None
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw = None                       # 文件缺失：新建，直接写
+    except (OSError, ValueError, TypeError) as read_error:
+        raw = None
+        error = read_error               # 读不出内容，无法证明为空，按错误文件处理
+    if raw is not None and raw.strip():
         try:
-            text = config_path.read_text(encoding="utf-8")
-            document = json.loads(text)
+            document = json.loads(raw)
             if not isinstance(document, dict):
                 raise ValueError("顶层不是 object")
-            _top_level_entries(text)
-        except (OSError, ValueError, TypeError) as error:
-            logger.warning("rpc.json 无法保留原结构，整文件标准化写入: %s: %s",
-                           config_path, error)
-            text = None
+            _top_level_entries(raw)
+            text = raw
+        except (ValueError, TypeError) as parse_error:
+            error = parse_error
+    if text is None and error is not None and not force_write:
+        raise ValueError(
+            f"rpc.json 非空且无法解析，拒绝覆盖（如需强制覆盖请传 force_write=True）: "
+            f"{config_path}: {error}") from error
     if text is None:
+        if error is not None:
+            logger.warning("rpc.json 无法保留原结构，force_write 整文件标准化写入: %s: %s",
+                           config_path, error)
         write_json_document(config_path, dict(updates))
         return
     for key, value in updates.items():
@@ -627,9 +643,13 @@ def _read_rpc_config_document(path=None):
     with CONFIG_LOCK:
         try:
             with config_path.open("r", encoding="utf-8") as config_file:
-                stored = json.load(config_file)
+                raw = config_file.read()
         except FileNotFoundError:
-            stored = {}
+            return {}
+        if not raw.strip():
+            return {}                      # 空文件视为未配置，直接写不需要 force_write
+        try:
+            stored = json.loads(raw)
         except json.JSONDecodeError as error:
             raise ValueError(f"RPC 配置文件 JSON 格式错误: {config_path}: {error}") from error
         if not isinstance(stored, dict):
@@ -835,23 +855,28 @@ def _validate_explicit_updates(updates):
         _validate_rpc_config(trial)
 
 
-def _write_rpc_config_updates(updates, path=None):
-    """只持久化用户显式修改的项，避免把内置 broker 凭据复制进配置文件。"""
+def _write_rpc_config_updates(updates, path=None, force_write=False):
+    """只持久化用户显式修改的项，避免把内置 broker 凭据复制进配置文件。
+
+    force_write 语义与 :func:`update_json_document` 一致：正确或空 rpc.json
+    直接写；非空错误文件默认抛 ValueError 拒绝覆盖，force_write=True 才重写。
+    """
     config_path = Path(path) if path is not None else DEFAULT_RPC_CONFIG_PATH
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with CONFIG_LOCK:
         try:
             with config_path.open("r", encoding="utf-8") as config_file:
-                stored = json.load(config_file)
+                raw = config_file.read()
+            stored = json.loads(raw) if raw.strip() else {}
         except FileNotFoundError:
             stored = {}
         except json.JSONDecodeError as error:
-            # 文件坏了也要能写回（如首启生成本机 topic）：按空配置重写，
-            # 否则脏 rpc.json 会让启动路径抛异常。
-            logger.warning("rpc.json JSON 格式错误，按空配置重写: %s: %s", config_path, error)
+            # 非空错误文件：是否覆盖由 update_json_document 的 force_write 把关，
+            # 这里只按空配置算出写回内容，绝不静默重写用户文件。
+            logger.warning("rpc.json JSON 格式错误: %s: %s", config_path, error)
             stored = {}
         if not isinstance(stored, dict):
-            logger.warning("rpc.json 不是 JSON object，按空配置重写: %s", config_path)
+            logger.warning("rpc.json 不是 JSON object，按空配置处理: %s", config_path)
             stored = {}
         # 校验用净化后的配置（脏键回落默认值），写回仍以用户文件的原始键为准
         source = _sanitize_rpc_document(stored, config_path)
@@ -867,7 +892,7 @@ def _write_rpc_config_updates(updates, path=None):
             elif key in serialized:
                 patch[key] = serialized[key]
         # 文本级按键改写：只动被改键的一行，保留用户手写缩进与其余内容
-        update_json_document(config_path, patch)
+        update_json_document(config_path, patch, force_write=force_write)
 
 
 def _read_request_topic_map(stored):
@@ -950,7 +975,12 @@ def _resolve_request_topic(request_topic=None, stored=None, path=None):
         )
         return REQUEST_TOPIC
 
-    _write_rpc_config_updates({"request_topic": machine_topic}, path)
+    try:
+        _write_rpc_config_updates({"request_topic": machine_topic}, path)
+    except (ValueError, OSError) as error:
+        # 唯一自动写入点：非空错误文件按 force_write 规则拒绝覆盖（保护用户
+        # 手写内容），topic 照常在内存生效，只是不持久化，绝不阻断启动。
+        logger.warning("request_topic 未持久化（rpc.json 拒绝覆盖）: %s", error)
     return machine_topic
 
 
