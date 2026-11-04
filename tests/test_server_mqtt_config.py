@@ -1365,6 +1365,23 @@ class BrokerAddForceTests(unittest.TestCase):
         self.assertIsNone(rpc_config.parse_broker_add("host:99999"))
         self.assertIsNone(rpc_config.parse_broker_add(":1883"))
 
+    def test_empty_auth_list_equals_no_auth(self):
+        # ["host", port, []] 等价于 ["host", port]，不再判认证信息非法
+        self.assertEqual(
+            rpc_config._normalize_broker_list(
+                [["192.168.1.20", 1883, []]], "broker_list_add"),
+            [("192.168.1.20", 1883)])
+        self._write({
+            "broker_list_add": [["192.168.1.20", 1883, []]],
+        })
+        self.assertIn(
+            ("192.168.1.20", 1883),
+            server_mqtt.load_broker_list(path=self.config_path, module="pty"))
+        # 单元素认证列表仍属非法
+        with self.assertRaises(ValueError):
+            rpc_config._normalize_broker_list(
+                [["192.168.1.20", 1883, ["user"]]], "broker_list_add")
+
     def test_forced_add_bypasses_mask_and_del(self):
         self._write({
             "broker_list": [["broker-a.example", 1883], ["broker-b.example", 1884]],

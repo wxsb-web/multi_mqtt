@@ -136,12 +136,15 @@ def _normalize_broker_list(brokers, name, allow_empty=False):
         broker = [host.strip(), port]
         if len(entry) == 3:
             auth = entry[2]
-            if not (
-                isinstance(auth, str)
-                or isinstance(auth, (list, tuple)) and len(auth) >= 2
-            ):
-                raise ValueError(f"{name}[{index}] 的认证信息格式无效")
-            broker.append(list(auth) if isinstance(auth, tuple) else auth)
+            if isinstance(auth, (list, tuple)) and not auth:
+                auth = None   # 空认证列表 [] 等价于不带认证的两元素条目
+            if auth is not None:
+                if not (
+                    isinstance(auth, str)
+                    or isinstance(auth, (list, tuple)) and len(auth) >= 2
+                ):
+                    raise ValueError(f"{name}[{index}] 的认证信息格式无效")
+                broker.append(list(auth) if isinstance(auth, tuple) else auth)
         normalized_brokers.append(tuple(broker))
     return normalized_brokers
 
