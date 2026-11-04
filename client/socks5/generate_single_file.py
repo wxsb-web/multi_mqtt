@@ -143,6 +143,7 @@ from .remote_cmd import (                   # noqa: E402
 )
 
 from multi_mqtt import stime, BROKER_LIST, MultiMQTTManager  # noqa: E402
+from rpc_config import load_broker_list  # noqa: E402  broker 直读通道（rpc.json 三键合成 + 按模块屏蔽）
 from server_http import start_rpc_server   # noqa: E402  复用 /r= 表达式求值 RPC
 
 logger = logging.getLogger("socks5_client_mqtt")

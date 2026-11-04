@@ -43,7 +43,7 @@ from client.remote_cmd import (  # noqa: E402
     build_pty_start_code, PTY_FRAME_MAX,
 )
 from rpc_executor import PythonExecutor  # noqa: E402
-from multi_mqtt import BROKER_LIST  # noqa: E402
+from rpc_config import load_broker_list  # noqa: E402
 from client import pty_client_mqtt as pcm  # noqa: E402
 
 IS_POSIX = os.name == "posix"
@@ -409,7 +409,7 @@ class RemotePtyClientTests(unittest.TestCase):
     def test_broker_status_without_node_falls_back_to_config_count(self):
         online, total, hosts = pcm._broker_status(FakeTransport())
         self.assertEqual((online, hosts), (0, []))
-        self.assertEqual(total, len(BROKER_LIST))
+        self.assertEqual(total, len(load_broker_list(module="pty")))
 
     def test_broker_status_counts_only_connected_clients(self):
         from types import SimpleNamespace

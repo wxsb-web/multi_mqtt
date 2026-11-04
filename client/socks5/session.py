@@ -20,7 +20,8 @@ from ..remote_cmd import (
     bytes_to_wire, wire_to_bytes, DEFAULT_TIMEOUT, PTY_FRAME_MAX,
     _parse_pty_responders,
 )
-from multi_mqtt import BROKER_LIST, MultiMQTTManager
+from multi_mqtt import MultiMQTTManager
+from rpc_config import load_broker_list
 
 from .config import (
     _BULK_INTV, _BULK_READY_WAIT, _CACHE_MAX, _GAP_DEFAULT, _HB_FLOOR_WIN,
@@ -623,7 +624,7 @@ class RemoteSocks5:
             old = self._bnet
             nn = None
             try:
-                sub = [b for b in BROKER_LIST if b[0] in want]
+                sub = [b for b in load_broker_list(module="socks5") if b[0] in want]
                 if len(sub) != len(want):
                     return
                 # 先建新再停旧：重建罕见（名单有在位者保护），零数据窗口

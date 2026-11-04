@@ -106,6 +106,7 @@ from .remote_cmd import (                   # noqa: E402
 )
 
 from multi_mqtt import stime, BROKER_LIST, MultiMQTTManager  # noqa: E402
+from rpc_config import load_broker_list  # noqa: E402  broker 直读通道（rpc.json 三键合成 + 按模块屏蔽）
 from server_http import start_rpc_server   # noqa: E402  复用 /r= 表达式求值 RPC
 
 logger = logging.getLogger("socks5_client_mqtt")
@@ -386,7 +387,9 @@ def _cmq_socks5_start():
                         _old = _bnet
                         try:
                             _cls = _g.get("MultiMQTTManager") or type(_net)
-                            _bl = _g.get("BROKER_LIST")
+                            _fn = _g.get("load_broker_list")
+                            _bl = _fn(module="socks5") if callable(_fn) \
+                                else _g.get("BROKER_LIST")
                             _bsub = [_b for _b in _bl if _b[0] in _want] \
                                 if _bl else []
                             if len(_bsub) == len(_want):
@@ -1937,7 +1940,7 @@ class RemoteSocks5:
             old = self._bnet
             nn = None
             try:
-                sub = [b for b in BROKER_LIST if b[0] in want]
+                sub = [b for b in load_broker_list(module="socks5") if b[0] in want]
                 if len(sub) != len(want):
                     return
                 # 先建新再停旧：重建罕见（名单有在位者保护），零数据窗口
@@ -2643,13 +2646,13 @@ def main(argv=None) -> int:
 
     signed = bool(str(args.key or "").strip())
     _info("正在并发连接 %d 个公共 MQTT broker（首个连上即继续）..."
-          % len(BROKER_LIST))
+          % len(load_broker_list(module="socks5")))
     _info("request_topic=%s  reply_topic=%s  请求签名=%s  允许未验签回包=%s"
           % (args.request_topic, args.reply_topic,
              "是" if signed else "否", "是" if args.allow else "否"))
     transport = MqttTransport(
         request_topic=args.request_topic, reply_topic=args.reply_topic,
-        private_key=args.key, allow_no_pub=args.allow)
+        private_key=args.key, allow_no_pub=args.allow, broker_module="socks5")
 
     sess = None
     try:

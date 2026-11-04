@@ -1030,10 +1030,12 @@ class _Socks5SessionHarness:
     def setUp(self):
         self._old_bl = scm.BROKER_LIST
         self._old_cls = scm.MultiMQTTManager
+        self._old_load_bl = scm.load_broker_list
         FakeClientMgr.constructed = []
         FakeClientMgr.gate = None
         # open() 会按 _PB_SEED 建本端 bulk 连接，名单必须全部可解析
         scm.BROKER_LIST = [(h, 1883) for h in scm._PB_SEED]
+        scm.load_broker_list = lambda **_ka: [(h, 1883) for h in scm._PB_SEED]
         scm.MultiMQTTManager = FakeClientMgr
         self.addCleanup(self._restore_module)
 
@@ -1048,6 +1050,7 @@ class _Socks5SessionHarness:
     def _restore_module(self):
         scm.BROKER_LIST = self._old_bl
         scm.MultiMQTTManager = self._old_cls
+        scm.load_broker_list = self._old_load_bl
 
     def tearDown(self):
         try:

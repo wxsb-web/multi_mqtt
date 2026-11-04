@@ -1082,5 +1082,134 @@ class IsVerifyEnabledTests(unittest.TestCase):
                 server_public_key_bytes=b"definitely-not-a-pem")
 
 
+class BrokerDirectChannelTests(unittest.TestCase):
+    """broker 直读通道：load_broker_list / filter_broker_list / broker_list_no。
+
+    全部用例只读写临时目录里的 rpc.json，绝不碰仓库 rpc.json。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp_dir.name) / "rpc.json"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write(self, document):
+        self.config_path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_compose_matches_server_channel(self):
+        """双通道对拍：直读通道与 load_rpc_config 同一份合成结果。"""
+        self._write({
+            "broker_list": [["broker-a.example", 1883], ["broker-b.example", 1884]],
+            "broker_list_add": [
+                ["broker-a.example", 1883, ["user", "pass"]],   # 同身份原位替换
+                ["broker-c.example", 1885],                     # 新身份追加
+            ],
+            "broker_list_del": [["broker-b.example", 1884]],
+        })
+
+        expected = server_mqtt.load_rpc_config(self.config_path)["broker_list"]
+        self.assertEqual(server_mqtt.load_broker_list(path=self.config_path), expected)
+        self.assertEqual(expected, [
+            ("broker-a.example", 1883, ["user", "pass"]),
+            ("broker-c.example", 1885),
+        ])
+
+    def test_broker_list_no_masks_only_listed_modules(self):
+        self._write({
+            "broker_list": [["broker-a.example", 1883], ["broker-b.example", 1884]],
+            "broker_list_no": {"broker-b.example:1884": ["pty"]},
+        })
+
+        full = server_mqtt.load_broker_list(path=self.config_path)
+        self.assertEqual(full,
+                         [("broker-a.example", 1883), ("broker-b.example", 1884)])
+        self.assertEqual(server_mqtt.load_broker_list(path=self.config_path,
+                                                      module="pty"),
+                         [("broker-a.example", 1883)])
+        # 其它模块 / module=None 不受影响（未知模块名宽松放行）
+        self.assertEqual(server_mqtt.load_broker_list(path=self.config_path,
+                                                      module="server"), full)
+        self.assertEqual(server_mqtt.load_broker_list(path=self.config_path,
+                                                      module="web"), full)
+
+    def test_mask_matches_identity_after_add_replace(self):
+        """add 原位替换后屏蔽按身份继续生效（不按具体条目实例）；key host 大小写不敏感。"""
+        self._write({
+            "broker_list": [["broker-a.example", 1883]],
+            "broker_list_add": [["broker-a.example", 1883, ["user", "pass"]]],
+            "broker_list_no": {"BROKER-A.example:1883": ["pty", "tools"]},
+        })
+
+        self.assertEqual(server_mqtt.load_broker_list(path=self.config_path,
+                                                      module="pty"), [])
+        self.assertEqual(server_mqtt.load_broker_list(path=self.config_path,
+                                                      module="tools"), [])
+        self.assertEqual(server_mqtt.load_broker_list(path=self.config_path,
+                                                      module="socks5"),
+                         [("broker-a.example", 1883, ["user", "pass"])])
+
+    def test_invalid_mask_entries_are_skipped(self):
+        self._write({
+            "broker_list": [["broker-a.example", 1883], ["broker-b.example", 1884]],
+            "broker_list_no": {
+                "broker-a.example": ["pty"],          # 无 port
+                ":1884": ["pty"],                     # 无 host
+                "broker-b.example:99999": ["pty"],    # port 越界
+                "broker-a.example:1883": "pty",       # 值不是列表
+            },
+        })
+
+        self.assertEqual(
+            server_mqtt.load_broker_list(path=self.config_path, module="pty"),
+            [("broker-a.example", 1883), ("broker-b.example", 1884)])
+
+    def test_broken_file_falls_back_to_builtin(self):
+        self.config_path.write_text("{ not json", encoding="utf-8")
+        result = server_mqtt.load_broker_list(path=self.config_path)
+        self.assertEqual(result, server_mqtt._normalize_broker_list(
+            server_mqtt.BROKER_LIST, "broker_list"))
+
+        missing = Path(self.temp_dir.name) / "missing.json"
+        self.assertEqual(server_mqtt.load_broker_list(path=missing), result)
+
+    def test_write_back_preserves_broker_list_no(self):
+        """server 端配置写回以文件原始键为准，不得丢掉 broker_list_no。"""
+        self._write({
+            "request_topic": "old/request",
+            "broker_list_no": {"broker-b.example:1884": ["pty"]},
+        })
+
+        server_mqtt._write_rpc_config_updates({"request_topic": "new/request"},
+                                              self.config_path)
+
+        stored = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["broker_list_no"],
+                         {"broker-b.example:1884": ["pty"]})
+        self.assertEqual(stored["request_topic"], "new/request")
+
+    def test_filter_broker_list_applies_mask_to_explicit_list(self):
+        self._write({"broker_list_no": {"broker-b.example:1884": ["server"]}})
+        brokers = [("broker-a.example", 1883), ("broker-b.example", 1884)]
+        self.assertEqual(
+            server_mqtt.filter_broker_list(brokers, "server",
+                                           path=self.config_path),
+            [("broker-a.example", 1883)])
+        self.assertEqual(
+            server_mqtt.filter_broker_list(brokers, None, path=self.config_path),
+            brokers)
+
+    def test_manager_default_uses_channel_and_explicit_brokers_win(self):
+        from multi_mqtt import MultiMQTTManager
+
+        mgr = MultiMQTTManager(enable_stats=False, log_connection=False,
+                               recovery_enabled=False)
+        self.assertEqual(mgr.brokers, server_mqtt.load_broker_list())
+        self.assertEqual(MultiMQTTManager(brokers=[], enable_stats=False,
+                                          log_connection=False,
+                                          recovery_enabled=False).brokers, [])
+
+
 if __name__ == "__main__":
     unittest.main()

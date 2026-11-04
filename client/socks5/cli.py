@@ -8,7 +8,7 @@ import argparse
 from .. import client_mqtt as _cm
 from ..cmd_client_mqtt import MqttTransport, add_connection_args
 from ..remote_cmd import PTY_FRAME_MAX, RemoteError
-from multi_mqtt import BROKER_LIST
+from rpc_config import load_broker_list
 from server_http import start_rpc_server
 
 from .config import (
@@ -84,13 +84,13 @@ def main(argv=None) -> int:
 
     signed = bool(str(args.key or "").strip())
     _info("正在并发连接 %d 个公共 MQTT broker（首个连上即继续）..."
-          % len(BROKER_LIST))
+          % len(load_broker_list(module="socks5")))
     _info("request_topic=%s  reply_topic=%s  请求签名=%s  允许未验签回包=%s"
           % (args.request_topic, args.reply_topic,
              "是" if signed else "否", "是" if args.allow else "否"))
     transport = MqttTransport(
         request_topic=args.request_topic, reply_topic=args.reply_topic,
-        private_key=args.key, allow_no_pub=args.allow)
+        private_key=args.key, allow_no_pub=args.allow, broker_module="socks5")
 
     sess = None
     try:

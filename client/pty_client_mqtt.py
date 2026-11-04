@@ -172,7 +172,8 @@ from .remote_cmd import (                   # noqa: E402
     RemoteOpError, _PtyReorderBuffer,
 )
 
-from multi_mqtt import stime, BROKER_LIST
+from multi_mqtt import stime
+from rpc_config import load_broker_list
 
 # ================= 统一别名表（小写变量名） =================
 # 与 client_mqtt.py 同一套规矩：语义别名不带 "--"/"%" 前缀，三处共用一份：
@@ -2795,7 +2796,7 @@ def _broker_status(transport):
     net = getattr(getattr(transport, "node", None), "mqtt_net", None)
     clients = getattr(net, "clients", None)
     if not clients:
-        return 0, len(BROKER_LIST), []
+        return 0, len(load_broker_list(module="pty")), []
     hosts = []
     for host, cli in clients.items():
         try:
@@ -6826,13 +6827,13 @@ def main(argv=None) -> int:
     signed = bool(str(args.key or "").strip())
     t_conn = time.monotonic()
     _info("正在并发连接 %d 个公共 MQTT broker（多路径冗余，首个连上即继续，通常不足 1 秒）..."
-          % len(BROKER_LIST))
+          % len(load_broker_list(module="pty")))
     _info("request_topic=%s  reply_topic=%s  请求签名=%s  允许未验签回包=%s"
           % (args.request_topic, args.reply_topic,
              "是" if signed else "否", "是" if args.allow else "否"))
     transport = MqttTransport(
         request_topic=args.request_topic, reply_topic=args.reply_topic,
-        private_key=args.key, allow_no_pub=args.allow)
+        private_key=args.key, allow_no_pub=args.allow, broker_module="pty")
     # 首包统计是纯旁路观察：安装失败只告警，绝不影响主流程。
     try:
         first_packet_stats.install(transport)

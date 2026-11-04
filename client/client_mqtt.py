@@ -10,6 +10,7 @@ for _p in (os.path.dirname(_HERE), _HERE):
 
 from multi_mqtt import MultiMQTTManager, get_req_id, get_standard_pem_bytes,get_duplicated_kargs
 from rpc_executor import utc_ms
+import rpc_config as _rpc_config
 
 logger = logging.getLogger(__file__)
 from server_mqtt import REQUEST_TOPIC, DEFAULT_REPLY_TOPIC as REPLY_TOPIC
@@ -24,17 +25,14 @@ def load_client_rpc_config(path=None):
 
     返回原始 JSON dict；文件不存在/损坏/非 object 时返回空 dict，
     绝不让客户端因为服务端配置问题启动失败。
+    读取逻辑委托 rpc_config（与服务端共用同一套容错读）。
     """
     path = CLIENT_RPC_CONFIG_PATH if path is None else path
     try:
-        with open(path, "r", encoding="utf-8") as file:
-            document = json.load(file)
-    except FileNotFoundError:
-        return {}
+        return _rpc_config._read_rpc_config_document(path)
     except (OSError, ValueError) as error:
         logger.warning("读取客户端 rpc.json 失败，回退默认统计周期：%s", error)
         return {}
-    return document if isinstance(document, dict) else {}
 
 
 def _client_stats_interval(value):
@@ -114,6 +112,7 @@ class MQTTClientNode:
         allow_no_server_pubkey_response: bool = False,
         stats_print_interval=None,
         stats_ping_interval=None,
+        broker_module=None,
     ):
         self.client_private_key_bytes = client_private_key_bytes
         self.allow_no_server_pubkey_response = allow_no_server_pubkey_response
@@ -121,6 +120,7 @@ class MQTTClientNode:
             stats_print_interval)
         self.mqtt_net = MultiMQTTManager(
             log_messages=False,
+            broker_module=broker_module,
             client_private_key_bytes=client_private_key_bytes,
             stats_print_interval=stats_print_interval,
             stats_ping_interval=stats_ping_interval,

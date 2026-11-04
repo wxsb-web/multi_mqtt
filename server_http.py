@@ -6,6 +6,7 @@ from pathlib import Path
 
 import rpc_executor
 from rpc_executor import PythonExecutor, format_result ,stime, utc_ms
+import rpc_config as _rpc_config
 
 
 # --------------------------------------------------------------------------- #
@@ -18,10 +19,9 @@ ALIAS_CONFIG_KEY = 'http_aliases'
 # 打开站点首页 / 时执行的别名名：定义 #alias root 后 / 直接显示它产出的
 # HTML（例如 response.set_data(open('/home/<user>/apk.html').read())）。
 ROOT_ALIAS = 'root'
-# reload 会重造锁对象：正在写 rpc.json 的线程与拿新锁的线程会同时进临界区，
-# setdefault 保住同一把锁跨 reload（与 server_mqtt 的写法一致）。
-_ALIAS_CONFIG_LOCK = globals().setdefault(
-    '_ALIAS_CONFIG_LOCK', threading.RLock())
+# 与 server_mqtt 配置写回共用 rpc_config.CONFIG_LOCK 同一把锁：写同一份 rpc.json
+# 的读-改-写跨模块串行，消除两把锁时的丢失更新竞态；reload 安全由 setdefault 保证。
+_ALIAS_CONFIG_LOCK = _rpc_config.CONFIG_LOCK
 # #alias 指令行尾出现这些标记 = 只注册到内存、不写 rpc.json：
 #     #alias apk !      #alias apk np      #alias apk!
 # 标记在本模块被剥掉后再交给执行器，rpc_executor.py 一行不改。
@@ -41,19 +41,11 @@ def _read_config_document(path=None):
     config_path = _alias_config_path(path)
     with _ALIAS_CONFIG_LOCK:
         try:
-            with config_path.open('r', encoding='utf-8') as config_file:
-                document = json.load(config_file)
-        except FileNotFoundError:
-            return {}
+            return _rpc_config._read_rpc_config_document(config_path)
         except (OSError, ValueError) as error:
             logging.getLogger('app').warning(
                 '别名持久化读取失败，跳过 %s: %s', config_path, error)
             return None
-        if not isinstance(document, dict):
-            logging.getLogger('app').warning(
-                '别名持久化跳过：%s 根节点不是 JSON object', config_path)
-            return None
-        return document
 
 
 def _persisted_alias_records(path=None):
@@ -120,30 +112,9 @@ def _update_persisted_aliases(updates=None, deletes=(), path=None):
         else:
             document.pop(ALIAS_CONFIG_KEY, None)
         config_path = _alias_config_path(path)
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        # mkstemp 在 POSIX 上固定创建 0600；直接 replace 会把 rpc.json 原本
-        # 的 0644 等权限改掉，换成另一个用户运行的服务就可能读不到。写临时
-        # 文件后先恢复原文件权限，再原子替换。
-        try:
-            existing_mode = stat.S_IMODE(os.stat(config_path).st_mode)
-        except OSError:
-            existing_mode = None
-        handle, temp_name = tempfile.mkstemp(
-            prefix=config_path.name + '.', suffix='.tmp',
-            dir=str(config_path.parent))
-        try:
-            with os.fdopen(handle, 'w', encoding='utf-8') as temp_file:
-                json.dump(document, temp_file, ensure_ascii=False, indent=2)
-                temp_file.write('\n')
-            if existing_mode is not None:
-                os.chmod(temp_name, existing_mode)
-            os.replace(temp_name, config_path)
-        except BaseException:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            raise
+        # 原子写 + 保留原权限位（mkstemp 默认 0600 会破坏原文件权限），
+        # 与 server_mqtt 配置写回共用 rpc_config.write_json_document。
+        _rpc_config.write_json_document(config_path, document)
         return True
 
 

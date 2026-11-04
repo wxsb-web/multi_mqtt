@@ -172,5 +172,6 @@ from .remote_cmd import (                   # noqa: E402
     RemoteOpError, _PtyReorderBuffer,
 )
 
-from multi_mqtt import stime, BROKER_LIST
+from multi_mqtt import stime
+from rpc_config import load_broker_list
 

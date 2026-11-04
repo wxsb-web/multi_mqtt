@@ -5,7 +5,7 @@ def _broker_status(transport):
     net = getattr(getattr(transport, "node", None), "mqtt_net", None)
     clients = getattr(net, "clients", None)
     if not clients:
-        return 0, len(BROKER_LIST), []
+        return 0, len(load_broker_list(module="pty")), []
     hosts = []
     for host, cli in clients.items():
         try:

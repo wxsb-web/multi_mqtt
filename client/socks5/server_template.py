@@ -231,7 +231,9 @@ def _cmq_socks5_start():
                         _old = _bnet
                         try:
                             _cls = _g.get("MultiMQTTManager") or type(_net)
-                            _bl = _g.get("BROKER_LIST")
+                            _fn = _g.get("load_broker_list")
+                            _bl = _fn(module="socks5") if callable(_fn) \
+                                else _g.get("BROKER_LIST")
                             _bsub = [_b for _b in _bl if _b[0] in _want] \
                                 if _bl else []
                             if len(_bsub) == len(_want):

@@ -8,7 +8,8 @@ import threading
 import logging
 import collections
 import weakref
-from multi_mqtt import MultiMQTTManager, BROKER_LIST
+from multi_mqtt import MultiMQTTManager
+from rpc_config import load_broker_list
 
 from rich.live import Live
 from rich.table import Table
@@ -491,7 +492,7 @@ def main(argv=None):
             return
         engine.push(host, topic, payload_bytes)
 
-    manager = RawSnifferManager(brokers=BROKER_LIST, log_messages=False, enable_crypto=False)
+    manager = RawSnifferManager(brokers=load_broker_list(module="tools"), log_messages=False, enable_crypto=False)
     manager.set_on_message(on_raw_message)
 
     logger.info("启动 MQTT 节点连接管理程序...")

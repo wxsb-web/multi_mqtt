@@ -74,7 +74,7 @@ class MqttTransport(Transport):
 
     def __init__(self, node=None, request_topic=DEFAULT_REQUEST_TOPIC,
                  reply_topic=DEFAULT_REPLY_TOPIC, private_key=DEFAULT_KEY,
-                 allow_no_pub=True):
+                 allow_no_pub=True, broker_module=None):
         self.request_topic = request_topic
         self.reply_topic = reply_topic
         self.allow_no_pub = allow_no_pub
@@ -86,6 +86,7 @@ class MqttTransport(Transport):
             node = _cm.MQTTClientNode(
                 client_private_key_bytes=self.key,
                 allow_no_server_pubkey_response=allow_no_pub,
+                broker_module=broker_module,
             )
             node.start()
         self.node = node
