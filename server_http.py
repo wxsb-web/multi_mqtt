@@ -16,6 +16,9 @@ import rpc_config as _rpc_config
 # 这里只读写自己的 http_aliases 段，读-改-写时其它键原样保留，互不覆盖。
 RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
 ALIAS_CONFIG_KEY = 'http_aliases'
+# HTTP Basic 认证凭据同样放在 rpc.json：字符串 'user:password' 或
+# [user, password] 数组；缺省 / 空值 / 写错都表示不启用。
+BASIC_AUTH_CONFIG_KEY = 'basic_auth'
 # 打开站点首页 / 时执行的别名名：定义 #alias root 后 / 直接显示它产出的
 # HTML（例如 response.set_data(open('/home/<user>/apk.html').read())）。
 ROOT_ALIAS = 'root'
@@ -46,6 +49,58 @@ def _read_config_document(path=None):
             logging.getLogger('app').warning(
                 '别名持久化读取失败，跳过 %s: %s', config_path, error)
             return None
+
+
+def _parse_basic_auth_value(value, source='rpc.json'):
+    """把 rpc.json 的 basic_auth 归一化成 'user:password'；非法值返回 ''。
+
+    支持 ``"user:password"`` 与 ``[user, password]`` 两种写法；null / 空串
+    表示不启用认证。这是文件内容，按"边缘配置只降级"的约定，写错只告警并
+    关闭认证，绝不阻断服务器启动。
+    """
+    if value is None:
+        return ''
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            logging.getLogger('app').warning(
+                '%s 的 %s 必须是 "user:password" 或 [user, password]，'
+                'HTTP Basic 认证保持关闭', source, BASIC_AUTH_CONFIG_KEY)
+            return ''
+        value = ':'.join(str(item) for item in value)
+    if not isinstance(value, str):
+        logging.getLogger('app').warning(
+            '%s 的 %s 类型无效，HTTP Basic 认证保持关闭',
+            source, BASIC_AUTH_CONFIG_KEY)
+        return ''
+    value = value.strip()
+    if not value:
+        return ''
+    if ':' not in value:
+        logging.getLogger('app').warning(
+            '%s 的 %s 缺少冒号（应为 user:password），HTTP Basic 认证保持关闭',
+            source, BASIC_AUTH_CONFIG_KEY)
+        return ''
+    return value
+
+
+def load_basic_auth_from_config(path=None):
+    """启动时从 rpc.json 读取 basic_auth；文件缺失 / 损坏 / 配置非法都返回 ''。
+
+    凭据不写日志，读取失败只告警并保持不启用认证，保证主流程照常启动。
+    """
+    config_path = _alias_config_path(path)
+    with _ALIAS_CONFIG_LOCK:
+        try:
+            document = _rpc_config._read_rpc_config_document(config_path)
+        except (OSError, ValueError, TypeError) as error:
+            logging.getLogger('app').warning(
+                '读取 %s 的 %s 失败，HTTP Basic 认证保持关闭：%s',
+                config_path, BASIC_AUTH_CONFIG_KEY, error)
+            return ''
+    if not isinstance(document, dict):
+        return ''
+    return _parse_basic_auth_value(
+        document.get(BASIC_AUTH_CONFIG_KEY), config_path)
 
 
 def _persisted_alias_records(path=None):
@@ -1416,9 +1471,13 @@ def start_rpc_server(port=1133, key='', ip='0.0.0.0', globals=None, locals=None,
     # 别名持久化默认开启：注册 / 更新 / 删除都同步进 rpc.json 的
     # http_aliases 段，进程重启（含 pythonanywhere SIGHUP）后自动恢复。
     persist_aliases = bool(persist_aliases)
-    # basic_auth 接受 'user:password' 或 (user, password)，统一成前者；空则不启用认证
+    # basic_auth 接受 'user:password' 或 (user, password)，统一成前者；空则不启用认证。
+    # 参数未显式传入（'' / None）时自动读 rpc.json 的 basic_auth 键：调用方
+    # 不必再逐一透传配置，pty_client_mqtt / server_mqtt / ASGI/WSGI 垫片都生效。
     if isinstance(basic_auth, (tuple, list)):
         basic_auth = ':'.join(str(item) for item in basic_auth)
+    if not basic_auth:
+        basic_auth = load_basic_auth_from_config()
 
     # 持久命名空间：默认零拷贝，直接持有调用方传入的 globals 字典引用，
     # 不做任何浅拷贝。这样服务器启动之后调用方才赋值的名字（例如 MQTT
@@ -1598,12 +1657,13 @@ def build_arg_parser():
                         default=True,
                         help="关闭别名持久化（默认写 rpc.json 的 http_aliases）")
     # 三种写法同义：--basic_auth / -basic_auth / -basic-auth；值是
-    # 'user:password'，空串（默认）表示不启用认证。--basic_auth 里若写成
-    # 空格分隔的两个参数会被 argparse 拒绝，必须带冒号或用引号。
+    # 'user:password'，未指定时自动读 rpc.json 的 basic_auth，空值表示
+    # 不启用认证。--basic_auth 里若写成空格分隔的两个参数会被 argparse
+    # 拒绝，必须带冒号或用引号。
     parser.add_argument('--basic_auth', '-basic_auth', '-basic-auth',
                         dest='basic_auth', default='',
                         help="HTTP Basic 认证，格式 user:password；"
-                             "空则不启用认证")
+                              "不指定时读 rpc.json 的 basic_auth")
     return parser
 
 

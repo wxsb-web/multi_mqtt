@@ -673,6 +673,70 @@ class CliArgsTests(unittest.TestCase):
         self.assertTrue(args.persist_aliases)
         self.assertEqual(args.port,1133)
 
+
+class BasicAuthConfigTests(unittest.TestCase):
+    """rpc.json 的 basic_auth 启动自动读取；显式参数优先，脏值只降级。"""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.config_path = Path(temp.name) / "rpc.json"
+        old_path = server_http.RPC_CONFIG_PATH
+        server_http.RPC_CONFIG_PATH = self.config_path
+        self.addCleanup(setattr, server_http, "RPC_CONFIG_PATH", old_path)
+        old_basic_auth = server_http.RPCRequestHandler.basic_auth
+        self.addCleanup(setattr, server_http.RPCRequestHandler,
+                        "basic_auth", old_basic_auth)
+
+    def _write(self, value):
+        self.config_path.write_text(
+            json.dumps({"basic_auth": value}), encoding="utf-8")
+
+    def _start(self, **kwargs):
+        kwargs.setdefault("persist_aliases", False)
+        server = server_http.start_rpc_server(
+            port=0, ip="127.0.0.1", globals={}, locals={}, **kwargs)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    @staticmethod
+    def _request(server, credential=None):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/1%2B1")
+        if credential:
+            request.add_header(
+                "Authorization",
+                "Basic " + base64.b64encode(credential.encode()).decode("ascii"))
+        return request
+
+    def test_string_credential_is_read_at_startup(self):
+        self._write("admin:pw")
+        server = self._start()
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(self._request(server), timeout=10)
+        self.assertEqual(context.exception.code, 401)
+        with urllib.request.urlopen(
+                self._request(server, "admin:pw"), timeout=10) as response:
+            self.assertEqual(response.read().decode(), "2")
+
+    def test_array_credential_and_explicit_argument_wins(self):
+        self._write(["file-user", "file-pw"])
+        server = self._start(basic_auth="explicit:secret")
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(
+                self._request(server, "file-user:file-pw"), timeout=10)
+        self.assertEqual(context.exception.code, 401)
+        with urllib.request.urlopen(
+                self._request(server, "explicit:secret"), timeout=10) as response:
+            self.assertEqual(response.read().decode(), "2")
+
+    def test_broken_config_degrades_to_no_auth(self):
+        self.config_path.write_text("{not json", encoding="utf-8")
+        server = self._start()
+        with urllib.request.urlopen(self._request(server), timeout=10) as response:
+            self.assertEqual(response.read().decode(), "2")
+
     def test_cli_basic_auth_value_gates_requests(self):
         # start_rpc_server 把 basic_auth 写进 RPCRequestHandler 类属性，同进程
         # 后跑的 WSGI 用例会继承它（shim 读类属性），必须还原
