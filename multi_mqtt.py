@@ -872,13 +872,14 @@ class MultiMQTTManager:
     # [修复-N3] stop() 中等待分发线程退出的超时（秒）。
     DISPATCH_JOIN_TIMEOUT = 5.0
 
-    def __init__(self,brokers=None,broker_module=None,log_messages=False,enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0,timestamp_window=400,stats_print_interval=None, stats_ping_interval=None):
+    def __init__(self,brokers=None,broker_module=None,broker_add=None,log_messages=False,enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0,timestamp_window=400,stats_print_interval=None, stats_ping_interval=None):
         if brokers is None:
             # 直读通道：rpc.json 三键合成 + broker_list_no 按 broker_module 屏蔽，
             # server_mqtt 与 client 启动读到同一份 broker。晚绑定导入：rpc_config
             # 顶部反向 import 本模块，模块级导入会成环。显式传 brokers=（含 []）原样使用。
+            # broker_add 为 CLI 显式强制加入的 broker（优先级最高，绕过屏蔽/删除）。
             from rpc_config import load_broker_list
-            brokers = load_broker_list(module=broker_module)
+            brokers = load_broker_list(module=broker_module, broker_add=broker_add)
         self.brokers = brokers
         self.keepalive = keepalive
         self.max_reconnect_delay = max_reconnect_delay

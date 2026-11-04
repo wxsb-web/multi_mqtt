@@ -173,5 +173,5 @@ from .remote_cmd import (                   # noqa: E402
 )
 
 from multi_mqtt import stime
-from rpc_config import load_broker_list
+from rpc_config import load_broker_list, resolve_client_request_topic
 

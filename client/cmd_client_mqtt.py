@@ -42,6 +42,7 @@ if not __package__:
 logger = logging.getLogger("cmd_client_mqtt")
 
 from multi_mqtt import get_standard_pem_bytes  # noqa: E402
+from rpc_config import resolve_client_request_topic  # noqa: E402  客户端 topic 默认值解析统一走 rpc_config
 from . import client_mqtt as _cm               # noqa: E402  复用 REPL 基建
 from .remote_cmd import (                      # noqa: E402
     Transport, RemoteShell as _RemoteShell, CmdResult,
@@ -74,7 +75,7 @@ class MqttTransport(Transport):
 
     def __init__(self, node=None, request_topic=DEFAULT_REQUEST_TOPIC,
                  reply_topic=DEFAULT_REPLY_TOPIC, private_key=DEFAULT_KEY,
-                 allow_no_pub=True, broker_module=None):
+                 allow_no_pub=True, broker_module=None, broker_add=None):
         self.request_topic = request_topic
         self.reply_topic = reply_topic
         self.allow_no_pub = allow_no_pub
@@ -87,6 +88,7 @@ class MqttTransport(Transport):
                 client_private_key_bytes=self.key,
                 allow_no_server_pubkey_response=allow_no_pub,
                 broker_module=broker_module,
+                broker_add=broker_add,
             )
             node.start()
         self.node = node
@@ -248,11 +250,13 @@ class MqttRemoteShell(_RemoteShell):
     def __init__(self, request_topic=DEFAULT_REQUEST_TOPIC,
                  reply_topic=DEFAULT_REPLY_TOPIC, private_key=DEFAULT_KEY,
                  allow_no_pub=True, timeout=DEFAULT_TIMEOUT,
-                 max_transfer=MAX_TRANSFER, wire_budget=WIRE_BUDGET, transport=None):
+                 max_transfer=MAX_TRANSFER, wire_budget=WIRE_BUDGET, transport=None,
+                 broker_add=None):
         if transport is None:
             transport = MqttTransport(
                 request_topic=request_topic, reply_topic=reply_topic,
-                private_key=private_key, allow_no_pub=allow_no_pub)
+                private_key=private_key, allow_no_pub=allow_no_pub,
+                broker_add=broker_add)
         super().__init__(transport, timeout=timeout,
                          max_transfer=max_transfer, wire_budget=wire_budget)
 
@@ -269,11 +273,12 @@ _default_shell_lock = threading.Lock()
 
 def connect(private_key=DEFAULT_KEY, request_topic=DEFAULT_REQUEST_TOPIC,
             reply_topic=DEFAULT_REPLY_TOPIC, allow_no_pub=True,
-            timeout=DEFAULT_TIMEOUT, **ka) -> MqttRemoteShell:
+            timeout=DEFAULT_TIMEOUT, broker_add=None, **ka) -> MqttRemoteShell:
     """显式建立一个到默认设备的 RemoteShell（用完 .close()）。"""
     return MqttRemoteShell(
         private_key=private_key, request_topic=request_topic,
-        reply_topic=reply_topic, allow_no_pub=allow_no_pub, timeout=timeout, **ka)
+        reply_topic=reply_topic, allow_no_pub=allow_no_pub, timeout=timeout,
+        broker_add=broker_add, **ka)
 
 
 def get_shell(**ka) -> MqttRemoteShell:
@@ -935,8 +940,9 @@ def add_connection_args(p, default_timeout=DEFAULT_TIMEOUT):
     """
     p.add_argument(
         *_cm._cli_opts(*_cm.alias_request_topic),
-        dest="request_topic", default=DEFAULT_REQUEST_TOPIC,
-        help=f"request topic（默认 {DEFAULT_REQUEST_TOPIC}）",
+        dest="request_topic", default=None,
+        help=f"request topic（默认按 rpc.json 解析：request_topic_map[设备id] > "
+             f"request_topic > {DEFAULT_REQUEST_TOPIC}）",
     )
     p.add_argument(
         *_cm._cli_opts(*_cm.alias_reply_topic),
@@ -960,6 +966,13 @@ def add_connection_args(p, default_timeout=DEFAULT_TIMEOUT):
         dest="timeout", type=float, default=default_timeout,
         help=f"问答等待秒数（默认 {default_timeout}）",
     )
+    p.add_argument(
+        *_cm._cli_opts(*_cm.alias_broker_add),
+        dest="broker_add", action="append", default=None,
+        metavar="host:port",
+        help="强制加入的 broker，可重复；优先级最高，绕过 broker_list_no 屏蔽"
+             "与 broker_list_del 删除",
+    )
 
 
 # 向后兼容旧名字
@@ -968,12 +981,14 @@ _add_common = add_connection_args
 
 def _shell_from_args(args, wire_budget=WIRE_BUDGET):
     return MqttRemoteShell(
-        request_topic=args.request_topic,
+        request_topic=resolve_client_request_topic(
+            getattr(args, "request_topic", None)),
         reply_topic=args.reply_topic,
         private_key=args.key or None,
         allow_no_pub=args.allow,
         timeout=args.timeout,
         wire_budget=wire_budget,
+        broker_add=getattr(args, "broker_add", None),
     )
 
 

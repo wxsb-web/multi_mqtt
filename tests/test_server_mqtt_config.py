@@ -14,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import server_mqtt
+import rpc_config
 
 
 class FakeMQTTManager:
@@ -1209,6 +1210,219 @@ class BrokerDirectChannelTests(unittest.TestCase):
         self.assertEqual(MultiMQTTManager(brokers=[], enable_stats=False,
                                           log_connection=False,
                                           recovery_enabled=False).brokers, [])
+
+
+class RequestTopicMapTests(unittest.TestCase):
+    """request_topic_map 解析链：显式 > map[设备id] > request_topic > 兜底。
+
+    多机共用一份 rpc.json 时按 U.get_machine_id() 的设备 id 区别各机器
+    topic；map 命中只读不写回文件，避免共用配置被本机 topic 污染。
+    全部用例只读写临时目录里的 rpc.json，绝不碰仓库 rpc.json。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp_dir.name) / "rpc.json"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write(self, document):
+        self.config_path.write_text(json.dumps(document), encoding="utf-8")
+
+    def _mock_machine(self, machine_id):
+        module = types.ModuleType("U")
+        if isinstance(machine_id, BaseException):
+            module.get_machine_id = mock.Mock(side_effect=machine_id)
+        else:
+            module.get_machine_id = mock.Mock(return_value=machine_id)
+        patcher = mock.patch.dict(sys.modules, {"U": module})
+        return patcher, module
+
+    def test_map_hit_overrides_request_topic_without_write_back(self):
+        self._write({
+            "request_topic": "x230",
+            "request_topic_map": {"TestDevice_123456": "lenovo"},
+        })
+        patcher, _ = self._mock_machine("TestDevice_123456")
+        with patcher:
+            self.assertEqual(
+                rpc_config._resolve_request_topic(path=self.config_path),
+                "lenovo")
+            self.assertEqual(
+                rpc_config.resolve_client_request_topic(path=self.config_path),
+                "lenovo")
+        stored = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["request_topic"], "x230")   # 命中不写回
+
+    def test_map_miss_falls_back_to_request_topic(self):
+        self._write({
+            "request_topic": "x230",
+            "request_topic_map": {"OtherDevice_999999": "other"},
+        })
+        patcher, _ = self._mock_machine("TestDevice_123456")
+        with patcher:
+            self.assertEqual(
+                rpc_config._resolve_request_topic(path=self.config_path),
+                "x230")
+            self.assertEqual(
+                rpc_config.resolve_client_request_topic(path=self.config_path),
+                "x230")
+
+    def test_explicit_topic_wins_over_map(self):
+        self._write({"request_topic_map": {"TestDevice_123456": "lenovo"}})
+        patcher, module = self._mock_machine(AssertionError("must not run"))
+        with patcher:
+            self.assertEqual(
+                rpc_config._resolve_request_topic("hi", path=self.config_path),
+                "hi")
+            self.assertEqual(
+                rpc_config.resolve_client_request_topic(
+                    "hi", path=self.config_path),
+                "hi")
+        self.assertFalse(module.get_machine_id.called)
+
+    def test_map_absent_keeps_machine_id_persist_fallback(self):
+        # 零回归：没有 map 时保持原有"首启生成设备 topic 并持久化"行为
+        patcher, _ = self._mock_machine("TestDevice_123456")
+        with patcher:
+            self.assertEqual(
+                rpc_config._resolve_request_topic(path=self.config_path),
+                "TestDevice_123456")
+        self.assertEqual(
+            json.loads(self.config_path.read_text(encoding="utf-8"))
+            ["request_topic"], "TestDevice_123456")
+
+    def test_client_default_without_config_is_builtin(self):
+        # 客户端链不生成机器 ID、不写文件
+        patcher, module = self._mock_machine(AssertionError("must not run"))
+        with patcher:
+            self.assertEqual(
+                rpc_config.resolve_client_request_topic(path=self.config_path),
+                rpc_config.REQUEST_TOPIC)
+        self.assertFalse(module.get_machine_id.called)
+        self.assertFalse(self.config_path.exists())
+
+    def test_invalid_map_entries_are_skipped(self):
+        self._write({
+            "request_topic": "x230",
+            "request_topic_map": {
+                "": "lenovo",                        # 空设备 id
+                "TestDevice_123456": "  ",           # 空 topic
+                "Other_1": 5,                        # 非字符串 topic
+            },
+        })
+        patcher, _ = self._mock_machine("TestDevice_123456")
+        with patcher:
+            self.assertEqual(
+                rpc_config._resolve_request_topic(path=self.config_path),
+                "x230")
+
+        self._write({
+            "request_topic": "x230",
+            "request_topic_map": "not-an-object",    # 整体非法按空处理
+        })
+        with patcher:
+            self.assertEqual(
+                rpc_config.resolve_client_request_topic(path=self.config_path),
+                "x230")
+
+    def test_server_cli_chain_applies_map(self):
+        self._write({
+            "request_topic": "x230",
+            "request_topic_map": {"TestDevice_123456": "lenovo"},
+        })
+        with mock.patch.object(server_mqtt, "RPC_CONFIG_PATH", self.config_path):
+            patcher, _ = self._mock_machine("TestDevice_123456")
+            with patcher:
+                config = server_mqtt._rpc_config_with_cli_overrides()
+        self.assertEqual(config["request_topic"], "lenovo")
+
+
+class BrokerAddForceTests(unittest.TestCase):
+    """CLI --broker_add 强制加入：绕过 broker_list_no 屏蔽与 broker_list_del 删除。
+
+    全部用例只读写临时目录里的 rpc.json，绝不碰仓库 rpc.json。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp_dir.name) / "rpc.json"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write(self, document):
+        self.config_path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_parse_broker_add(self):
+        self.assertEqual(rpc_config.parse_broker_add("192.168.1.20:1883"),
+                         ("192.168.1.20", 1883))
+        self.assertEqual(rpc_config.parse_broker_add("broker.example"),
+                         ("broker.example", 1883))
+        self.assertIsNone(rpc_config.parse_broker_add(""))
+        self.assertIsNone(rpc_config.parse_broker_add("host:abc"))
+        self.assertIsNone(rpc_config.parse_broker_add("host:99999"))
+        self.assertIsNone(rpc_config.parse_broker_add(":1883"))
+
+    def test_forced_add_bypasses_mask_and_del(self):
+        self._write({
+            "broker_list": [["broker-a.example", 1883], ["broker-b.example", 1884]],
+            "broker_list_del": [["broker-a.example", 1883]],
+            "broker_list_no": {"broker-b.example:1884": ["pty"]},
+        })
+        self.assertEqual(
+            server_mqtt.load_broker_list(path=self.config_path, module="pty"),
+            [])
+        self.assertEqual(
+            server_mqtt.load_broker_list(
+                path=self.config_path, module="pty",
+                broker_add=["broker-a.example:1883", "broker-b.example:1884",
+                            "broker-c.example:1885"]),
+            [("broker-a.example", 1883), ("broker-b.example", 1884),
+             ("broker-c.example", 1885)])
+
+    def test_forced_add_restores_masked_entry_with_auth(self):
+        self._write({
+            "broker_list": [["broker-a.example", 1883]],
+            "broker_list_add": [["broker-a.example", 1883, ["user", "pass"]]],
+            "broker_list_no": {"broker-a.example:1883": ["pty"]},
+        })
+        self.assertEqual(
+            server_mqtt.load_broker_list(path=self.config_path, module="pty"),
+            [])
+        # 同身份补回合成表原条目（保留认证），host 大小写不敏感
+        self.assertEqual(
+            server_mqtt.load_broker_list(
+                path=self.config_path, module="pty",
+                broker_add=["BROKER-A.example:1883"]),
+            [("broker-a.example", 1883, ["user", "pass"])])
+
+    def test_forced_add_keeps_existing_entry_untouched(self):
+        self._write({
+            "broker_list": [["broker-a.example", 1883, ["user", "pass"]]],
+        })
+        self.assertEqual(
+            server_mqtt.load_broker_list(
+                path=self.config_path,
+                broker_add=["broker-a.example:1883", "broker-a.example"]),
+            [("broker-a.example", 1883, ["user", "pass"])])   # 不重复追加纯条目
+
+    def test_forced_add_skips_invalid_entries(self):
+        self._write({"broker_list": [["broker-a.example", 1883]]})
+        self.assertEqual(
+            server_mqtt.load_broker_list(
+                path=self.config_path,
+                broker_add=["", "host:abc", "broker-b.example:1884"]),
+            [("broker-a.example", 1883), ("broker-b.example", 1884)])
+
+    def test_manager_forces_broker_add_into_default_channel(self):
+        from multi_mqtt import MultiMQTTManager
+
+        mgr = MultiMQTTManager(enable_stats=False, log_connection=False,
+                               recovery_enabled=False,
+                               broker_add=["forced.example:1883"])
+        self.assertEqual(mgr.brokers[-1], ("forced.example", 1883))
 
 
 if __name__ == "__main__":

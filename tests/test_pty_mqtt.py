@@ -499,6 +499,25 @@ class PtyCliPreCommandTests(unittest.TestCase):
                           a.size, a.interval, a.port),
                          ("/bin/bash", 2.0, 7.0, True, "20x80", 0.5, 0))
 
+    def test_broker_add_option_with_pre_command(self):
+        # --broker_add 显式条目优先级最高：可重复 append，其值不当作前置命令起点
+        args = pcm.build_parser().parse_args(
+            ["-t", "hi", "--broker_add", "192.168.1.20:1883", "tmux at"])
+        self.assertEqual(args.request_topic, "hi")
+        self.assertEqual(args.broker_add, ["192.168.1.20:1883"])
+        self.assertEqual(pcm._join_pre_command(args.command), "tmux at")
+
+    def test_broker_add_repeatable_and_defaults_none(self):
+        args = pcm.build_parser().parse_args(
+            ["--broker_add", "1.2.3.4:1883", "--broker_add", "5.6.7.8",
+             "tmux", "at"])
+        self.assertEqual(args.broker_add, ["1.2.3.4:1883", "5.6.7.8"])
+        self.assertEqual(pcm._join_pre_command(args.command), "tmux at")
+        empty = pcm.build_parser().parse_args([])
+        self.assertIsNone(empty.broker_add)
+        # request_topic 未显式给时为 None，由 rpc.json 解析链决定默认值
+        self.assertIsNone(empty.request_topic)
+
 
 class AIBridgeRunEncodingTests(unittest.TestCase):
     """run() 的 base64 编码分支必须把命令严格编码进「双引号 sh -c」行，

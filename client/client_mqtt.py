@@ -82,6 +82,9 @@ alias_exit         =('exit', 'quit')
 alias_timeout      =('timeout','time','wait','second','sec','to')
 alias_timestamp_ms =('timestamp_ms','ts','server_ms')
 alias_min_broker_count =('min_broker_count','mb','min')
+# CLI 显式 broker（host:port）强制加入最终列表，优先级最高（绕过屏蔽/删除）；
+# 不占用 -b 避免与其它单字符短选项歧义。
+alias_broker_add    =('broker_add','brokeradd','badd')
 # 统一命名 stats_print_interval / stats_ping_interval；
 # 兼容历史叫法 report_interval/print_interval/ping_interval 等，实际键仍归一。
 alias_stats_print_interval =('stats_print_interval','stats_report_interval','report_interval','print_interval','ri')
@@ -113,6 +116,7 @@ class MQTTClientNode:
         stats_print_interval=None,
         stats_ping_interval=None,
         broker_module=None,
+        broker_add=None,
     ):
         self.client_private_key_bytes = client_private_key_bytes
         self.allow_no_server_pubkey_response = allow_no_server_pubkey_response
@@ -121,6 +125,7 @@ class MQTTClientNode:
         self.mqtt_net = MultiMQTTManager(
             log_messages=False,
             broker_module=broker_module,
+            broker_add=broker_add,
             client_private_key_bytes=client_private_key_bytes,
             stats_print_interval=stats_print_interval,
             stats_ping_interval=stats_ping_interval,

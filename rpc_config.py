@@ -466,15 +466,75 @@ def load_rpc_config(path=None):
     return _normalize_rpc_config(stored)
 
 
-def load_broker_list(path=None, module=None):
+def load_broker_list(path=None, module=None, broker_add=None):
     """broker 直读通道：rpc.json 三键合成后的生效 broker 列表。
 
     与 server 端 load_rpc_config 同一份合成实现（单一来源），server_mqtt 与
     client 启动读到同样的 broker。module 给定时套用 broker_list_no 的按模块
     屏蔽（见 filter_broker_list）。每次调用现读文件、不缓存，任何解析问题
     只告警回落，绝不阻断启动。
+
+    broker_add 给定时（CLI ``--broker_add host:port`` 显式条目，字符串或
+    (host, port) 元组）强制加入最终列表，优先级最高：绕过 broker_list_no
+    屏蔽与 broker_list_del 删除；同身份已在列表则不动，合成表（屏蔽前）
+    有同身份条目则补回原条目（保留认证），否则追加纯 (host, port)。
     """
-    return filter_broker_list(load_rpc_config(path)["broker_list"], module, path=path)
+    composed = load_rpc_config(path)["broker_list"]
+    result = filter_broker_list(composed, module, path=path)
+    if not broker_add:
+        return result
+    return _force_broker_list(result, composed, broker_add)
+
+
+def parse_broker_add(spec):
+    """解析 ``--broker_add`` 的 "host:port" 条目 -> (host, port)。
+
+    无端口时默认 1883；host 允许含冒号的 IPv6（rpartition(":") 拆最后一段，
+    与 broker_list_no 的键解析同口径）。非法输入告警返回 None，绝不抛异常。
+    """
+    if not isinstance(spec, str) or not spec.strip():
+        logger.warning("broker_add 条目 %r 非法，已跳过", spec)
+        return None
+    host, sep, port_text = spec.strip().rpartition(":")
+    host = host.strip()
+    port_text = port_text.strip()
+    if not sep:
+        host, port_text = spec.strip(), ""
+    if not host:
+        logger.warning("broker_add 条目 %r 非法，已跳过", spec)
+        return None
+    if not port_text:
+        return (host, 1883)
+    if not port_text.isdecimal():
+        logger.warning("broker_add 条目 %r 端口非法，已跳过", spec)
+        return None
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        logger.warning("broker_add 条目 %r 端口超出范围，已跳过", spec)
+        return None
+    return (host, port)
+
+
+def _force_broker_list(result, composed, broker_add):
+    """把 broker_add 显式条目强制并入最终列表（优先级最高，绕过屏蔽/删除）。"""
+    forced = list(result)
+    have = {_broker_identity(b) for b in forced}
+    by_identity = {_broker_identity(b): b for b in composed}
+    for spec in broker_add:
+        entry = parse_broker_add(spec) if isinstance(spec, str) else spec
+        if entry is None:
+            continue
+        try:
+            entry = _normalize_broker_list([entry], "broker_add")[0]
+        except ValueError as error:
+            logger.warning("broker_add 条目 %r 非法，已跳过：%s", spec, error)
+            continue
+        identity = _broker_identity(entry)
+        if identity in have:
+            continue                       # 已在列表（可能带认证）：不动
+        forced.append(by_identity.get(identity, entry))
+        have.add(identity)
+    return forced
 
 
 def filter_broker_list(brokers, module, path=None):
@@ -560,16 +620,21 @@ def _sanitize_rpc_document(document, source="rpc.json"):
 
 
 def _valid_stored_request_topic(raw_document, sanitized_document):
-    """只把文件里合法生效的 request_topic 交给 _resolve_request_topic。
+    """只把文件里合法生效的 request_topic/request_topic_map 交给 _resolve_request_topic。
 
-    缺键或值非法（已被 sanitize 回落默认值）时返回空 dict，让 _resolve_request_topic
-    继续走机器 ID 兜底，保持原有"首启生成设备 topic 并持久化"的行为。
+    request_topic 缺键或值非法（已被 sanitize 回落默认值）时不返回该键，让
+    _resolve_request_topic 继续走机器 ID 兜底，保持原有"首启生成设备 topic
+    并持久化"的行为。request_topic_map 原样携带（解析校验在
+    _read_request_topic_map），让 map 在服务端解析链同样生效。
     """
+    result = {}
     if "request_topic" in raw_document:
         value = raw_document["request_topic"]
         if value == sanitized_document["request_topic"]:
-            return {"request_topic": value}
-    return {}
+            result["request_topic"] = value
+    if "request_topic_map" in raw_document:
+        result["request_topic_map"] = raw_document["request_topic_map"]
+    return result
 
 
 def _validate_explicit_updates(updates):
@@ -617,6 +682,52 @@ def _write_rpc_config_updates(updates, path=None):
         write_json_document(config_path, stored)
 
 
+def _read_request_topic_map(stored):
+    """解析 request_topic_map：{"设备id": "别名/topic"} -> {设备id: topic}。
+
+    可选顶层键（不进 _default_rpc_config），供多机共用一份 rpc.json 时按
+    U.get_machine_id() 输出的设备 id 区别各机器的 topic；key/value 都须是
+    非空字符串，非法条目告警跳过，永不抛异常。
+    """
+    raw = stored.get("request_topic_map") if isinstance(stored, dict) else None
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("request_topic_map 必须是 JSON object，已按空处理")
+        return {}
+    topic_map = {}
+    for machine_id, topic in raw.items():
+        if (isinstance(machine_id, str) and machine_id.strip()
+                and isinstance(topic, str) and topic.strip()):
+            topic_map[machine_id.strip()] = topic.strip()
+        else:
+            logger.warning("request_topic_map 条目 %r 非法，已跳过",
+                           (machine_id, topic))
+    return topic_map
+
+
+def _machine_id_or_none():
+    """本机设备 id（request_topic_map 的键）；拿不到返回 None，绝不抛异常。"""
+    try:
+        import U
+        machine_id = U.get_machine_id()
+        if not isinstance(machine_id, str) or not machine_id.strip():
+            return None
+        return machine_id.strip()
+    except Exception as error:
+        logger.warning("获取设备 id 失败（request_topic_map 按未命中处理）：%s", error)
+        return None
+
+
+def _mapped_request_topic(stored):
+    """request_topic_map[设备id]：命中返回 topic，否则 None（不写回文件）。"""
+    topic_map = _read_request_topic_map(stored)
+    if not topic_map:
+        return None                      # 空表不调 U.get_machine_id()，零回归
+    machine_id = _machine_id_or_none()
+    return topic_map.get(machine_id) if machine_id else None
+
+
 def _resolve_request_topic(request_topic=None, stored=None, path=None):
     if request_topic is not None:
         return request_topic
@@ -627,6 +738,13 @@ def _resolve_request_topic(request_topic=None, stored=None, path=None):
         except (ValueError, TypeError, OSError) as error:
             logger.warning("rpc.json 无法解析，按未配置 request_topic 处理：%s", error)
             stored = {}
+
+    # request_topic_map 优先级高于 request_topic（多机共用 rpc.json 区别机器），
+    # 命中只读不写回，避免共用配置被本机 topic 污染。
+    mapped = _mapped_request_topic(stored)
+    if mapped is not None:
+        return mapped
+
     if "request_topic" in stored:
         return stored["request_topic"]
 
@@ -646,6 +764,27 @@ def _resolve_request_topic(request_topic=None, stored=None, path=None):
 
     _write_rpc_config_updates({"request_topic": machine_topic}, path)
     return machine_topic
+
+
+def resolve_client_request_topic(request_topic=None, path=None):
+    """客户端 request_topic 默认值解析：显式 > map[设备id] > request_topic > 内置默认。
+
+    与服务端 _resolve_request_topic 的区别：客户端不生成机器 ID、不写回文件，
+    未配置时直接用内置默认值 REQUEST_TOPIC，保持兼容。
+    """
+    if request_topic is not None:
+        return request_topic
+    try:
+        stored = _read_rpc_config_document(path)
+    except (ValueError, TypeError, OSError) as error:
+        logger.warning("rpc.json 无法解析，按未配置 request_topic 处理：%s", error)
+        stored = {}
+    mapped = _mapped_request_topic(stored)
+    if mapped is not None:
+        return mapped
+    if "request_topic" in stored:
+        return stored["request_topic"]
+    return REQUEST_TOPIC
 
 
 def _merge_rpc_updates(current, updates):

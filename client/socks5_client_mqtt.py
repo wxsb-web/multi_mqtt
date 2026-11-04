@@ -2645,14 +2645,16 @@ def main(argv=None) -> int:
         dead_timeout = max(dead_timeout, heartbeat * 3)
 
     signed = bool(str(args.key or "").strip())
+    request_topic = resolve_client_request_topic(args.request_topic)
     _info("正在并发连接 %d 个公共 MQTT broker（首个连上即继续）..."
-          % len(load_broker_list(module="socks5")))
+          % len(load_broker_list(module="socks5", broker_add=args.broker_add)))
     _info("request_topic=%s  reply_topic=%s  请求签名=%s  允许未验签回包=%s"
-          % (args.request_topic, args.reply_topic,
+          % (request_topic, args.reply_topic,
              "是" if signed else "否", "是" if args.allow else "否"))
     transport = MqttTransport(
-        request_topic=args.request_topic, reply_topic=args.reply_topic,
-        private_key=args.key, allow_no_pub=args.allow, broker_module="socks5")
+        request_topic=request_topic, reply_topic=args.reply_topic,
+        private_key=args.key, allow_no_pub=args.allow, broker_module="socks5",
+        broker_add=args.broker_add)
 
     sess = None
     try:

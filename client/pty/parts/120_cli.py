@@ -178,15 +178,17 @@ def main(argv=None) -> int:
     # 启动自检：本文件是否仍是 pty/parts 分片重组出来的最新版（不同步只告警）
     check_parts_sync()
     signed = bool(str(args.key or "").strip())
+    request_topic = resolve_client_request_topic(args.request_topic)
     t_conn = time.monotonic()
     _info("正在并发连接 %d 个公共 MQTT broker（多路径冗余，首个连上即继续，通常不足 1 秒）..."
-          % len(load_broker_list(module="pty")))
+          % len(load_broker_list(module="pty", broker_add=args.broker_add)))
     _info("request_topic=%s  reply_topic=%s  请求签名=%s  允许未验签回包=%s"
-          % (args.request_topic, args.reply_topic,
+          % (request_topic, args.reply_topic,
              "是" if signed else "否", "是" if args.allow else "否"))
     transport = MqttTransport(
-        request_topic=args.request_topic, reply_topic=args.reply_topic,
-        private_key=args.key, allow_no_pub=args.allow, broker_module="pty")
+        request_topic=request_topic, reply_topic=args.reply_topic,
+        private_key=args.key, allow_no_pub=args.allow, broker_module="pty",
+        broker_add=args.broker_add)
     # 首包统计是纯旁路观察：安装失败只告警，绝不影响主流程。
     try:
         first_packet_stats.install(transport)
