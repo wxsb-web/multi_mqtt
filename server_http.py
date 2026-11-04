@@ -107,14 +107,15 @@ def _update_persisted_aliases(updates=None, deletes=(), path=None):
                 changed = True
         if not changed:
             return False
-        if aliases:
-            document[ALIAS_CONFIG_KEY] = aliases
-        else:
-            document.pop(ALIAS_CONFIG_KEY, None)
         config_path = _alias_config_path(path)
-        # 原子写 + 保留原权限位（mkstemp 默认 0600 会破坏原文件权限），
-        # 与 server_mqtt 配置写回共用 rpc_config.write_json_document。
-        _rpc_config.write_json_document(config_path, document)
+        # 文本级只动 http_aliases 一键（保留 rpc.json 其余手写缩进与内容），
+        # 原子写 + 保留原权限位由 update_json_document 处理。
+        if aliases:
+            _rpc_config.update_json_document(
+                config_path, {ALIAS_CONFIG_KEY: aliases})
+        else:
+            _rpc_config.update_json_document(
+                config_path, {}, deletes=(ALIAS_CONFIG_KEY,))
         return True
 
 

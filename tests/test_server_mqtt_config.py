@@ -1425,5 +1425,106 @@ class BrokerAddForceTests(unittest.TestCase):
         self.assertEqual(mgr.brokers[-1], ("forced.example", 1883))
 
 
+class JsonPreserveWriteTests(unittest.TestCase):
+    """rpc.json 文本级按键改写：只动被改键一行，其余字节原样保留。
+
+    全部用例只读写临时目录里的 rpc.json，绝不碰仓库 rpc.json。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.config_path = Path(self.temp_dir.name) / "rpc.json"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _write_text(self, text):
+        self.config_path.write_text(text, encoding="utf-8")
+
+    def test_update_existing_key_keeps_other_bytes(self):
+        text = ('{\n'
+                '\t"a": 1,\n'
+                '    "b" :   [1, {"x": "y,z}"}],\n'
+                '  "c": "keep"\n'
+                '}\n')
+        self._write_text(text)
+        rpc_config.update_json_document(self.config_path, {"a": 2})
+        rpc_config.update_json_document(self.config_path, {"c": "new"})
+        self.assertEqual(
+            self.config_path.read_text(encoding="utf-8"),
+            text.replace('\t"a": 1,', '\t"a": 2,')
+                .replace('"c": "keep"', '"c": "new"'))
+
+    def test_update_nested_value_stays_one_line(self):
+        text = '{\n  "a": 1,\n  "b": [\n    1,\n    2\n  ]\n}\n'
+        self._write_text(text)
+        rpc_config.update_json_document(self.config_path, {"b": [9]})
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"),
+                         '{\n  "a": 1,\n  "b": [9]\n}\n')
+
+    def test_add_key_only_appends_one_line(self):
+        text = '{\n  "a": 1\n}\n'
+        self._write_text(text)
+        rpc_config.update_json_document(self.config_path, {"b": 2})
+        result = self.config_path.read_text(encoding="utf-8")
+        self.assertEqual(result, '{\n  "a": 1,\n  "b": 2\n}\n')
+        self.assertEqual(result.count("\n"), text.count("\n") + 1)
+
+    def test_add_key_with_comma_first_style_line(self):
+        # 逗号开头行等手写风格：新键仍独占一行，缩进沿用末条目行首空白
+        text = '{\n  "a": 1\n  ,"b": {\n    "x": 1\n  }\n}\n'
+        self._write_text(text)
+        rpc_config.update_json_document(self.config_path, {"c": 3})
+        result = self.config_path.read_text(encoding="utf-8")
+        self.assertEqual(result,
+                         '{\n  "a": 1\n  ,"b": {\n    "x": 1\n  },\n  "c": 3\n}\n')
+        self.assertEqual(result.count("\n"), text.count("\n") + 1)
+
+    def test_add_key_to_single_line_file_stays_inline(self):
+        text = '{"a": 1}'
+        self._write_text(text)
+        rpc_config.update_json_document(self.config_path, {"b": 2})
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"),
+                         '{"a": 1, "b": 2}')
+
+    def test_delete_key_only_removes_its_line(self):
+        text = '{\n  "a": 1,\n  "b": 2,\n  "c": 3\n}\n'
+        self._write_text(text)
+        rpc_config.update_json_document(self.config_path, {}, deletes=("b",))
+        self.assertEqual(self.config_path.read_text(encoding="utf-8"),
+                         '{\n  "a": 1,\n  "c": 3\n}\n')
+
+    def test_write_rpc_config_updates_preserves_formatting(self):
+        text = '{\n\t"request_topic": "x230",\n    "pub_key" : "abc"\n}\n'
+        self._write_text(text)
+        rpc_config._write_rpc_config_updates(
+            {"request_topic": "new/topic"}, self.config_path)
+        self.assertEqual(
+            self.config_path.read_text(encoding="utf-8"),
+            text.replace('"request_topic": "x230"',
+                         '"request_topic": "new/topic"'))
+
+    def test_machine_id_fallback_only_adds_one_line(self):
+        text = '{\n  "pub_key": "abc"\n}\n'
+        self._write_text(text)
+        module = types.ModuleType("U")
+        module.get_machine_id = mock.Mock(return_value="TestDevice_123456")
+        with mock.patch.dict(sys.modules, {"U": module}):
+            self.assertEqual(
+                rpc_config._resolve_request_topic(path=self.config_path),
+                "TestDevice_123456")
+        self.assertEqual(
+            self.config_path.read_text(encoding="utf-8"),
+            '{\n  "pub_key": "abc",\n'
+            '  "request_topic": "TestDevice_123456"\n}\n')
+
+    def test_invalid_file_falls_back_to_full_write(self):
+        self._write_text('{ broken json')
+        rpc_config.update_json_document(self.config_path, {"a": 1})
+        self.assertEqual(
+            json.loads(self.config_path.read_text(encoding="utf-8")),
+            {"a": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

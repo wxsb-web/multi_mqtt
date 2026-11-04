@@ -398,10 +398,9 @@ def _json_brokers(brokers):
     ]
 
 
-def write_json_document(path, document):
-    """原子写 JSON 文档（server_mqtt 配置写回 / server_http 别名持久化共用）。
+def _atomic_write_text(path, text):
+    """同目录临时文件 + fsync + ``os.replace`` 原子替换文本，保留原文件权限。
 
-    同目录临时文件 + fsync + ``os.replace`` 并发请求不会读到半截 JSON；
     mkstemp 在 POSIX 上固定创建 0600，直接 replace 会把 rpc.json 原本的
     0644 等权限改掉，换成另一个用户运行的服务就可能读不到，所以写临时文件后
     先恢复原文件权限，再原子替换。
@@ -416,8 +415,7 @@ def write_json_document(path, document):
         prefix=config_path.name + '.', suffix='.tmp', dir=str(config_path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as config_file:
-            json.dump(document, config_file, ensure_ascii=False, indent=2)
-            config_file.write("\n")
+            config_file.write(text)
             config_file.flush()
             os.fsync(config_file.fileno())
         if existing_mode is not None:
@@ -429,6 +427,194 @@ def write_json_document(path, document):
         except OSError:
             pass
         raise
+
+
+def write_json_document(path, document):
+    """原子写 JSON 文档（整文件标准化序列化）。
+
+    只用于新建或无法保留原结构的兜底；按键增量改写用
+    :func:`update_json_document`，保留用户手写的缩进与内容。
+    """
+    _atomic_write_text(
+        path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+
+
+def _json_value_end(text, i):
+    """i 处 JSON 值的结束位置（不含值后的分隔符），非法抛 ValueError。"""
+    n = len(text)
+    ch = text[i]
+    if ch == '"':
+        i += 1
+        while i < n:
+            if text[i] == "\\":
+                i += 2
+                continue
+            if text[i] == '"':
+                return i + 1
+            i += 1
+        raise ValueError("JSON 字符串未闭合")
+    if ch in "[{":
+        depth = 0
+        while i < n:
+            c = text[i]
+            if c == '"':
+                i = _json_value_end(text, i)
+                continue
+            if c in "[{":
+                depth += 1
+            elif c in "]}":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        raise ValueError("JSON 容器未闭合")
+    end = i
+    while end < n and text[end] not in ",]} \t\r\n":
+        end += 1
+    if end == i:
+        raise ValueError("JSON 值为空")
+    return end
+
+
+def _top_level_entries(text):
+    """扫描顶层 object 条目：[(key, key_start, value_start, value_end, comma_end)]。
+
+    comma_end 指向条目后逗号的下一位置，无逗号时等于 value_end；
+    另返回右花括号位置。只用于改写定位，完整合法性由 json.loads 保证。
+    """
+    i = 0
+    n = len(text)
+    while i < n and text[i] in " \t\r\n":
+        i += 1
+    if i >= n or text[i] != "{":
+        raise ValueError("顶层不是 JSON object")
+    i += 1
+    entries = []
+    while True:
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            raise ValueError("JSON 截断")
+        if text[i] == "}":
+            return entries, i
+        if text[i] != '"':
+            raise ValueError("顶层键不是字符串")
+        key_start = i
+        key_end = _json_value_end(text, i)
+        key = json.loads(text[key_start:key_end])
+        i = key_end
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n or text[i] != ":":
+            raise ValueError("顶层键后缺冒号")
+        i += 1
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            raise ValueError("JSON 截断")
+        value_start = i
+        value_end = _json_value_end(text, i)
+        i = value_end
+        comma_end = value_end
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i < n and text[i] == ",":
+            comma_end = i + 1
+            i += 1
+        entries.append((key, key_start, value_start, value_end, comma_end))
+
+
+def _entry_by_key(entries, key):
+    return next((entry for entry in entries if entry[0] == key), None)
+
+
+def _insert_entry(text, entries, key, value_text):
+    """新增顶层键：多行文件独占新增一行，缩进沿用末条目行首空白。
+
+    单行文件（全文无换行）行内追加，避免凭空造出无缩进的行。
+    """
+    item = json.dumps(key, ensure_ascii=False) + ": " + value_text
+    if not entries:
+        open_index = text.find("{")
+        return text[:open_index + 1] + item + text[open_index + 1:]
+    last = entries[-1]
+    if "\n" not in text:
+        head = ", "
+    else:
+        line_start = text.rfind("\n", 0, last[1]) + 1
+        line_prefix = text[line_start:last[1]]
+        indent = line_prefix[:len(line_prefix) - len(line_prefix.lstrip())]
+        head = ",\n" + indent
+    return text[:last[4]] + head + item + text[last[4]:]
+
+
+def _remove_entry(text, entries, key):
+    """删除顶层键所在条目并处理相邻逗号与整行换行，其余字节不动。"""
+    index = next((i for i, entry in enumerate(entries)
+                  if entry[0] == key), None)
+    if index is None:
+        return text
+    key_start, _value_start, value_end, comma_end = entries[index][1:]
+    start = key_start
+    while start > 0 and text[start - 1] in " \t":
+        start -= 1
+    if comma_end > value_end:            # 条目后带逗号：连同逗号一起删
+        end = comma_end
+    else:
+        end = value_end
+        if index > 0:                    # 前一条目带逗号：把那个逗号一并删掉
+            previous = entries[index - 1]
+            if previous[4] > previous[3]:
+                start = previous[4] - 1
+    if (start > 0 and text[start - 1] == "\n"
+            and end < len(text) and text[end] == "\n"):
+        end += 1                         # 独占一行：吞行尾换行，正好删一行
+    return text[:start] + text[end:]
+
+
+def update_json_document(path, updates=None, deletes=()):
+    """按键文本级改写 JSON 文件：只动被改键对应文本，其余字节原样保留。
+
+    - 已有键：原位把值文本替换为单行紧凑 JSON；
+    - 新增键：按最后一个顶层键的缩进追加一行（单行文件行内追加）；
+    - 删除键：连同相邻逗号一并移除；
+    - 文件缺失 / 非法 JSON / 顶层非 object：无可保留结构，退化为
+      :func:`write_json_document` 整文件写入（只含 updates 键）。
+
+    不加锁，调用方持 CONFIG_LOCK（与 write_json_document 同约定）。
+    """
+    config_path = Path(path)
+    updates = dict(updates or {})
+    deletes = [key for key in deletes if key]
+    if not updates and not deletes:
+        return
+    text = None
+    if config_path.exists():
+        try:
+            text = config_path.read_text(encoding="utf-8")
+            document = json.loads(text)
+            if not isinstance(document, dict):
+                raise ValueError("顶层不是 object")
+            _top_level_entries(text)
+        except (OSError, ValueError, TypeError) as error:
+            logger.warning("rpc.json 无法保留原结构，整文件标准化写入: %s: %s",
+                           config_path, error)
+            text = None
+    if text is None:
+        write_json_document(config_path, dict(updates))
+        return
+    for key, value in updates.items():
+        entries, _close_index = _top_level_entries(text)
+        value_text = json.dumps(value, ensure_ascii=False)
+        entry = _entry_by_key(entries, key)
+        if entry is not None:
+            text = text[:entry[2]] + value_text + text[entry[3]:]
+        else:
+            text = _insert_entry(text, entries, key, value_text)
+    for key in deletes:
+        entries, _close_index = _top_level_entries(text)
+        text = _remove_entry(text, entries, key)
+    _atomic_write_text(config_path, text)
 
 
 def _read_rpc_config_document(path=None):
@@ -672,14 +858,16 @@ def _write_rpc_config_updates(updates, path=None):
         source.update(updates)
         normalized = _normalize_rpc_config(source)
         serialized = _json_rpc_config(normalized)
+        patch = {}
         for key in updates:
             if key == "broker_list":
-                stored[key] = _json_brokers(normalized["_broker_list_base"])
+                patch[key] = _json_brokers(normalized["_broker_list_base"])
             elif key == "pub_key" and updates[key] == "":
-                stored[key] = ""
+                patch[key] = ""
             elif key in serialized:
-                stored[key] = serialized[key]
-        write_json_document(config_path, stored)
+                patch[key] = serialized[key]
+        # 文本级按键改写：只动被改键的一行，保留用户手写缩进与其余内容
+        update_json_document(config_path, patch)
 
 
 def _read_request_topic_map(stored):
