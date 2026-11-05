@@ -13,6 +13,8 @@
 #   curl "http://127.0.0.1:1188/r=first_packet_stats.get_report()"
 #   curl "http://127.0.0.1:1188/r=first_packet_stats.get_report(reset=True)"
 #       # 读完清零，开始新的统计窗口
+#   curl "http://127.0.0.1:1188/r=first_packet_stats.get_report(snapshots=True)"
+#       # 时间切片体积=窗口数×broker数，默认不返回，需要时才带出
 #
 # 说明：QoS0 下 on_publish 只代表「包已交给网络层」，不代表 broker 已回执；
 # 上行统计因此是发送侧口径。真正能证明到达 broker 的只有业务回包，那部分
@@ -866,13 +868,15 @@ class FirstPacketStats:
         except Exception:
             return set()
 
-    def get_report(self, reset: bool = False) -> dict:
+    def get_report(self, reset: bool = False, snapshots: bool = False) -> dict:
         """生成一份可 JSON 序列化的统计报表（reset=True 时读完即清零）。
 
         三层结构：
           health    总览结论（整体评分 / 按阈值归类的名单）
           brokers   每 broker 统一视图（连接 + 下行 + 上行 + 评分/角色/趋势）
-          snapshots 时间切片（默认每小时一窗，看「最近是否在恶化」）
+          snapshots 时间切片（默认每小时一窗，看「最近是否在恶化」）；
+                    snapshots=False（默认）时整块不返回——每窗 × 每 broker
+                    的记录体积很大，按需用 snapshots=True 才带出
         其余 section 保留原始计数与诊断现场，字段口径见 note。
         """
         now = time.monotonic()
@@ -940,7 +944,7 @@ class FirstPacketStats:
             res = {h: {k: list(v) for k, v in d.items()}
                    for h, d in self._samples.items()}
             gres = {k: list(v) for k, v in self._gsamples.items()}
-            snapshots = list(self._snapshots)
+            snap_rows = list(self._snapshots) if snapshots else None
             uptime = max(0.0, now - self._t0)
             last_bcast_at = (round(now - self._last_bcast_at, 1)
                              if self._last_bcast_at is not None else None)
@@ -969,12 +973,11 @@ class FirstPacketStats:
         for host, r in records.items():
             r["trend"] = self._trend(host)
         health = self._health(records)
-        return {
+        out = {
             "uptime_s": round(uptime, 1),
             "installed": self._installed,
             "health": health,
             "brokers": records,
-            "snapshots": snapshots,
             "requests": {
                 "n": req_n,
                 "observed": observed,
@@ -1142,7 +1145,9 @@ class FirstPacketStats:
                 "随即消费）；ack_without_mid 恒等于 ack_before_reg+"
                 "ack_after_drop；ack_foreign=stats ping 的 ack，不进前两者。"
                 "\nsnapshots：窗口=相邻两次滚动时刻的累计差分，默认 1 小时一窗"
-                "（_SNAP_INTERVAL），窗口边界是滚动时刻不是整点，静默期会并窗。"
+                "（_SNAP_INTERVAL），窗口边界是滚动时刻不是整点，静默期会并窗；"
+                "该块体积=窗口数×broker数，默认不返回，get_report(snapshots=True)"
+                " 才带出（trend 仍用内部切片计算，不受影响）。"
                 "\ncoverage：predicted=按连接状态预测本批要发的 host 数；"
                 "attempted=publish 实际进包装器的 host 数（恒等于 seen+blind）；"
                 "blind=有下行却无上行样本（client 被重建/未包装，publish 绕过了"
@@ -1156,6 +1161,9 @@ class FirstPacketStats:
                 "快照不同时刻，属正常。"
             ),
         }
+        if snap_rows is not None:
+            out["snapshots"] = snap_rows
+        return out
 
     def _connectivity(self):
         net = getattr(self._node, "mqtt_net", None)

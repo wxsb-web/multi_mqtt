@@ -916,7 +916,7 @@ class FirstPacketStatsTests(unittest.TestCase):
         net.downlink("sys/device/response", {"req_id": "req-1"}, "broker-a")
         # 回拨窗口起点，逼出一次滚动封窗
         self.stats._snap_at = time.monotonic() - self.stats._SNAP_INTERVAL - 1
-        rep = self.stats.get_report()
+        rep = self.stats.get_report(snapshots=True)
         self.assertEqual(len(rep["snapshots"]), 1)
         win = rep["snapshots"][0]
         self.assertGreater(win["window_end_s"], win["window_start_s"])
@@ -926,6 +926,15 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertIsNone(row["downlink"]["latency_ms"]["max"])
         self.assertIsNotNone(row["downlink"]["latency_ms"]["avg"])
         self.assertIsNone(row["trend"])   # 窗口行本身不带趋势
+
+    def test_snapshots_omitted_by_default(self):
+        """默认不带时间切片（体积=窗口数×broker数），显式 snapshots=True 才返回。"""
+        self.stats._snap_at = time.monotonic() - self.stats._SNAP_INTERVAL - 1
+        rep = self.stats.get_report()
+        self.assertNotIn("snapshots", rep)
+        rep2 = self.stats.get_report(snapshots=True)
+        self.assertIn("snapshots", rep2)
+        self.assertEqual(len(rep2["snapshots"]), 1)
 
     def test_brokers_view_covers_quiet_hosts_and_is_dict(self):
         """统一视图：按 host 键 O(1) 查找，安静的节点也有完整行。"""

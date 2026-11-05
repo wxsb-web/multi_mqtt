@@ -47,7 +47,9 @@ AI 常驻调用（监控窗口模型，避免每条命令重连 broker）
 
     curl "http://127.0.0.1:1188/r=first_packet_stats.get_report()"
     curl "http://127.0.0.1:1188/r=first_packet_stats.get_report(reset=True)"
-    # 逐 broker 的胜率/延迟 min-avg-max；reset=True 读完清零开新窗口
+    curl "http://127.0.0.1:1188/r=first_packet_stats.get_report(snapshots=True)"
+    # 逐 broker 的胜率/延迟 min-avg-max；reset=True 读完清零开新窗口；
+    # snapshots=True 才返回时间切片（体积=窗口数×broker数，默认不带）
 
 MCP 工具服务（Model Context Protocol，AI 客户端标准工具协议）
 ====================================================
