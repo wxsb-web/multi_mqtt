@@ -60,11 +60,12 @@ from collections import deque
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
 _CLIENT_DIR = os.path.join(_ROOT, "client")
-for _path in (_ROOT, _CLIENT_DIR):
+for _path in (_ROOT, _CLIENT_DIR, _HERE):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
 import client_mqtt  # noqa: E402  复用 client/rpc 的 MQTT 客户端与配置读取
+import xime_ui  # noqa: E402  元素视图的页面 / WebSocket / MQTT 数据面
 from multi_mqtt import get_standard_pem_bytes  # noqa: E402
 
 logger = logging.getLogger("xime_mcp")
@@ -120,6 +121,9 @@ _CONFIG_DEFAULTS = {
     "reply_topic": None,
     "private_key": None,
 }
+
+# 命令行覆盖（与 client_mqtt 的 alias 同名参数）：非 None 的键优先于 rpc.json。
+_CLI_OVERRIDES = {}
 
 
 class XimeConfigError(RuntimeError):
@@ -197,6 +201,9 @@ def get_config(path=None):
                         _CONFIG_DEFAULTS["allow_no_server_pubkey_response"])),
         "private_key": _normalize_key(section.get("private_key", section.get("k"))),
     }
+    for key, value in _CLI_OVERRIDES.items():
+        if value is not None:
+            config[key] = value
     return config
 
 
@@ -284,6 +291,11 @@ def _send_device_code(code, op, timeout, config):
         result["error"] = raw.get("error") or "RPC 执行失败"
         result["ok"] = False
     return result
+
+
+# 元素视图的数据面复用同一套控制面 RPC 与 rpc.json 配置，避免循环导入。
+xime_ui.configure(send_code=_send_device_code, get_config_fn=get_config,
+                  log_event=_event)
 
 
 def _q(value):
@@ -455,6 +467,64 @@ def xime_launch_app(package):
     return _send_device_code(code, "launch_app", None, config)
 
 
+def xime_event_state():
+    """读取无障碍事件版本号与最近一次事件（静止时版本号不变，可用于判断是否需要刷新）。"""
+    return _call("event_state", op="event_state")
+
+
+def xime_event_capture(enabled=True, ttl_ms=30000):
+    """开启/关闭无障碍事件监听，ttl_ms 到期自动关闭；仅在自动化期间开启。"""
+    return _call("event_capture", bool(enabled), int(ttl_ms), op="event_capture")
+
+
+def xime_windows():
+    """列出当前窗口（id/type/layer/title/active/focused/bounds/package）。"""
+    return _call("windows", op="windows")
+
+
+def xime_perform_action(node_ref, action, text=""):
+    """对节点执行通用无障碍动作。node_ref 形如 w0:p1.2；
+    action 支持 click/long_click/scroll_forward/scroll_backward/set_text/paste/select/focus/clear_focus。"""
+    return _call("perform_action", str(node_ref), str(action), str(text),
+                 op="perform_action")
+
+
+def xime_set_text(node_ref, text):
+    """向节点写入文本（ACTION_SET_TEXT，失败时设备端会回读校验）。"""
+    return _call("set_text", str(node_ref), str(text), op="set_text")
+
+
+def xime_screenshot(window_id=-1):
+    """按需截图（-1 为整屏）；返回本地文件路径与尺寸，低版本或受限 ROM 会明确报错。"""
+    return _call("screenshot", int(window_id), op="screenshot")
+
+
+
+# 无障碍 API 不能点亮屏幕：改用 PowerManager 的 SCREEN_BRIGHT_WAKE_LOCK(10) +
+# ACQUIRE_CAUSES_WAKEUP(0x10000000) = 0x1000000A。只亮屏，不清除密码锁屏。
+_WAKE_CODE = """import json
+try:
+    from java import jclass
+    _app = jclass("com.chaquo.python.Python").getPlatform().getApplication()
+    _pm = _app.getSystemService("power")
+    _before = bool(_pm.isInteractive())
+    if not _before:
+        _pm.newWakeLock(0x1000000A, "xime:rpc_wake").acquire(%d)
+    r = json.dumps({"ok": True, "op": "wake", "interactive_before": _before,
+                    "interactive": bool(_pm.isInteractive())}, ensure_ascii=False)
+except Exception as exc:
+    r = json.dumps({"ok": False, "op": "wake", "error": str(exc)},
+                   ensure_ascii=False)
+"""
+
+
+def xime_wake(seconds=10):
+    """点亮屏幕（seconds 秒后自动释放）；有密码的锁屏仍需人工解锁。"""
+    config = get_config()
+    wake_ms = max(1000, int(float(seconds) * 1000))
+    return _send_device_code(_WAKE_CODE % wake_ms, "wake", None, config)
+
+
 _MCP_INSTRUCTIONS = (
     "远端手机的无障碍服务（XimeAccessibilityService）。所有工具经 MQTT RPC "
     "把控制代码动态下发到手机进程执行，手机端只需运行 server_mqtt 与内置 "
@@ -462,6 +532,9 @@ _MCP_INSTRUCTIONS = (
     "节点中心点），等待界面用 wait_text；坐标手势用 tap / long_press / swipe / "
     "drag / pinch / gesture；系统操作用 global_action；启动界面用 "
     "start_activity；列应用用 list_apps，按包名启动应用用 launch_app；"
+    "事件版本用 event_state，按需开关事件监听用 event_capture，列窗口用 "
+    "windows，按节点路径执行通用动作用 perform_action，写文本用 set_text，"
+    "按需截图用 screenshot；"
     "失败时先 status 看连接；需要完整体检时用 status(deep=True)。"
 )
 
@@ -527,11 +600,18 @@ _TOOLS = (
     xime_start_activity,
     xime_list_apps,
     xime_launch_app,
+    xime_event_state,
+    xime_event_capture,
+    xime_windows,
+    xime_perform_action,
+    xime_set_text,
+    xime_screenshot,
+    xime_wake,
 )
 
 
 def register_tools(server):
-    """把上面 15 个函数注册成 MCP 工具（对外名称去掉 xime_ 前缀）。"""
+    """把上面的工具注册成 MCP 工具（对外名称去掉 xime_ 前缀）。"""
     for fn in _TOOLS:
         server.tool(name=_tool_name(fn))(_log_tool(fn))
 
@@ -540,404 +620,10 @@ def register_tools(server):
 # 元素视图：浏览器里用 SVG 画远端界面（不是截屏，只按 dump_ui 的 bounds 绘制）
 # ----------------------------------------------------------------------------
 
-_UI_MAX_NODES = 600
-
-
-def _ui_payload(max_nodes=_UI_MAX_NODES, include_empty=True):
-    """取一次界面节点树供 ui_html 渲染；任何异常都折叠成 ok=False 的 dict。"""
-    try:
-        result = xime_dump_ui(int(max_nodes), bool(include_empty))
-    except Exception as exc:
-        return {"ok": False, "op": "dump_ui", "nodes": [], "count": 0,
-                "error": "%s: %s" % (type(exc).__name__, exc)}
-    if not isinstance(result, dict):
-        return {"ok": False, "op": "dump_ui", "nodes": [], "count": 0,
-                "error": "设备返回类型不支持: %s" % type(result).__name__}
-    result.setdefault("nodes", [])
-    return result
-
-
 def ui_html(p):
-    """元素视图页面（HTTP RPC：``/ui_html(p)``，根路径自动跳转）。
+    """元素视图页面（HTTP RPC：``/ui_html(p)``，根路径自动跳转）。"""
+    return xime_ui.ui_html(p)
 
-    不是截图：只把 dump_ui 返回的节点 bounds 画成 SVG 矩形，按层级用不同
-    颜色区分，可点击/可编辑/可滚动各有标记。鼠标点击页面任意位置时，把
-    屏幕坐标换算成设备坐标，经 ``/r=xime_tap(x,y)`` 回传到手机。
-    """
-    p.set_header("Content-Type", "text/html; charset=utf-8")
-    p.set_header("Cache-Control", "no-store")
-    payload = _ui_payload()
-    data = json.dumps(payload, ensure_ascii=False)
-    data = data.replace("</", "<\\/")
-    p.set_data(_UI_PAGE.replace("__DATA__", data))
-
-
-_UI_PAGE = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>xime 元素视图</title>
-<style>
-* { box-sizing: border-box; }
-html, body { height: 100%; margin: 0; overflow: hidden; background: #0b0f14;
-  color: #d7e0ea; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
-#side { position: absolute; top: 0; right: 0; bottom: 0; width: 240px;
-  display: flex; flex-direction: column; gap: 12px; padding: 14px 12px;
-  border-left: 1px solid #1e2a36; background: #0e141b; }
-#side .name { font-weight: 600; color: #7ee787; white-space: nowrap; }
-#meta { font-size: 12px; line-height: 1.6; color: #8ea3b7; word-break: break-all;
-  max-height: 40vh; overflow: auto; }
-button { background: #1b2733; color: #d7e0ea; border: 1px solid #2b3a4a;
-  border-radius: 4px; padding: 6px 12px; cursor: pointer; font: inherit; width: 100%; }
-button:hover { background: #243444; }
-label { display: flex; align-items: center; gap: 6px; color: #8ea3b7;
-  font-size: 12px; user-select: none; cursor: pointer; white-space: nowrap; }
-#stage { position: absolute; inset: 0 240px 0 0; display: flex; align-items: center;
-  justify-content: center; padding: 8px; }
-#ui { height: 100%; width: auto; max-width: 100%; background: #0f1620;
-  border: 1px solid #22303e; border-radius: 2px; cursor: crosshair;
-  touch-action: manipulation; }
-#ui rect:hover { stroke: #ffffff !important; stroke-width: 3px !important; }
-#msg { position: absolute; left: 12px; bottom: 12px; max-width: calc(100% - 264px);
-  padding: 6px 12px; border-radius: 4px; background: rgba(14,20,27,.94);
-  border: 1px solid #2b3a4a; color: #d7e0ea; font-size: 12px; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-#msg.err { border-color: #a3342f; color: #ff9a94; }
-#legend { margin-top: auto; display: flex; flex-direction: column; gap: 6px;
-  padding-top: 10px; border-top: 1px solid #1e2a36; font-size: 11px;
-  color: #8ea3b7; }
-#legend span { display: flex; align-items: center; }
-#legend i { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
-  margin-right: 4px; vertical-align: -1px; flex: none; }
-</style>
-</head>
-<body>
-<div id="stage"><svg id="ui" xmlns="http://www.w3.org/2000/svg"
-  preserveAspectRatio="xMidYMid meet"></svg></div>
-<aside id="side">
-  <span class="name">xime 元素视图</span>
-  <span id="meta">加载中…</span>
-  <label><input id="auto" type="checkbox"> 自动刷新</label>
-  <button id="refresh">刷新</button>
-  <div id="legend">
-    <span><i style="background:linear-gradient(90deg,#4ea1ff,#39d0c4,#7ee787,#e3b341,#ff8a65,#c792ea)"></i>不同颜色=不同层级</span>
-    <span><i style="background:transparent;border:2px solid #d7e0ea"></i>可点击(粗边)</span>
-    <span><i style="background:#ff8a65"></i>可编辑</span>
-    <span><i style="background:transparent;border:1px dashed #d7e0ea"></i>可滚动</span>
-  </div>
-</aside>
-<div id="msg"></div>
-<script>
-const DATA = __DATA__;
-const NS = 'http://www.w3.org/2000/svg';
-const PALETTE = ['#4ea1ff', '#39d0c4', '#7ee787', '#e3b341',
-                 '#ff8a65', '#c792ea', '#f78fb3', '#9fb0c0'];
-const svg = document.getElementById('ui');
-const metaEl = document.getElementById('meta');
-const msgEl = document.getElementById('msg');
-let W = 0, H = 0, tapping = false;
-
-function el(tag, attrs) {
-  const node = document.createElementNS(NS, tag);
-  for (const key in attrs) node.setAttribute(key, attrs[key]);
-  return node;
-}
-
-function shortClass(name) {
-  const text = String(name || '');
-  const parts = text.split('.');
-  return parts[parts.length - 1] || text;
-}
-
-function labelOf(n) {
-  return n.t || n.d || (n.id ? String(n.id).split('/').pop() : '')
-         || shortClass(n.c) || '?';
-}
-
-function summary(data) {
-  if (!data || !data.ok) {
-    return '读取失败: ' + ((data && data.error) || '未知错误');
-  }
-  const parts = ['pkg=' + (data.pkg || '(未知)'),
-                 '节点=' + (data.count !== undefined ? data.count : (data.nodes || []).length)];
-  if (data.elapsed_ms !== undefined) parts.push('RPC ' + data.elapsed_ms + 'ms');
-  parts.push('点击画面回传 tap');
-  return parts.join(' · ');
-}
-
-function setMsg(text, isError) {
-  msgEl.textContent = text;
-  msgEl.className = isError ? 'err' : '';
-}
-
-function describe(n) {
-  const flags = [];
-  if (n.k) flags.push('可点击');
-  if (n.e) flags.push('可编辑');
-  if (n.s) flags.push('可滚动');
-  if (n.f) flags.push('聚焦');
-  const b = n.b || [0, 0, 0, 0];
-  return shortClass(n.c) + '  [' + b.join(', ') + ']  ' + labelOf(n).slice(0, 40)
-         + (flags.length ? '  ' + flags.join('/') : '');
-}
-
-function computeTree(nodes) {
-  const stack = [];
-  const depths = [];
-  const hasChild = [];
-  nodes.forEach(function (n, index) {
-    const b = n.b;
-    hasChild[index] = false;
-    if (!b || b.length < 4) { depths.push(0); return; }
-    const w = b[2] - b[0], h = b[3] - b[1];
-    // 零面积节点不参与层级推导，否则会把真正的叶子误判成容器
-    if (w <= 0 || h <= 0) { depths.push(0); return; }
-    while (stack.length) {
-      const t = nodes[stack[stack.length - 1]].b;
-      const inside = b[0] >= t[0] - 1 && b[1] >= t[1] - 1
-                  && b[2] <= t[2] + 1 && b[3] <= t[3] + 1;
-      if (inside) break;
-      stack.pop();
-    }
-    depths.push(stack.length);
-    if (stack.length) hasChild[stack[stack.length - 1]] = true;
-    stack.push(index);
-  });
-  return {depths: depths, hasChild: hasChild};
-}
-
-function render() {
-  const nodes = (DATA && Array.isArray(DATA.nodes)) ? DATA.nodes : [];
-  for (const n of nodes) {
-    const b = n && n.b;
-    if (!b || b.length < 4) continue;
-    W = Math.max(W, b[2]);
-    H = Math.max(H, b[3]);
-  }
-  W = W || 1080;
-  H = H || 1920;
-  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
-  svg.setAttribute('width', W);
-  svg.setAttribute('height', H);
-  svg.appendChild(el('rect', {x: 0, y: 0, width: W, height: H, fill: '#0f1620'}));
-
-  if (DATA && DATA.pkg) document.title = 'xime 元素视图 · ' + DATA.pkg;
-  metaEl.textContent = summary(DATA);
-  if (!DATA || !DATA.ok) {
-    setMsg(summary(DATA), true);
-    return;
-  }
-  if (!nodes.length) {
-    const tip = el('text', {x: W / 2, y: H / 2, 'text-anchor': 'middle',
-      'font-size': Math.max(18, Math.round(H / 30)), fill: '#8ea3b7',
-      'font-family': 'system-ui, sans-serif'});
-    tip.textContent = '未取到节点（界面可能不可访问或已锁屏）';
-    svg.appendChild(tip);
-    return;
-  }
-
-  const tree = computeTree(nodes);
-
-  // 第一遍只画矩形：标签必须最后统一画，否则会被后绘制的子节点矩形盖住
-  nodes.forEach(function (n, index) {
-    const b = n.b;
-    if (!b || b.length < 4) return;
-    const x = b[0], y = b[1], w = b[2] - b[0], h = b[3] - b[1];
-    if (w <= 0 || h <= 0) return;
-    const color = PALETTE[Math.min(tree.depths[index], PALETTE.length - 1)];
-    const clickable = !!n.k, editable = !!n.e, scrollable = !!n.s;
-    const attrs = {
-      x: x, y: y, width: w, height: h, 'rx': 3,
-      fill: editable ? '#ff8a65' : color,
-      'fill-opacity': clickable ? '0.22' : (editable ? '0.20' : '0.07'),
-      stroke: editable ? '#ffb59c' : color,
-      'stroke-opacity': clickable ? '0.95' : '0.60',
-      'stroke-width': clickable ? '2' : '1',
-      'vector-effect': 'non-scaling-stroke'
-    };
-    if (scrollable && !clickable) attrs['stroke-dasharray'] = '4 3';
-    const rect = el('rect', attrs);
-    rect.addEventListener('mouseenter', function () {
-      metaEl.textContent = describe(n);
-    });
-    svg.appendChild(rect);
-  });
-
-  // 完全相同的 bounds 只让最深层节点出标签，避免多层同名文字压在一起
-  const boxOwner = new Map();
-  nodes.forEach(function (n, index) {
-    const b = n.b;
-    if (!b || b.length < 4) return;
-    if (b[2] - b[0] <= 0 || b[3] - b[1] <= 0) return;
-    const key = b.join(',');
-    const prev = boxOwner.get(key);
-    if (prev === undefined || tree.depths[index] >= tree.depths[prev]) {
-      boxOwner.set(key, index);
-    }
-  });
-
-  const labeledBoxes = new Set();
-  const placedLabels = [];
-  let fallback = -1;
-
-  function drawLabel(n, index) {
-    const b = n.b;
-    const x = b[0], y = b[1], w = b[2] - b[0], h = b[3] - b[1];
-    const fontSize = Math.min(26, Math.max(10, h / 2.2));
-    if (w < fontSize * 2 || h < fontSize + 4) return false;
-    const boxKey = b.join(',');
-    if (labeledBoxes.has(boxKey)) return false;
-    const maxChars = Math.max(1, Math.floor(
-      Math.min(w - 8, W * 0.5) / (fontSize * 0.85)));
-    let text = labelOf(n);
-    if (text.length > maxChars) text = text.slice(0, maxChars - 1) + '…';
-
-    const label = el('text', {
-      x: x + 3, y: 0, 'font-size': fontSize,
-      fill: '#ffffff', 'fill-opacity': '0.96', 'pointer-events': 'none',
-      'font-family': 'ui-monospace, Consolas, monospace'
-    });
-    label.textContent = text;
-    svg.appendChild(label);
-
-    function measure() {
-      try { return label.getComputedTextLength(); } catch (e) { return 0; }
-    }
-    const maxWidth = Math.min(w - 8, W * 0.5);
-    let textWidth = measure();
-    // 估算截断后仍可能超宽（中文比等宽字符宽），按真实测量再二分截断到框内
-    if (textWidth > maxWidth) {
-      let lo = 1, hi = text.length, best = 1;
-      while (lo <= hi) {
-        const mid = Math.floor((lo + hi) / 2);
-        label.textContent = text.slice(0, mid) + '…';
-        textWidth = measure();
-        if (textWidth <= maxWidth) { best = mid; lo = mid + 1; }
-        else { hi = mid - 1; }
-      }
-      label.textContent = text.slice(0, best) + '…';
-      textWidth = measure();
-    }
-    const chipW = Math.min(w - 2, textWidth + 6);
-    const chipH = fontSize * 1.32;
-    const lineHeight = fontSize * 1.42;
-
-    // 与已经放好的标签逐行碰撞检测：往下挪，挪不出本节点就放弃这个标签
-    let labelTop = y + 2;
-    while (labelTop + chipH <= y + h) {
-      let clash = false;
-      for (const p of placedLabels) {
-        if (x + 1 < p.x + p.w && x + 1 + chipW > p.x
-            && labelTop < p.y + p.h && labelTop + chipH > p.y) {
-          clash = true;
-          break;
-        }
-      }
-      if (!clash) break;
-      labelTop += lineHeight;
-    }
-    if (labelTop + chipH > y + h) {
-      label.remove();
-      return false;
-    }
-    label.setAttribute('y', labelTop + fontSize);
-    placedLabels.push({x: x + 1, y: labelTop, w: chipW, h: chipH});
-    labeledBoxes.add(boxKey);
-
-    const chip = el('rect', {
-      x: x + 1, y: labelTop, width: chipW, height: chipH,
-      'rx': 2, fill: '#0b0f14', 'fill-opacity': '0.78',
-      'pointer-events': 'none'
-    });
-    svg.insertBefore(chip, label);
-    return true;
-  }
-
-  nodes.forEach(function (n, index) {
-    const b = n.b;
-    if (!b || b.length < 4) return;
-    if (b[2] - b[0] <= 0 || b[3] - b[1] <= 0) return;
-    if (boxOwner.get(b.join(',')) !== index) return;
-    if (fallback < 0 || tree.depths[index] > tree.depths[fallback]) {
-      fallback = index;
-    }
-    const hasText = !!(n.t || n.d || n.id);
-    // 纯容器（无文本但有子节点）不标类名，让真正的叶子节点出标签
-    if (!hasText && tree.hasChild[index]) return;
-    drawLabel(n, index);
-  });
-
-  // 整页都是纯容器、一个标签都没有时，至少标出最深层节点
-  if (labeledBoxes.size === 0 && fallback >= 0) {
-    drawLabel(nodes[fallback], fallback);
-  }
-}
-
-function toDevice(ev) {
-  const matrix = svg.getScreenCTM();
-  if (!matrix) return null;
-  const point = svg.createSVGPoint();
-  point.x = ev.clientX;
-  point.y = ev.clientY;
-  const local = point.matrixTransform(matrix.inverse());
-  return {x: Math.round(local.x), y: Math.round(local.y)};
-}
-
-function marker(x, y) {
-  const radius = Math.max(9, Math.round(W / 70));
-  const dot = el('circle', {
-    cx: x, cy: y, r: radius, fill: '#ffd166', 'fill-opacity': '0.9',
-    stroke: '#ffffff', 'stroke-width': '2',
-    'vector-effect': 'non-scaling-stroke', 'pointer-events': 'none'
-  });
-  svg.appendChild(dot);
-  setTimeout(function () { dot.remove(); }, 1400);
-}
-
-svg.addEventListener('mouseleave', function () {
-  metaEl.textContent = summary(DATA);
-});
-
-svg.addEventListener('click', function (ev) {
-  if (tapping) return;
-  const point = toDevice(ev);
-  if (!point) return;
-  if (point.x < 0 || point.y < 0 || point.x > W || point.y > H) return;
-  tapping = true;
-  marker(point.x, point.y);
-  setMsg('tap ' + point.x + ', ' + point.y + ' …');
-  const code = 'xime_tap(' + point.x + ', ' + point.y + ')';
-  fetch('/r=' + encodeURIComponent(code), {cache: 'no-store'})
-    .then(function (resp) { return resp.text(); })
-    .then(function (text) {
-      const flat = text.replace(/\s+/g, ' ').slice(0, 300);
-      const failed = /'ok':\s*False|"ok":\s*false|Traceback/.test(text);
-      setMsg('tap ' + point.x + ',' + point.y + ' → ' + flat, failed);
-      setTimeout(function () { location.reload(); }, 1500);
-    })
-    .catch(function (err) {
-      setMsg('tap ' + point.x + ',' + point.y + ' 失败: ' + err, true);
-      tapping = false;
-    });
-});
-
-const autoEl = document.getElementById('auto');
-try { autoEl.checked = localStorage.getItem('xime_auto') === '1'; } catch (e) {}
-autoEl.addEventListener('change', function () {
-  try { localStorage.setItem('xime_auto', autoEl.checked ? '1' : '0'); } catch (e) {}
-  if (autoEl.checked) setTimeout(function () { location.reload(); }, 4000);
-});
-if (autoEl.checked) setTimeout(function () { location.reload(); }, 4000);
-
-document.getElementById('refresh').addEventListener('click', function () {
-  location.reload();
-});
-
-render();
-</script>
-</body>
-</html>"""
 
 
 # ----------------------------------------------------------------------------
@@ -1178,6 +864,8 @@ def _run_http(server, args):
         persist_aliases=False,
         alias_url=server_http.ALIAS_URL_DASH,
         redirect_root="/ui_html(p)",
+        # 元素视图数据面：浏览器 <-> 本进程 /uiws；本进程 <-> 手机两个 MQTT topic
+        websocket_handlers={xime_ui.WS_PATH: xime_ui.ws_handler},
     )
     _HTTP_SERVER = http_server
     paths = _mount_mcp(server, args.host)
@@ -1214,11 +902,45 @@ def main(argv=None):
     parser.add_argument("--host", default="0.0.0.0", help="HTTP 模式监听地址（远程访问用 0.0.0.0）")
     parser.add_argument("--port", type=int, default=5555, help="HTTP 模式监听端口")
     parser.add_argument("--selftest", action="store_true", help="只调一次手机 status 并打印结果")
+    # 连接参数直接复用 client_mqtt 的别名表：-t/--topic/--request_topic、-k/--key/--private_key、
+    # -mb/--min、-to/--timeout 等与 client 命令行完全一致，非空时覆盖 rpc.json。
+    parser.add_argument(
+        *client_mqtt._cli_opts(*client_mqtt.alias_request_topic),
+        dest="request_topic", default=None,
+        help="覆盖 xime_mcp.request_topic（手机 server_mqtt 监听的 topic）")
+    parser.add_argument(
+        *client_mqtt._cli_opts(*client_mqtt.alias_reply_topic),
+        dest="reply_topic", default=None,
+        help="覆盖 xime_mcp.reply_topic")
+    parser.add_argument(
+        *client_mqtt._cli_opts(*client_mqtt.alias_private_key),
+        dest="private_key", default=None,
+        help="覆盖 xime_mcp.private_key（支持 2**222 / k=表达式 / PEM / 文件路径）")
+    parser.add_argument(
+        *client_mqtt._cli_opts(*client_mqtt.alias_timeout),
+        dest="rpc_timeout", type=float, default=None,
+        help="覆盖 xime_mcp.timeout（秒）")
+    parser.add_argument(
+        *client_mqtt._cli_opts(*client_mqtt.alias_min_broker_count),
+        dest="min_broker_count", type=int, default=None,
+        help="覆盖 xime_mcp.min_broker_count")
+    parser.add_argument(
+        *client_mqtt._cli_opts(*client_mqtt.alias_allow_no_pub),
+        dest="allow_no_pub", action="store_true", default=None,
+        help="覆盖 xime_mcp.allow_no_server_pubkey_response=True")
     args = parser.parse_args(argv)
 
     logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                         format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
     CONFIG_PATH = args.config
+    _CLI_OVERRIDES.update({
+        "request_topic": (args.request_topic or "").strip() or None,
+        "reply_topic": (args.reply_topic or "").strip() or None,
+        "timeout": args.rpc_timeout,
+        "min_broker_count": args.min_broker_count,
+        "allow_no_server_pubkey_response": True if args.allow_no_pub else None,
+        "private_key": _normalize_key(args.private_key) if args.private_key else None,
+    })
 
     if args.selftest:
         print(json.dumps(xime_status(), ensure_ascii=False, indent=2))
