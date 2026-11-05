@@ -417,7 +417,8 @@ class MQTTClientNode:
 
 def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_TIMEOUT,
         client_private_key_bytes=None, allow_no_server_pubkey_response: bool = False,
-        reply_topic: str = REPLY_TOPIC, min_broker_count:int=10, **ka):
+        reply_topic: str = REPLY_TOPIC, min_broker_count:int=10,
+        broker_add=None, **ka):
     """Execute code through a lazily started shared MQTT client.
 
     救援通道（timestamp_ms / ts / server_ms 别名）：服务端验签开启且时钟
@@ -436,6 +437,7 @@ def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_
     timeout=get_duplicated_kargs(ka,*alias_timeout,default=timeout)
     timestamp_ms=get_duplicated_kargs(ka,*alias_timestamp_ms,default=None)
     min_broker_count=get_duplicated_kargs(ka,*alias_min_broker_count,default=min_broker_count)
+    broker_add=get_duplicated_kargs(ka,*alias_broker_add,default=broker_add)
     stats_print_interval=get_duplicated_kargs(ka,*alias_stats_print_interval,default=None)
     stats_ping_interval=get_duplicated_kargs(ka,*alias_stats_ping_interval,default=None)
     with _default_client_lock:
@@ -445,6 +447,7 @@ def rpc(code: str, request_topic: str = REQUEST_TOPIC, timeout: float = DEFAULT_
                 allow_no_server_pubkey_response=allow_no_server_pubkey_response,
                 stats_print_interval=stats_print_interval,
                 stats_ping_interval=stats_ping_interval,
+                broker_add=broker_add,
             )
             _default_client.start()
         client = _default_client

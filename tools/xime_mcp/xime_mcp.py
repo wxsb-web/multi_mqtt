@@ -67,6 +67,7 @@ for _path in (_ROOT, _CLIENT_DIR, _HERE):
 import client_mqtt  # noqa: E402  复用 client/rpc 的 MQTT 客户端与配置读取
 import xime_ui  # noqa: E402  元素视图的页面 / WebSocket / MQTT 数据面
 from multi_mqtt import get_standard_pem_bytes  # noqa: E402
+from rpc_config import parse_broker_add  # noqa: E402  --broker_add 的 host:port 解析口径
 
 logger = logging.getLogger("xime_mcp")
 
@@ -120,10 +121,15 @@ _CONFIG_DEFAULTS = {
     "allow_no_server_pubkey_response": True,
     "reply_topic": None,
     "private_key": None,
+    "broker_add": [],
 }
 
 # 命令行覆盖（与 client_mqtt 的 alias 同名参数）：非 None 的键优先于 rpc.json。
 _CLI_OVERRIDES = {}
+
+# UI 运行期追加的 broker（只在内存生效，绝不写 rpc.json）。
+_RUNTIME_BROKERS = []
+_RUNTIME_LOCK = threading.Lock()
 
 
 class XimeConfigError(RuntimeError):
@@ -172,6 +178,41 @@ def _normalize_key(value):
     return get_standard_pem_bytes(text)
 
 
+def _normalize_broker_add(value):
+    """把 broker_add 归一成 ["host:port", ...]：支持单个字符串、[host,port] 与列表。
+
+    非法条目按 parse_broker_add 的口径丢弃（只告警），不影响启动。
+    """
+    if value is None:
+        return []
+    items = [value] if isinstance(value, str) else list(value or [])
+    result = []
+    for item in items:
+        if isinstance(item, (list, tuple)):
+            if len(item) < 2:
+                continue
+            item = "%s:%s" % (item[0], item[1])
+        text = str(item or "").strip()
+        if not text:
+            continue
+        entry = parse_broker_add(text)
+        if entry is None:
+            continue
+        spec = "%s:%d" % entry
+        if spec not in result:
+            result.append(spec)
+    return result
+
+
+def _merge_broker_add(config_value, cli_value):
+    """rpc.json 的 broker_add 与 CLI 的 --broker_add 取并集（CLI 可重复 append）。"""
+    merged = _normalize_broker_add(config_value)
+    for spec in _normalize_broker_add(cli_value):
+        if spec not in merged:
+            merged.append(spec)
+    return merged
+
+
 def get_config(path=None):
     """返回 rpc.json 里 xime_mcp 段的归一化配置；缺失或非法抛 XimeConfigError。"""
 
@@ -200,9 +241,14 @@ def get_config(path=None):
             section.get("allow_no_server_pubkey_response",
                         _CONFIG_DEFAULTS["allow_no_server_pubkey_response"])),
         "private_key": _normalize_key(section.get("private_key", section.get("k"))),
+        "broker_add": _merge_broker_add(section.get("broker_add"), None),
     }
     for key, value in _CLI_OVERRIDES.items():
-        if value is not None:
+        if value is None:
+            continue
+        if key == "broker_add":
+            config["broker_add"] = _merge_broker_add(config["broker_add"], value)
+        else:
             config[key] = value
     return config
 
@@ -250,9 +296,93 @@ def device_call(fn, args=(), op=None, timeout=None):
     return _send_device_code(code, op or fn, timeout, config)
 
 
+def _broker_entries(specs):
+    """["host:port", ...] / [(host, port), ...] -> [[host, port], ...]。"""
+    entries = []
+    for spec in specs or []:
+        parsed = parse_broker_add(spec) if isinstance(spec, str) else spec
+        if not isinstance(parsed, (list, tuple)) or len(parsed) < 2:
+            continue
+        entry = [str(parsed[0]), int(parsed[1])]
+        if entry not in entries:
+            entries.append(entry)
+    return entries
+
+
+def _brokers_for_request(config):
+    """rpc.json + CLI + UI 运行期追加的 broker 合集（全部只在内存生效）。"""
+    specs = list(config.get("broker_add") or [])
+    with _RUNTIME_LOCK:
+        for spec in _RUNTIME_BROKERS:
+            if spec not in specs:
+                specs.append(spec)
+    return specs
+
+
+# 下发每条 RPC 前先在手机进程里把 broker_add 幂等地补进内存 broker 列表：
+# 手机端只要有一条路径没接上 LAN broker，请求就只能走公网。update_brokers
+# 只改内存（不写 rpc.json），已在列表时不重复建连。
+_REMOTE_BROKER_SYNC = r'''try:
+    for _cmq_v in list(globals().values()):
+        _cmq_net = getattr(_cmq_v, "mqtt_net", None)
+        if _cmq_net is None or not callable(getattr(_cmq_net, "update_brokers", None)):
+            continue
+        _cmq_cur = list(getattr(_cmq_net, "brokers", []) or [])
+        _cmq_have = set()
+        for _cmq_b in _cmq_cur:
+            if isinstance(_cmq_b, (list, tuple)) and len(_cmq_b) >= 2:
+                try:
+                    _cmq_have.add((str(_cmq_b[0]).casefold(), int(_cmq_b[1])))
+                except Exception:
+                    pass
+        _cmq_add = []
+        for _cmq_h, _cmq_p in %r:
+            if (str(_cmq_h).casefold(), int(_cmq_p)) not in _cmq_have:
+                _cmq_add.append((str(_cmq_h), int(_cmq_p)))
+        if _cmq_add:
+            _cmq_net.update_brokers(_cmq_cur + _cmq_add)
+        break
+except Exception:
+    pass
+'''
+
+
+def apply_broker_add(entries):
+    """运行期把 broker 追加进本地控制面 MQTT net（内存，绝不写 rpc.json）。
+
+    entries 为 ["host:port", ...] 或 [(host, port), ...]。共享 client 尚未
+    创建时只登记，随后首次 rpc() 会用这份列表建连。
+    """
+    specs = _normalize_broker_add(entries)
+    if not specs:
+        return {"ok": False, "error": "broker_add 无合法条目（格式 host:port）"}
+    with _RUNTIME_LOCK:
+        for spec in specs:
+            if spec not in _RUNTIME_BROKERS:
+                _RUNTIME_BROKERS.append(spec)
+    client = getattr(client_mqtt, "_default_client", None)
+    net = getattr(client, "mqtt_net", None)
+    if net is None or not callable(getattr(net, "update_brokers", None)):
+        return {"ok": True, "added": [], "pending": specs}
+    cur = list(getattr(net, "brokers", []) or [])
+    have = set()
+    for item in cur:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            try:
+                have.add((str(item[0]).casefold(), int(item[1])))
+            except Exception:
+                pass
+    add = [e for e in _broker_entries(specs)
+           if (e[0].casefold(), e[1]) not in have]
+    if add:
+        net.update_brokers(cur + [tuple(e) for e in add])
+    return {"ok": True, "added": ["%s:%d" % tuple(e) for e in add]}
+
+
 def _send_device_code(code, op, timeout, config):
     """把一段设备端 Python 代码经 MQTT RPC 下发，并归一化回包。"""
     rpc_timeout = float(timeout or config["timeout"])
+    broker_add = _brokers_for_request(config)
     kwargs = {
         "request_topic": config["request_topic"],
         "timeout": rpc_timeout,
@@ -265,6 +395,11 @@ def _send_device_code(code, op, timeout, config):
         kwargs["client_private_key_bytes"] = config["private_key"]
     if config["reply_topic"]:
         kwargs["reply_topic"] = config["reply_topic"]
+    if broker_add:
+        kwargs["broker_add"] = broker_add
+        entries = _broker_entries(broker_add)
+        if entries:
+            code = _REMOTE_BROKER_SYNC % (entries,) + "\n" + code
 
     started = time.monotonic()
     raw = client_mqtt.rpc(code, **kwargs)
@@ -295,7 +430,7 @@ def _send_device_code(code, op, timeout, config):
 
 # 元素视图的数据面复用同一套控制面 RPC 与 rpc.json 配置，避免循环导入。
 xime_ui.configure(send_code=_send_device_code, get_config_fn=get_config,
-                  log_event=_event)
+                  log_event=_event, add_brokers=apply_broker_add)
 
 
 def _q(value):
@@ -482,6 +617,23 @@ def xime_windows():
     return _call("windows", op="windows")
 
 
+def xime_broker_add(brokers=("192.168.1.20:1883",)):
+    """为了改善同一个局域网控制延迟， 同时 把 broker 追加进内存 broker 列表（host:port，可空格/逗号分隔多条）。
+
+    只改内存（update_brokers），不写 rpc.json；手机端在下一次 RPC 前自动补上
+    同一批 broker（幂等，已在列表时不重复建连）。
+    """
+    if isinstance(brokers, str):
+        specs = [part for part in brokers.replace(",", " ").replace(";", " ").split()
+                 if part]
+    else:
+        specs = list(brokers or [])
+    result = apply_broker_add(specs)
+    if isinstance(result, dict) and result.get("ok"):
+        result["remote"] = "下次 RPC 自动同步手机端"
+    return result
+
+
 def xime_perform_action(node_ref, action, text=""):
     """对节点执行通用无障碍动作。node_ref 形如 w0:p1.2；
     action 支持 click/long_click/scroll_forward/scroll_backward/set_text/paste/select/focus/clear_focus。"""
@@ -533,7 +685,8 @@ _MCP_INSTRUCTIONS = (
     "drag / pinch / gesture；系统操作用 global_action；启动界面用 "
     "start_activity；列应用用 list_apps，按包名启动应用用 launch_app；"
     "事件版本用 event_state，按需开关事件监听用 event_capture，列窗口用 "
-    "windows，按节点路径执行通用动作用 perform_action，写文本用 set_text，"
+    "windows，动态加 broker 用 broker_add（只改内存，不写 rpc.json），"
+    "按节点路径执行通用动作用 perform_action，写文本用 set_text，"
     "按需截图用 screenshot；"
     "失败时先 status 看连接；需要完整体检时用 status(deep=True)。"
 )
@@ -603,6 +756,7 @@ _TOOLS = (
     xime_event_state,
     xime_event_capture,
     xime_windows,
+    xime_broker_add,
     xime_perform_action,
     xime_set_text,
     xime_screenshot,
@@ -925,6 +1079,11 @@ def main(argv=None):
         dest="min_broker_count", type=int, default=None,
         help="覆盖 xime_mcp.min_broker_count")
     parser.add_argument(
+        *client_mqtt._cli_opts(*client_mqtt.alias_broker_add),
+        dest="broker_add", action="append", default=None,
+        help="强制加入 broker（host:port，可重复）：本地与手机端都只在内存生效，"
+             "不写 rpc.json")
+    parser.add_argument(
         *client_mqtt._cli_opts(*client_mqtt.alias_allow_no_pub),
         dest="allow_no_pub", action="store_true", default=None,
         help="覆盖 xime_mcp.allow_no_server_pubkey_response=True")
@@ -940,6 +1099,7 @@ def main(argv=None):
         "min_broker_count": args.min_broker_count,
         "allow_no_server_pubkey_response": True if args.allow_no_pub else None,
         "private_key": _normalize_key(args.private_key) if args.private_key else None,
+        "broker_add": args.broker_add,
     })
 
     if args.selftest:
