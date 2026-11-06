@@ -130,6 +130,51 @@ def _cmq_xime_ui_start():
         except Exception as _exc:
             return {"ok": False, "error": "feature_touch.%s 失败: %s" % (_name, _exc)}
 
+    def _volume(_set, _level, _stream):
+        # 音量直接走 Java AudioManager，不依赖 feature_touch 是否暴露音量接口，
+        # 与 feature_audio.build_volume_code 同一套调用（ActivityThread 取
+        # Application → getSystemService(AUDIO_SERVICE)）。
+        # 注意：部分 ROM（实测 ColorOS 的媒体流）会静默忽略 setStreamVolume——不报
+        # 错、索引也不变，页面读回旧值（常是 0）就成了“滑条回弹 0”。这类系统只吃
+        # 相对调节：回读确认绝对设置没生效后，退回 adjustStreamVolume（与音量键
+        # 同一条路径）按真实步长逐格逼近目标，最后仍回读真实值。step 回传实际步长，
+        # 供页面把滑条粒度对齐，避免 1 格拖动只走 1/10 步。
+        try:
+            from java import jclass as _jc
+            _AT = _jc("android.app.ActivityThread")
+            _Ctx = _jc("android.content.Context")
+            _AM = _jc("android.media.AudioManager")
+            _am = _AT.currentApplication().getSystemService(_Ctx.AUDIO_SERVICE)
+            _max = int(_am.getStreamMaxVolume(_stream))
+            _before = int(_am.getStreamVolume(_stream))
+            _after = _before
+            _step = None
+            _target = _before
+            if _set:
+                _target = max(0, min(int(_level), _max))
+                if _target != _before:
+                    _am.setStreamVolume(_stream, _target, 0)
+                    _after = int(_am.getStreamVolume(_stream))
+                    if _after == _before:
+                        # 绝对设置被系统吞掉：改用相对调节逐格逼近。
+                        _dir = 1 if _target > _after else -1
+                        for _ in range(200):
+                            _am.adjustStreamVolume(_stream, _dir, 0)
+                            _now = int(_am.getStreamVolume(_stream))
+                            if _now == _after:      # 到底/到顶或系统不响应
+                                break
+                            if _step is None:
+                                _step = abs(_now - _after)
+                            _after = _now
+                            if (_dir > 0 and _after >= _target) \
+                                    or (_dir < 0 and _after <= _target):
+                                break
+            return {"ok": True, "op": "volume", "stream": _stream,
+                    "level": _after, "max": _max, "before": _before,
+                    "target": _target, "step": _step}
+        except Exception as _exc:
+            return {"ok": False, "op": "volume", "error": str(_exc)}
+
     def _wake():
         # 无障碍 API 不能点亮屏幕：用 PowerManager 的 SCREEN_BRIGHT_WAKE_LOCK +
         # ACQUIRE_CAUSES_WAKEUP（0x1000000A）。只亮屏，不清除密码锁屏。
@@ -268,7 +313,7 @@ def _cmq_xime_ui_start():
 
     _end = _th.Event()
     _state = {"seq": 0, "dirty": True, "client_last": _t.time(),
-              "last_version": None, "stopped": None}
+              "last_version": None, "stopped": None, "superseded": False}
 
     def _push(_obj):
         if _end.is_set():
@@ -329,18 +374,29 @@ def _cmq_xime_ui_start():
                     _un(_in)
             except Exception:
                 pass
-            _ftcall("event_capture", False)
+            # 被新会话顶替时不要关共享的事件采集，否则新会话收不到事件。
+            if not _state["superseded"]:
+                _ftcall("event_capture", False)
             with _lock:
                 _sessions.pop(_sid, None)
 
     def _snapshot():
+        # 先记版本、再 dump、最后再记一次。dump 期间界面若还在变（切页/滑动
+        # 动画），把“更新后的版本”当成已消费会让页面永久停在中间态：事件停
+        # 了以后 version 不再变化，poll 就再也不会拍帧。两次版本不同则置
+        # dirty，下一轮继续追平到稳定帧。
+        _es0 = _ftcall("event_state")
+        _v0 = _es0.get("version") if isinstance(_es0, dict) else None
+        _state["dirty"] = False
         _w = _ftcall("windows")
         _d = _ftcall("dump_ui", _max_nodes, True)
         _es = _ftcall("event_state")
-        _state["last_version"] = _es.get("version") if isinstance(_es, dict) else None
-        _state["dirty"] = False
+        _v1 = _es.get("version") if isinstance(_es, dict) else None
+        _state["last_version"] = _v1 if _v0 is None else _v0
+        if _v0 is not None and _v1 is not None and _v0 != _v1:
+            _state["dirty"] = True
         _err = None
-        for _part in (_d, _w, _es):
+        for _part in (_d, _w, _es0, _es):
             if isinstance(_part, dict) and _part.get("error"):
                 _err = _part["error"]
                 break
@@ -382,6 +438,9 @@ def _cmq_xime_ui_start():
 
     def _poll_loop():
         _last_capture = 0.0
+        _settle_at = 0.0
+        _settle_delay = 0.6
+        _catchup = 0
         if _ftcall("event_capture", True, _capture_ms).get("ok"):
             _last_capture = _t.time()
         try:
@@ -397,8 +456,30 @@ def _cmq_xime_ui_start():
                         _last_capture = _t.time()
                 _es = _ftcall("event_state")
                 _v = _es.get("version") if isinstance(_es, dict) else None
-                if _state["dirty"] or (_v is not None and _v != _state["last_version"]):
+                _need = _state["dirty"] or (_v is not None and _v != _state["last_version"])
+                _settle = False
+                if not _need and _settle_at and _t.time() >= _settle_at:
+                    _settle = True
+                    _settle_at = 0.0
+                    _need = True
+                if _need:
                     _snapshot()
+                    if _state["dirty"]:
+                        # dump 期间界面还在变：继续追平；连续追平过多次就退让
+                        # 2s，避免持续动画（视频列表/惯性滚动）一直 dump。
+                        _catchup += 1
+                        _settle_at = 0.0
+                        if _catchup >= 8:
+                            _catchup = 0
+                            _settle_at = _t.time() + 2.0
+                    elif not _settle:
+                        # 切页/滑动结束后通常不再产生事件，补拍一帧静置后的
+                        # 布局；只补一次，静止时不再 dump。
+                        _catchup = 0
+                        _settle_at = _t.time() + _settle_delay
+                    else:
+                        _catchup = 0
+                        _settle_at = 0.0
             except Exception:
                 pass
             if _t.time() - _state["client_last"] > _ttl:
@@ -451,6 +532,12 @@ def _cmq_xime_ui_start():
                     _res = _ftcall("global_action", 1)
                 elif _type == "wake":
                     _res = _pj(_wake())
+                elif _type in ("volume", "volume_get"):
+                    # volume=设置（拖动松手才发），volume_get=只读，用于页面初始化。
+                    # 注意不能用键名 stream：上行帧的 stream 字段是会话 sid。
+                    _res = _volume(_type == "volume",
+                                   int(_fr.get("level", 0) or 0),
+                                   int(_fr.get("audio_stream", 3) or 3))
                 elif _type == "tap":
                     _res = _ftcall("tap", float(_fr.get("x", 0)),
                                    float(_fr.get("y", 0)),
@@ -490,14 +577,44 @@ def _cmq_xime_ui_start():
                        "action": _fr.get("type") if isinstance(_fr, dict) else "?",
                        "ok": False, "error": str(_exc),
                        "t": _fr.get("t") if isinstance(_fr, dict) else None})
-        _ftcall("event_capture", False)
+        if not _state["superseded"]:
+            _ftcall("event_capture", False)
 
     _threads = [_th.Thread(target=_poll_loop,
                            name="xime-ui-poll-%s" % _sid, daemon=True),
                 _th.Thread(target=_in_loop,
                            name="xime-ui-in-%s" % _sid, daemon=True)]
+    # PC 重启/刷新会带新 sid 开新会话，旧会话在 PC 那边已经没人用了，只靠
+    # 60s TTL 回收。这段时间里多个孤儿会话会同时 300ms 轮询/dump，把手机端
+    # 的无障碍调用拖住，连控制面 RPC 都排不上队（表现为下发会话代码超时）。
+    # 新会话建立时直接把旧会话顶掉：停线程、取消订阅，不关共享事件采集。
+    _stale = []
     with _lock:
-        _sessions[_sid] = {"end": _end, "threads": _threads, "topics": [_in]}
+        for _k, _v in list(_sessions.items()):
+            if _k != _sid:
+                _stale.append(_v)
+                _sessions.pop(_k, None)
+        _sessions[_sid] = {"end": _end, "threads": _threads,
+                           "topics": [_in], "state": _state}
+    for _v in _stale:
+        _st = _v.get("state") if isinstance(_v, dict) else None
+        if isinstance(_st, dict):
+            _st["superseded"] = True
+        try:
+            _v["end"].set()
+        except Exception:
+            pass
+        for _tp in _v.get("topics") or []:
+            try:
+                _net._cmq_ui_router.pop(_tp, None)
+            except Exception:
+                pass
+            try:
+                _un2 = getattr(_net, "unsubscribe", None)
+                if callable(_un2):
+                    _un2(_tp)
+            except Exception:
+                pass
     for _t0 in _threads:
         _t0.start()
     return _j.dumps({"ok": True, "op": "ui_open", "sid": _sid,
@@ -1026,7 +1143,8 @@ class _UiHub:
             slot.send({"type": "state", "state": "opening"})
             return
         if mtype in ("tap", "long_press", "swipe", "set_text", "perform_action",
-                     "refresh", "wake", "back", "global_action"):
+                     "refresh", "wake", "back", "global_action",
+                     "volume", "volume_get"):
             body = {"type": mtype}
             if mtype == "global_action":
                 body["action"] = int(msg.get("action", 1))
@@ -1043,6 +1161,9 @@ class _UiHub:
             elif mtype == "perform_action":
                 body.update({"ref": msg.get("ref"), "action": msg.get("action"),
                              "text": msg.get("text", "")})
+            elif mtype in ("volume", "volume_get"):
+                body.update({"level": int(msg.get("level", 0) or 0),
+                             "audio_stream": int(msg.get("audio_stream", 3) or 3)})
             try:
                 self._send_uplink(sess, body)
             except Exception as exc:
@@ -1137,3 +1258,4 @@ def ui_html(p):
     p.set_header("Cache-Control", "no-store")
     with open(_UI_PAGE_FILE, "r", encoding="utf-8") as fp:
         p.set_data(fp.read())
+ui=ui_html

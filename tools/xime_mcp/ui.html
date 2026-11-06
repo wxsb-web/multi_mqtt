@@ -36,11 +36,16 @@ button:hover { background: #243444; }
 #broker input { width: 100%; background: #0b0f14; color: #d7e0ea;
   border: 1px solid #2b3a4a; border-radius: 4px; padding: 6px 8px; font: inherit; }
 #labelcfg { display: flex; flex-direction: column; gap: 6px; }
+#volume { display: flex; flex-direction: column; gap: 6px; }
+#volume .row { display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px; color: #8ea3b7; }
+#volume input[type=range] { width: 100%; accent-color: #4ea1ff; }
 #labelcfg .row { display: flex; align-items: center; justify-content: space-between;
   font-size: 12px; color: #8ea3b7; }
 #labelcfg input[type=range] { width: 100%; accent-color: #4ea1ff; }
 #labelcfg .chk { display: flex; align-items: center; gap: 6px; font-size: 12px;
   color: #8ea3b7; }
+#labelcfg .chkrow { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 #labelcfg .chk input { width: auto; }
 #keys { display: flex; flex-direction: column; gap: 6px; }
 #keys .row { display: flex; align-items: center; justify-content: space-between;
@@ -54,7 +59,7 @@ button:hover { background: #243444; }
   -webkit-user-select: none; }
 #ui { max-height: 100%; max-width: 100%; height: auto; width: auto;
   background: #0f1620; border: 1px solid #22303e; border-radius: 2px;
-  cursor: crosshair; touch-action: none; }
+  cursor: crosshair; touch-action: none; overflow: hidden; }
 #ui rect:hover { stroke: #ffffff !important; stroke-width: 3px !important; }
 #msg { padding: 6px 9px; border-radius: 4px; background: #131b24;
   border: 1px solid #2b3a4a; color: #d7e0ea; font-size: 12px; line-height: 1.5;
@@ -98,6 +103,10 @@ button:hover { background: #243444; }
     <span>MQTT<b id="mqtt-lat">—</b></span>
   </div>
   <button id="tostage">← 元素视图</button>
+  <div id="volume">
+    <div class="row"><span>媒体音量</span><b id="volume-val">—</b></div>
+    <input id="volume-range" type="range" min="0" max="15" step="1" value="0">
+  </div>
   <button id="refresh">刷新</button>
   <button id="back">返回键</button>
   <button id="wake">唤醒屏幕</button>
@@ -112,9 +121,15 @@ button:hover { background: #243444; }
   <div id="labelcfg">
     <div class="row"><span>文本标签字号</span><b id="label-size-val">14</b></div>
     <input id="label-size" type="range" min="8" max="26" step="1" value="14">
-    <div class="chk">
-      <input id="label-show" type="checkbox" checked>
-      <label for="label-show">显示文本标签</label>
+    <div class="chkrow">
+      <div class="chk">
+        <input id="label-show" type="checkbox" checked>
+        <label for="label-show">显示文本标签</label>
+      </div>
+      <div class="chk">
+        <input id="offscreen" type="checkbox">
+        <label for="offscreen">显示屏幕外元素</label>
+      </div>
     </div>
   </div>
   <div id="keys">
@@ -154,6 +169,32 @@ const editorEl = document.getElementById('editor');
 const edRefEl = document.getElementById('ed-ref');
 const edInput = document.getElementById('ed-input');
 const brokerInput = document.getElementById('broker-input');
+// 媒体音量滑条：拖动只改本地显示，松手才发一次 volume 帧（走 MQTT 到手机）。
+const volumeValEl = document.getElementById('volume-val');
+const volumeRangeEl = document.getElementById('volume-range');
+let volumeMax = 15;
+function setVolumeUi(level, max, step) {
+  if (max !== undefined && max !== null) {
+    volumeMax = Math.max(1, Number(max) || volumeMax);
+    volumeRangeEl.max = volumeMax;
+  }
+  // 有些 ROM 只吃相对调节，实际步长不是 1（如 ColorOS 媒体流 10/格）。
+  // 设备端回传 step 后把滑条粒度对齐，拖动一格就是真实一格。
+  const st = Number(step);
+  if (step !== undefined && step !== null && st > 0) {
+    volumeRangeEl.step = st;
+  }
+  const lv = Math.max(0, Math.min(volumeMax, Number(level) || 0));
+  volumeRangeEl.value = lv;
+  volumeValEl.textContent = lv + ' / ' + volumeMax;
+}
+volumeRangeEl.addEventListener('input', function () {
+  volumeValEl.textContent = volumeRangeEl.value + ' / ' + volumeMax;
+});
+volumeRangeEl.addEventListener('change', function () {
+  wsSend({type: 'volume', level: Number(volumeRangeEl.value) || 0,
+          audio_stream: 3, t: Date.now()});
+});
 // 浏览器本地记住已提交的 broker_add（不改变后端状态，仅回填输入框）。
 const BROKER_KEY = 'xime.broker_add';
 let savedBrokers = [];
@@ -167,8 +208,11 @@ const LABEL_KEY = 'xime.label';
 const labelSizeEl = document.getElementById('label-size');
 const labelSizeValEl = document.getElementById('label-size-val');
 const labelShowEl = document.getElementById('label-show');
+const offscreenEl = document.getElementById('offscreen');
 let labelMinSize = 14;
 let labelVisible = true;
+// 默认不渲染屏幕外的预加载节点（列表/桌面会提前准备大量屏幕外元素）。
+let showOffscreen = false;
 try {
   const cfg = JSON.parse(localStorage.getItem(LABEL_KEY) || 'null');
   if (cfg && typeof cfg === 'object') {
@@ -176,16 +220,18 @@ try {
       labelMinSize = Math.max(8, Math.min(26, Number(cfg.size) || 14));
     }
     if (cfg.show !== undefined) labelVisible = !!cfg.show;
+    if (cfg.offscreen !== undefined) showOffscreen = !!cfg.offscreen;
   }
 } catch (e) {}
 labelSizeEl.value = labelMinSize;
 labelSizeValEl.textContent = labelMinSize;
 labelShowEl.checked = labelVisible;
+offscreenEl.checked = showOffscreen;
 let labelTimer = null;
 function saveLabelCfg() {
   try {
     localStorage.setItem(LABEL_KEY, JSON.stringify(
-        {size: labelMinSize, show: labelVisible}));
+        {size: labelMinSize, show: labelVisible, offscreen: showOffscreen}));
   } catch (e) {}
 }
 function relabel() {
@@ -201,6 +247,11 @@ labelSizeEl.addEventListener('input', function () {
 });
 labelShowEl.addEventListener('change', function () {
   labelVisible = !!labelShowEl.checked;
+  saveLabelCfg();
+  relabel();
+});
+offscreenEl.addEventListener('change', function () {
+  showOffscreen = !!offscreenEl.checked;
   saveLabelCfg();
   relabel();
 });
@@ -367,16 +418,41 @@ function submitEditor() {
 
 function render(data) {
   DATA = data;
-  W = 0; H = 0;
   const nodes = (data && Array.isArray(data.nodes)) ? data.nodes : [];
-  for (const n of nodes) {
-    const b = n && n.b;
-    if (!b || b.length < 4) continue;
-    W = Math.max(W, b[2]);
-    H = Math.max(H, b[3]);
+  // 画布尺寸：默认取窗口边界（屏幕），屏幕外预加载节点不参与渲染；打开
+  // 「显示屏幕外元素」后改按节点实际范围扩画布（整体会缩小），可看到全部。
+  // 用节点坐标最大值当屏幕画布会被列表/桌面的屏幕外项撑成几千像素，整页
+  // 等比缩成左上角一条窄带，上滑越多缩得越小。
+  W = 0;
+  H = 0;
+  if (showOffscreen) {
+    for (const n of nodes) {
+      const b = n && n.b;
+      if (!b || b.length < 4) continue;
+      W = Math.max(W, b[2]);
+      H = Math.max(H, b[3]);
+    }
+  } else {
+    const wins = (data && Array.isArray(data.windows)) ? data.windows : [];
+    for (const w of wins) {
+      const b = w && (w.bounds || w.b);
+      if (!b || b.length < 4) continue;
+      W = Math.max(W, b[2]);
+      H = Math.max(H, b[3]);
+    }
+  }
+  if (!W || !H) {
+    // 拿不到窗口信息时退回节点可见范围。
+    for (const n of nodes) {
+      const b = n && n.b;
+      if (!b || b.length < 4) continue;
+      W = Math.max(W, b[2]);
+      H = Math.max(H, b[3]);
+    }
   }
   W = W || 1080;
   H = H || 1920;
+  svg.style.overflow = showOffscreen ? 'visible' : 'hidden';
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   // 快照刷新只重绘显示层；拖动指示线放在覆盖层，最后再挂回最上层
   svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
@@ -474,7 +550,10 @@ function render(data) {
     const fontSize = fontPx / labelScale;
     const boxKey = b.join(',');
     if (labeledBoxes.has(boxKey)) return false;
-    const maxWidth = Math.max(fontSize, Math.min(w - 8, W * 0.5));
+    // 只用元素自身宽度作为折行上限：旧实现额外加了 W * 0.5（半屏）封顶，
+    // 宽元素（横屏列表/长文本）在屏宽一半处就被省略号截断，看起来只占了
+    // 元素宽度的六成左右。元素再宽也应该先铺满自己的宽度再省略。
+    const maxWidth = Math.max(fontSize, w - 8);
     const lineHeight = fontSize * lineHeightRatio;
     const maxLines = Math.max(1, Math.floor((h - 4) / lineHeight));
     const raw = String(labelOf(n));
@@ -822,6 +901,8 @@ function handle(msg) {
       if (msg.state === 'ready') {
         setState('已连接 · sid=' + (msg.sid || '?'));
         checkBrokers();
+        // 拿到当前流的最大值/真实音量，滑条范围按设备实际值初始化。
+        wsSend({type: 'volume_get', audio_stream: 3, t: Date.now()});
       } else if (msg.state === 'error') {
         setState('连接失败: ' + (msg.error || '?'), true);
         setMsg('连接失败: ' + (msg.error || '?'), true);
@@ -869,6 +950,15 @@ function handle(msg) {
         if (msg.remote_sent) parts.push('已同步手机端');
         if (msg.remote_error) parts.push('手机端失败 ' + msg.remote_error);
         if (parts.length) text += ' · ' + parts.join(' · ');
+      }
+      if (msg.action === 'volume' || msg.action === 'volume_get') {
+        const vr = msg.result || {};
+        if (vr.ok) {
+          setVolumeUi(vr.level, vr.max, vr.step);
+          text += ' · ' + vr.level + '/' + vr.max;
+        } else if (vr.error) {
+          text += ' · ' + vr.error;
+        }
       }
       setMsg(text + (msg.mqtt_rtt_ms !== undefined ? ' · MQTT ' + msg.mqtt_rtt_ms + 'ms' : ''),
              !msg.ok);

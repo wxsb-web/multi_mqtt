@@ -804,7 +804,7 @@ def register_tools(server):
 def ui_html(p):
     """元素视图页面（HTTP RPC：``/ui_html(p)``，根路径自动跳转）。"""
     return xime_ui.ui_html(p)
-
+ui=ui_html
 
 
 # ----------------------------------------------------------------------------
