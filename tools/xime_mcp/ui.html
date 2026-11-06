@@ -1,0 +1,993 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xime 辅助功能元素视图</title>
+<style>
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; overflow: hidden; background: #0b0f14;
+  color: #d7e0ea; font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  user-select: none; -webkit-user-select: none; }
+body { display: flex; justify-content: center; }
+#side { flex: 0 0 280px; position: relative; display: flex; flex-direction: column;
+  gap: 10px; padding: 14px 12px; border-left: 1px solid #1e2a36;
+  background: #0e141b; overflow: auto;
+  user-select: text; -webkit-user-select: text; }
+#side .name { font-weight: 600; color: #7ee787; white-space: nowrap; }
+#conn { font-size: 12px; line-height: 1.5; color: #8ea3b7; word-break: break-all; }
+#cfg { font-size: 12px; line-height: 1.5; color: #8ea3b7; word-break: break-all;
+  white-space: pre-line; }
+#meta { font-size: 12px; line-height: 1.6; color: #8ea3b7; word-break: break-all; }
+#lat { display: flex; align-items: baseline; gap: 10px; font-size: 12px;
+  color: #8ea3b7; white-space: nowrap; overflow: hidden; }
+#lat span { display: inline-flex; align-items: baseline; gap: 4px; }
+#lat b { color: #d7e0ea; font-size: 13px; }
+button { background: #1b2733; color: #d7e0ea; border: 1px solid #2b3a4a;
+  border-radius: 4px; padding: 6px 12px; cursor: pointer; font: inherit; width: 100%; }
+button:hover { background: #243444; }
+#editor { display: none; flex-direction: column; gap: 6px; padding: 8px;
+  border: 1px solid #2b3a4a; border-radius: 4px; background: #131b24; }
+#editor .ref { font-size: 11px; color: #8ea3b7; word-break: break-all; }
+#editor input { width: 100%; background: #0b0f14; color: #d7e0ea;
+  border: 1px solid #2b3a4a; border-radius: 4px; padding: 6px 8px; font: inherit; }
+#editor .row { display: flex; gap: 6px; }
+#broker { display: flex; flex-direction: column; gap: 6px; }
+#broker input { width: 100%; background: #0b0f14; color: #d7e0ea;
+  border: 1px solid #2b3a4a; border-radius: 4px; padding: 6px 8px; font: inherit; }
+#labelcfg { display: flex; flex-direction: column; gap: 6px; }
+#labelcfg .row { display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px; color: #8ea3b7; }
+#labelcfg input[type=range] { width: 100%; accent-color: #4ea1ff; }
+#labelcfg .chk { display: flex; align-items: center; gap: 6px; font-size: 12px;
+  color: #8ea3b7; }
+#labelcfg .chk input { width: auto; }
+#keys { display: flex; flex-direction: column; gap: 6px; }
+#keys .row { display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px; color: #8ea3b7; }
+#keys-list { display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px;
+  color: #8ea3b7; }
+#keys-list button { width: auto; padding: 3px 8px; font-size: 11px; }
+#keys-list button.on { background: #1d3b52; border-color: #2f6f9f; }
+#stage { flex: 0 1 auto; min-width: 0; display: flex; align-items: center;
+  justify-content: center; padding: 8px; user-select: none;
+  -webkit-user-select: none; }
+#ui { max-height: 100%; max-width: 100%; height: auto; width: auto;
+  background: #0f1620; border: 1px solid #22303e; border-radius: 2px;
+  cursor: crosshair; touch-action: none; }
+#ui rect:hover { stroke: #ffffff !important; stroke-width: 3px !important; }
+#msg { padding: 6px 9px; border-radius: 4px; background: #131b24;
+  border: 1px solid #2b3a4a; color: #d7e0ea; font-size: 12px; line-height: 1.5;
+  word-break: break-all; }
+#msg:empty { display: none; }
+#msg.err { border-color: #a3342f; color: #ff9a94; }
+#legend { display: flex; flex-direction: row; flex-wrap: wrap; gap: 6px 12px;
+  padding-top: 10px; border-top: 1px solid #1e2a36; font-size: 11px;
+  color: #8ea3b7; }
+#side > * { flex: none; }
+#foot { margin-top: auto; display: flex; flex-direction: column; gap: 6px;
+  padding-top: 10px; border-top: 1px solid #1e2a36; }
+#legend span { display: flex; align-items: center; }
+#legend i { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+  margin-right: 4px; vertical-align: -1px; flex: none; }
+#tostage { display: none; }
+#toside { display: none; }
+/* 极窄（手机长屏）：元素视图与侧栏排不下才整屏滑动查看 */
+@media (max-width: 480px) {
+  html { height: 100%; overflow-x: auto; overflow-y: hidden; }
+  body { display: flex; justify-content: flex-start; height: 100vh; height: 100dvh;
+    width: max-content; min-width: 100%; overflow: visible; }
+  #stage { position: relative; inset: auto; flex: 0 0 100vw; width: 100vw;
+    height: 100vh; height: 100dvh; padding: 6px; }
+  #side { position: relative; top: auto; right: auto; bottom: auto;
+    flex: 0 0 280px; width: 280px; height: 100vh; height: 100dvh; }
+  #toside { display: block; position: fixed; top: 8px; right: 8px; width: auto;
+    z-index: 9; padding: 6px 10px; opacity: .9; }
+  #tostage { display: block; }
+}
+</style>
+</head>
+<body>
+<button id="toside">控制 →</button>
+<div id="stage"><svg id="ui" xmlns="http://www.w3.org/2000/svg"
+  preserveAspectRatio="xMidYMid meet"></svg></div>
+<aside id="side">
+  <div id="lat">
+    <span>延迟</span>
+    <span>WS<b id="ws-lat">—</b></span>
+    <span>MQTT<b id="mqtt-lat">—</b></span>
+  </div>
+  <button id="tostage">← 元素视图</button>
+  <button id="refresh">刷新</button>
+  <button id="back">返回键</button>
+  <button id="wake">唤醒屏幕</button>
+  <div id="editor">
+    <span class="ref" id="ed-ref"></span>
+    <input id="ed-input" type="text" placeholder="输入要写入的文本">
+    <div class="row">
+      <button id="ed-submit">提交</button>
+      <button id="ed-cancel">取消</button>
+    </div>
+  </div>
+  <div id="labelcfg">
+    <div class="row"><span>文本标签字号</span><b id="label-size-val">14</b></div>
+    <input id="label-size" type="range" min="8" max="26" step="1" value="14">
+    <div class="chk">
+      <input id="label-show" type="checkbox" checked>
+      <label for="label-show">显示文本标签</label>
+    </div>
+  </div>
+  <div id="keys">
+    <div class="row"><span>支持的按键</span><b id="keys-sdk">—</b></div>
+    <div id="keys-list">连接后读取</div>
+  </div>
+  <div id="msg"></div>
+  <div id="legend">
+    <span><i style="background:linear-gradient(90deg,#4ea1ff,#39d0c4,#7ee787,#e3b341,#ff8a65,#c792ea)"></i>不同颜色=不同层级</span>
+    <span><i style="background:transparent;border:2px solid #d7e0ea"></i>可点击(粗边)</span>
+    <span><i style="background:#ff8a65"></i>可编辑</span>
+    <span><i style="background:transparent;border:1px dashed #d7e0ea"></i>可滚动</span>
+  </div>
+  <div id="broker">
+    <input id="broker-input" type="text" autocomplete="off"
+      placeholder="broker_add，如 192.168.1.20:1883">
+    <button id="broker-add">加入 Broker</button>
+  </div>
+  <div id="foot">
+    <span id="conn">未连接</span>
+    <span id="cfg">topic —</span>
+    <span id="meta">连接中…</span>
+  </div>
+</aside>
+<script>
+const NS = 'http://www.w3.org/2000/svg';
+const PALETTE = ['#4ea1ff', '#39d0c4', '#7ee787', '#e3b341',
+                 '#ff8a65', '#c792ea', '#f78fb3', '#9fb0c0'];
+const svg = document.getElementById('ui');
+const metaEl = document.getElementById('meta');
+const msgEl = document.getElementById('msg');
+const stateEl = document.getElementById('conn');
+const cfgEl = document.getElementById('cfg');
+const wsLatEl = document.getElementById('ws-lat');
+const mqttLatEl = document.getElementById('mqtt-lat');
+const editorEl = document.getElementById('editor');
+const edRefEl = document.getElementById('ed-ref');
+const edInput = document.getElementById('ed-input');
+const brokerInput = document.getElementById('broker-input');
+// 浏览器本地记住已提交的 broker_add（不改变后端状态，仅回填输入框）。
+const BROKER_KEY = 'xime.broker_add';
+let savedBrokers = [];
+try {
+  const stored = JSON.parse(localStorage.getItem(BROKER_KEY) || '[]');
+  if (Array.isArray(stored)) savedBrokers = stored.filter(Boolean);
+} catch (e) { savedBrokers = []; }
+brokerInput.value = savedBrokers.join(' ');
+// 文本标签设置：字号下限与是否显示，浏览器本地记住。
+const LABEL_KEY = 'xime.label';
+const labelSizeEl = document.getElementById('label-size');
+const labelSizeValEl = document.getElementById('label-size-val');
+const labelShowEl = document.getElementById('label-show');
+let labelMinSize = 14;
+let labelVisible = true;
+try {
+  const cfg = JSON.parse(localStorage.getItem(LABEL_KEY) || 'null');
+  if (cfg && typeof cfg === 'object') {
+    if (cfg.size !== undefined) {
+      labelMinSize = Math.max(8, Math.min(26, Number(cfg.size) || 14));
+    }
+    if (cfg.show !== undefined) labelVisible = !!cfg.show;
+  }
+} catch (e) {}
+labelSizeEl.value = labelMinSize;
+labelSizeValEl.textContent = labelMinSize;
+labelShowEl.checked = labelVisible;
+let labelTimer = null;
+function saveLabelCfg() {
+  try {
+    localStorage.setItem(LABEL_KEY, JSON.stringify(
+        {size: labelMinSize, show: labelVisible}));
+  } catch (e) {}
+}
+function relabel() {
+  if (!DATA) return;
+  if (labelTimer) clearTimeout(labelTimer);
+  labelTimer = setTimeout(function () { render(DATA); }, 150);
+}
+labelSizeEl.addEventListener('input', function () {
+  labelMinSize = Number(labelSizeEl.value) || 14;
+  labelSizeValEl.textContent = labelMinSize;
+  saveLabelCfg();
+  relabel();
+});
+labelShowEl.addEventListener('change', function () {
+  labelVisible = !!labelShowEl.checked;
+  saveLabelCfg();
+  relabel();
+});
+window.addEventListener('resize', relabel);
+let cfgTopic = '';
+let cfgBrokers = [];
+let cfgCounts = null;   // 三端 broker 数量：进页面 / broker_add 时同步一次
+let cfgStatus = [];     // 各 broker 在三端的实际存在情况
+// 侧栏：设备支持的按键（连上会话后由手机端反射上报）
+const keysListEl = document.getElementById('keys-list');
+const keysSdkEl = document.getElementById('keys-sdk');
+let deviceKeys = {};
+
+function renderKeys(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const names = (payload.keys && typeof payload.keys === 'object')
+      ? payload.keys : payload;
+  const sdk = payload.sdk !== undefined ? payload.sdk : payload.keys_sdk;
+  if (sdk !== undefined && sdk !== null) keysSdkEl.textContent = 'SDK ' + sdk;
+  deviceKeys = {};
+  const entries = Object.keys(names).map(function (name) {
+    return [name, Number(names[name])];
+  }).filter(function (item) {
+    return isFinite(item[1]);
+  }).sort(function (a, b) {
+    return a[1] - b[1];
+  });
+  entries.forEach(function (item) { deviceKeys[item[0]] = item[1]; });
+  if (!entries.length) {
+    keysListEl.textContent = '未上报（需先连上会话）';
+    return;
+  }
+  keysListEl.textContent = '';
+  entries.forEach(function (item) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.textContent = item[0];
+    chip.title = 'global_action(' + item[1] + ')';
+    if (item[0].indexOf('dpad_') === 0) chip.className = 'on';
+    chip.addEventListener('click', function () {
+      setMsg('按键 ' + item[0] + ' → ' + item[1]);
+      wsSend({type: 'global_action', action: item[1]});
+    });
+    keysListEl.appendChild(chip);
+  });
+}
+
+let DATA = null;
+let W = 0, H = 0;
+let editing = null;
+let ws = null, retry = 0, heartbeat = null;
+let dragState = null;      // 按住拖动的起点/终点（设备坐标）
+let dragLine = null;       // 拖动时的虚线反馈
+let overlay = null;        // 持久覆盖层：快照刷新不销毁拖动指示线
+let pressTimer = null;     // 长按判定定时器
+let pressRing = null;      // 长按中的本地提示圈
+let suppressClickUntil = 0;  // 拖动/长按结束后短暂屏蔽 click，避免误发 tap
+const LONG_PRESS_MS = 450;   // 与 Android 长按阈值一致的判定时长
+
+function raiseOverlay() {
+  if (!overlay) overlay = el('g', {'pointer-events': 'none'});
+  svg.appendChild(overlay);   // 已存在时自动从旧父节点移出，挂回最上层
+  return overlay;
+}
+
+function el(tag, attrs) {
+  const node = document.createElementNS(NS, tag);
+  for (const key in attrs) node.setAttribute(key, attrs[key]);
+  return node;
+}
+
+function shortClass(name) {
+  const text = String(name || '');
+  const parts = text.split('.');
+  return parts[parts.length - 1] || text;
+}
+
+function labelOf(n) {
+  return n.t || n.d || (n.id ? String(n.id).split('/').pop() : '')
+         || shortClass(n.c) || '?';
+}
+
+function setMsg(text, isError) {
+  msgEl.textContent = text;
+  msgEl.className = isError ? 'err' : '';
+}
+
+function describe(n) {
+  const flags = [];
+  if (n.k) flags.push('可点击');
+  if (n.e) flags.push('可编辑');
+  if (n.s) flags.push('可滚动');
+  if (n.f) flags.push('聚焦');
+  const b = n.b || [0, 0, 0, 0];
+  return shortClass(n.c) + '  [' + b.join(', ') + ']  ' + labelOf(n).slice(0, 40)
+         + (flags.length ? '  ' + flags.join('/') : '');
+}
+
+function summary(data) {
+  if (!data || !data.ok) {
+    return '读取失败: ' + ((data && data.error) || '未知错误');
+  }
+  const parts = ['pkg=' + (data.pkg || '(未知)')];
+  if (data.title) parts.push('窗口=' + data.title);
+  parts.push('节点=' + (data.count !== undefined ? data.count : (data.nodes || []).length));
+  parts.push('窗口数=' + ((data.windows || []).length));
+  if (data.version !== undefined) parts.push('版本=' + data.version);
+  if (data.unreadable && data.unreadable.length) {
+    parts.push('无节点=' + data.unreadable.join(','));
+  }
+  return parts.join(' · ');
+}
+
+function computeTree(nodes) {
+  const stack = [];
+  const depths = [];
+  const hasChild = [];
+  nodes.forEach(function (n, index) {
+    const b = n.b;
+    hasChild[index] = false;
+    if (!b || b.length < 4) { depths.push(0); return; }
+    const w = b[2] - b[0], h = b[3] - b[1];
+    if (w <= 0 || h <= 0) { depths.push(0); return; }
+    while (stack.length) {
+      const t = nodes[stack[stack.length - 1]].b;
+      const inside = b[0] >= t[0] - 1 && b[1] >= t[1] - 1
+                  && b[2] <= t[2] + 1 && b[3] <= t[3] + 1;
+      if (inside) break;
+      stack.pop();
+    }
+    depths.push(stack.length);
+    if (stack.length) hasChild[stack[stack.length - 1]] = true;
+    stack.push(index);
+  });
+  return {depths: depths, hasChild: hasChild};
+}
+
+function openEditor(n) {
+  editing = n;
+  editorEl.style.display = 'flex';
+  edRefEl.textContent = 'ref=' + (n.r || '(无)');
+  edInput.value = n.t || '';
+  edInput.focus();
+  edInput.select();
+  setMsg('编辑 ' + (n.r || '?') + '，回车提交');
+}
+
+function closeEditor() {
+  editing = null;
+  editorEl.style.display = 'none';
+}
+
+function submitEditor() {
+  if (!editing) return;
+  const ref = editing.r;
+  if (!ref) {
+    setMsg('该节点没有 ref，无法写入文本', true);
+    return;
+  }
+  wsSend({type: 'set_text', ref: ref, text: edInput.value});
+  setMsg('set_text → ' + ref);
+  closeEditor();
+}
+
+function render(data) {
+  DATA = data;
+  W = 0; H = 0;
+  const nodes = (data && Array.isArray(data.nodes)) ? data.nodes : [];
+  for (const n of nodes) {
+    const b = n && n.b;
+    if (!b || b.length < 4) continue;
+    W = Math.max(W, b[2]);
+    H = Math.max(H, b[3]);
+  }
+  W = W || 1080;
+  H = H || 1920;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  // 快照刷新只重绘显示层；拖动指示线放在覆盖层，最后再挂回最上层
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+  // SVG 按 viewBox 等比缩放显示，字号必须按「屏幕像素」换算回 viewBox 单位，
+  // 否则滑块调大在屏幕上几乎看不出变化（旧实现的 26 上限就是缩放后的小字）。
+  const boxW = svg.clientWidth || 0, boxH = svg.clientHeight || 0;
+  const labelScale = (boxW > 0 && boxH > 0)
+      ? Math.max(0.05, Math.min(1, Math.min(boxW / W, boxH / H))) : 1;
+  svg.appendChild(el('rect', {x: 0, y: 0, width: W, height: H, fill: '#0f1620'}));
+
+  if (data && data.pkg) document.title = 'xime 元素视图 · ' + data.pkg;
+  metaEl.textContent = summary(data);
+  if (!data || !data.ok) {
+    setMsg(summary(data), true);
+    raiseOverlay();
+    return;
+  }
+  if (!nodes.length) {
+    const tip = el('text', {x: W / 2, y: H / 2, 'text-anchor': 'middle',
+      'font-size': Math.max(18, Math.round(H / 30)), fill: '#8ea3b7',
+      'font-family': 'system-ui, sans-serif'});
+    tip.textContent = '未取到节点（界面可能不可访问或已锁屏）';
+    svg.appendChild(tip);
+    raiseOverlay();
+    return;
+  }
+
+  const tree = computeTree(nodes);
+
+  // 第一遍只画矩形：标签必须最后统一画，否则会被后绘制的子节点矩形盖住
+  nodes.forEach(function (n, index) {
+    const b = n.b;
+    if (!b || b.length < 4) return;
+    const x = b[0], y = b[1], w = b[2] - b[0], h = b[3] - b[1];
+    if (w <= 0 || h <= 0) return;
+    const color = PALETTE[Math.min(tree.depths[index], PALETTE.length - 1)];
+    const clickable = !!n.k, editable = !!n.e, scrollable = !!n.s;
+    const attrs = {
+      x: x, y: y, width: w, height: h, 'rx': 3,
+      fill: editable ? '#ff8a65' : color,
+      'fill-opacity': clickable ? '0.22' : (editable ? '0.20' : '0.07'),
+      stroke: editable ? '#ffb59c' : color,
+      'stroke-opacity': clickable ? '0.95' : '0.60',
+      'stroke-width': clickable ? '2' : '1',
+      'vector-effect': 'non-scaling-stroke'
+    };
+    if (scrollable && !clickable) attrs['stroke-dasharray'] = '4 3';
+    const rect = el('rect', attrs);
+    rect.addEventListener('mouseenter', function () {
+      metaEl.textContent = describe(n);
+    });
+    rect.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      if (performance.now() < suppressClickUntil) return;
+      if (openEditableAt(ev)) return;
+      if (editable) {
+        setMsg('该节点不可编辑（缺少 ref）', true);
+        return;
+      }
+      sendTap(ev);
+    });
+    svg.appendChild(rect);
+  });
+
+  // 完全相同的 bounds 只让最深层节点出标签，避免多层同名文字压在一起
+  const boxOwner = new Map();
+  nodes.forEach(function (n, index) {
+    const b = n.b;
+    if (!b || b.length < 4) return;
+    if (b[2] - b[0] <= 0 || b[3] - b[1] <= 0) return;
+    const key = b.join(',');
+    const prev = boxOwner.get(key);
+    if (prev === undefined || tree.depths[index] >= tree.depths[prev]) {
+      boxOwner.set(key, index);
+    }
+  });
+
+  const labeledBoxes = new Set();
+  const placedLabels = [];
+  let fallback = -1;
+
+  function drawLabel(n, index) {
+    if (!labelVisible) return false;
+    const b = n.b;
+    const x = b[0], y = b[1], w = b[2] - b[0], h = b[3] - b[1];
+    // 滑块值即屏幕上的字号（px）。字号超过元素大小时按元素尺寸封顶（保证至少一行
+    // 文字放得下），不再直接丢掉这个标签；空间足够的元素仍按滑块值放大。
+    const nodeWpx = w * labelScale, nodeHpx = h * labelScale;
+    const lineHeightRatio = 1.28;
+    const fitPx = Math.max(1, Math.min((nodeHpx - 2) / lineHeightRatio,
+                                       (nodeWpx - 2) / 0.6));
+    const fontPx = Math.min(labelMinSize, fitPx);
+    const fontSize = fontPx / labelScale;
+    const boxKey = b.join(',');
+    if (labeledBoxes.has(boxKey)) return false;
+    const maxWidth = Math.max(fontSize, Math.min(w - 8, W * 0.5));
+    const lineHeight = fontSize * lineHeightRatio;
+    const maxLines = Math.max(1, Math.floor((h - 4) / lineHeight));
+    const raw = String(labelOf(n));
+
+    const label = el('text', {
+      x: x + 3, y: 0, 'font-size': fontSize,
+      fill: '#ffffff', 'fill-opacity': '0.96', 'pointer-events': 'none',
+      'font-family': 'ui-monospace, Consolas, monospace'
+    });
+    svg.appendChild(label);
+
+    function measure(str) {
+      label.textContent = str;
+      try { return label.getComputedTextLength(); } catch (e) { return 0; }
+    }
+
+    // 先在元素宽度内折行（二分找每行能放下的字符数），只有末行仍放不下才省略
+    const lines = [];
+    let pos = 0;
+    while (pos < raw.length) {
+      let fit = 0, lo = 1, hi = raw.length - pos;
+      while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (measure(raw.substr(pos, mid)) <= maxWidth) {
+          fit = mid; lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      if (fit <= 0) fit = 1;           // 单个字符都放不下：强制放一个，避免死循环
+      if (lines.length + 1 === maxLines) {
+        // 最后一行：把剩余文字全部塞进来，塞不下再截断加省略号
+        let rest = raw.substr(pos);
+        if (measure(rest) > maxWidth) {
+          let best = 0, l = 0, h = rest.length;
+          while (l <= h) {
+            const mid = Math.floor((l + h) / 2);
+            if (measure(rest.slice(0, mid) + '…') <= maxWidth) {
+              best = mid; l = mid + 1;
+            } else {
+              h = mid - 1;
+            }
+          }
+          rest = rest.slice(0, best) + '…';
+        }
+        lines.push(rest);
+        break;
+      }
+      lines.push(raw.substr(pos, fit));
+      pos += fit;
+    }
+
+    const lineWidths = lines.map(function (line) { return measure(line); });
+    const textWidth = Math.max.apply(null, lineWidths.concat([0]));
+    label.textContent = '';
+    lines.forEach(function (line, i) {
+      const span = el('tspan', {x: x + 3});
+      if (i > 0) span.setAttribute('dy', lineHeight);
+      span.textContent = line;
+      label.appendChild(span);
+    });
+
+    const chipW = Math.min(w - 2, textWidth + 6);
+    const chipH = lines.length * lineHeight;
+
+    // 标签只画在元素自己的左上角，绝不往下挪：与已放标签相交就放弃。调用方按「深
+    // 节点优先」的顺序绘制，同一角落由最里层（最精确）的节点先占位，外层容器标签让位，
+    // 避免 FrameLayout/ViewGroup 这类同左上角的空容器把真实文字标签一行行顶下去。
+    const labelTop = y + 2;
+    let clash = false;
+    for (const p of placedLabels) {
+      if (x + 1 < p.x + p.w && x + 1 + chipW > p.x
+          && labelTop < p.y + p.h && labelTop + chipH > p.y) {
+        clash = true;
+        break;
+      }
+    }
+    if (clash || labelTop + chipH > y + h) {
+      label.remove();
+      return false;
+    }
+    label.setAttribute('y', labelTop + fontSize);
+    placedLabels.push({x: x + 1, y: labelTop, w: chipW, h: chipH});
+    labeledBoxes.add(boxKey);
+
+    const chip = el('rect', {
+      x: x + 1, y: labelTop, width: chipW, height: chipH,
+      'rx': 2, fill: '#0b0f14', 'fill-opacity': '0.78',
+      'pointer-events': 'none'
+    });
+    svg.insertBefore(chip, label);
+    return true;
+  }
+
+  const labelOrder = [];
+  nodes.forEach(function (n, index) {
+    const b = n.b;
+    if (!b || b.length < 4) return;
+    if (b[2] - b[0] <= 0 || b[3] - b[1] <= 0) return;
+    if (boxOwner.get(b.join(',')) !== index) return;
+    if (fallback < 0 || tree.depths[index] > tree.depths[fallback]) {
+      fallback = index;
+    }
+    const hasText = !!(n.t || n.d || n.id);
+    // 纯容器（无文本但有子节点）不标类名，让真正的叶子节点出标签
+    if (!hasText && tree.hasChild[index]) return;
+    labelOrder.push(index);
+  });
+  // 占位优先级：真实文字 > 资源 id > 纯类名（FrameLayout/ViewGroup 这类结构噪音）。
+  // 同一角落只保留先占位的那一个，保证真文字不会被容器类名挤掉。
+  function labelRank(n) {
+    if (n.t || n.d) return 0;
+    if (n.id) return 1;
+    return 2;
+  }
+  // 节点先按优先级、再按深度排序：深层节点先画、先占位，外层容器标签让位；
+  // 这样每个标签都顶着自己元素的左上角，不会再被上一层的标签顶到元素中间。
+  labelOrder.sort(function (a, b) {
+    return labelRank(nodes[a]) - labelRank(nodes[b])
+        || tree.depths[b] - tree.depths[a] || a - b;
+  });
+  labelOrder.forEach(function (index) { drawLabel(nodes[index], index); });
+
+  // 整页都是纯容器、一个标签都没有时，至少标出最深层节点
+  if (labeledBoxes.size === 0 && fallback >= 0) {
+    drawLabel(nodes[fallback], fallback);
+  }
+  raiseOverlay();
+}
+
+function toDevice(ev) {
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return null;
+  const point = svg.createSVGPoint();
+  point.x = ev.clientX;
+  point.y = ev.clientY;
+  const local = point.matrixTransform(matrix.inverse());
+  return {x: Math.round(local.x), y: Math.round(local.y)};
+}
+
+function marker(x, y) {
+  const radius = Math.max(9, Math.round(W / 70));
+  const dot = el('circle', {
+    cx: x, cy: y, r: radius, fill: '#ffd166', 'fill-opacity': '0.9',
+    stroke: '#ffffff', 'stroke-width': '2',
+    'vector-effect': 'non-scaling-stroke', 'pointer-events': 'none'
+  });
+  raiseOverlay().appendChild(dot);
+  setTimeout(function () { dot.remove(); }, 1400);
+}
+
+function sendTap(ev) {
+  const point = toDevice(ev);
+  if (!point) return;
+  if (point.x < 0 || point.y < 0 || point.x > W || point.y > H) return;
+  marker(point.x, point.y);
+  wsSend({type: 'tap', x: point.x, y: point.y});
+  setMsg('tap ' + point.x + ', ' + point.y);
+}
+
+// 按点击坐标找该点覆盖的、面积最小的可编辑节点。输入框常常被父容器或上层
+// 全屏 View 盖住，直接依赖「点到的那块矩形」会命中不可编辑的容器，只发 tap。
+function editableAt(point) {
+  if (!point || !DATA) return null;
+  const nodes = DATA.nodes || [];
+  let best = null, bestArea = Infinity;
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (!n.e) continue;
+    const b = n.b;
+    if (!b || b.length < 4) continue;
+    const w = b[2] - b[0], h = b[3] - b[1];
+    if (w <= 0 || h <= 0) continue;
+    if (point.x < b[0] || point.x > b[2]
+        || point.y < b[1] || point.y > b[3]) continue;
+    if (w * h < bestArea) { bestArea = w * h; best = n; }
+  }
+  return best;
+}
+
+// 命中可编辑节点就打开侧栏输入框，返回 true 表示这次点击已被处理。
+function openEditableAt(ev) {
+  const target = editableAt(toDevice(ev));
+  if (!target) return false;
+  if (!target.r) {
+    setMsg('该节点不可编辑（缺少 ref）', true);
+    return true;
+  }
+  openEditor(target);
+  return true;
+}
+
+svg.addEventListener('mouseleave', function () {
+  metaEl.textContent = summary(DATA);
+});
+
+svg.addEventListener('click', function (ev) {
+  if (performance.now() < suppressClickUntil) return;
+  // pointerdown 里做了 setPointerCapture，click 可能落在 svg 而不是 rect；
+  // 这里再按坐标兜一次，保证点输入框一定能弹出侧栏输入框。
+  if (openEditableAt(ev)) return;
+  sendTap(ev);
+});
+
+// ---- 按住拖动 = 手机侧 swipe；按住不动 = 手机侧 long_press ----
+function clearPress() {
+  if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+  if (pressRing) { pressRing.remove(); pressRing = null; }
+}
+
+svg.addEventListener('pointerdown', function (ev) {
+  if (ev.button !== undefined && ev.button !== 0) return;
+  const point = toDevice(ev);
+  if (!point) return;
+  clearPress();
+  dragState = {id: ev.pointerId, sx: ev.clientX, sy: ev.clientY,
+               x1: point.x, y1: point.y, x2: point.x, y2: point.y,
+               startedAt: performance.now(), moved: false, longPressed: false};
+  try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+  // 手指/鼠标按住不动到阈值，立刻发 long_press，让手机端出真实长按菜单
+  pressTimer = setTimeout(function () {
+    pressTimer = null;
+    if (!dragState || dragState.moved) return;
+    dragState.longPressed = true;
+    const radius = Math.max(14, Math.round(W / 45));
+    pressRing = el('circle', {
+      cx: dragState.x1, cy: dragState.y1, r: radius,
+      fill: 'none', stroke: '#ffd166', 'stroke-width': '3',
+      'stroke-opacity': '0.95', 'pointer-events': 'none',
+      'vector-effect': 'non-scaling-stroke'
+    });
+    raiseOverlay().appendChild(pressRing);
+    wsSend({type: 'long_press', x: dragState.x1, y: dragState.y1,
+            duration_ms: 600});
+    setMsg('long_press ' + dragState.x1 + ', ' + dragState.y1);
+  }, LONG_PRESS_MS);
+});
+
+svg.addEventListener('pointermove', function (ev) {
+  if (!dragState || ev.pointerId !== dragState.id) return;
+  const dx = ev.clientX - dragState.sx;
+  const dy = ev.clientY - dragState.sy;
+  if (!dragState.moved && Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+  dragState.moved = true;
+  clearPress();               // 移动了就不再是长按
+  const point = toDevice(ev);
+  if (!point) return;
+  dragState.x2 = Math.max(0, Math.min(W, point.x));
+  dragState.y2 = Math.max(0, Math.min(H, point.y));
+  if (ev.cancelable) ev.preventDefault();
+  if (!dragLine) {
+    dragLine = el('line', {
+      stroke: '#ffd166', 'stroke-width': '3', 'stroke-dasharray': '6 6',
+      'stroke-opacity': '0.95', 'pointer-events': 'none',
+      'vector-effect': 'non-scaling-stroke'
+    });
+    raiseOverlay().appendChild(dragLine);
+  }
+  dragLine.setAttribute('x1', dragState.x1);
+  dragLine.setAttribute('y1', dragState.y1);
+  dragLine.setAttribute('x2', dragState.x2);
+  dragLine.setAttribute('y2', dragState.y2);
+  setMsg('swipe ' + dragState.x1 + ',' + dragState.y1 + ' → '
+         + dragState.x2 + ',' + dragState.y2);
+});
+
+function endDrag(ev) {
+  clearPress();
+  if (!dragState) return;
+  if (ev && ev.pointerId !== undefined && ev.pointerId !== dragState.id) return;
+  const state = dragState;
+  dragState = null;
+  if (dragLine) { dragLine.remove(); dragLine = null; }
+  if (ev && ev.pointerId !== undefined) {
+    try { svg.releasePointerCapture(ev.pointerId); } catch (e) {}
+  }
+  if (state.longPressed) {
+    // 长按已在手机端执行，抬手不要再补一次 tap
+    suppressClickUntil = performance.now() + 800;
+    return;
+  }
+  if (!state.moved) return;   // 位移不足阈值：交给 click 走 tap
+  suppressClickUntil = performance.now() + 500;
+  const duration = Math.min(1500,
+      Math.max(150, Math.round(performance.now() - state.startedAt)));
+  wsSend({type: 'swipe', x1: state.x1, y1: state.y1,
+          x2: state.x2, y2: state.y2, duration_ms: duration});
+  setMsg('swipe → ' + duration + 'ms');
+}
+
+svg.addEventListener('pointerup', endDrag);
+svg.addEventListener('pointercancel', endDrag);
+
+function wsSend(obj) {
+  if (!ws || ws.readyState !== 1) {
+    setMsg('WebSocket 未连接', true);
+    return false;
+  }
+  ws.send(JSON.stringify(obj));
+  return true;
+}
+
+function setState(text, isError) {
+  stateEl.textContent = text;
+  stateEl.style.color = isError ? '#ff9a94' : '';
+}
+
+function renderCfg(msg) {
+  msg = msg || {};
+  if (msg.topic !== undefined) cfgTopic = msg.topic || '';
+  if (msg.brokers !== undefined) {
+    cfgBrokers = Array.isArray(msg.brokers) ? msg.brokers : [];
+  }
+  if (msg.broker_status) cfgStatus = msg.broker_status;
+  if (msg.broker_counts) cfgCounts = msg.broker_counts;
+  let text = 'topic ' + (cfgTopic || '—');
+  if (cfgCounts) {
+    text += ' · broker 控制' + (cfgCounts.control || 0)
+         + ' 数据' + (cfgCounts.local || 0)
+         + ' 手机' + (cfgCounts.remote || 0);
+  }
+  // 只回显用户自己填过的 broker，三端实际状态压成一行 控制✓/数据✓/手机✓，
+  // 内建 broker 列表不再铺开，保持界面紧凑
+  (cfgStatus || []).forEach(function (it) {
+    text += ' · ' + it.spec + ' ' + (it.control ? '控制✓' : '控制✗')
+         + (it.local ? ' 数据✓' : ' 数据✗')
+         + (it.remote ? ' 手机✓' : ' 手机✗');
+  });
+  cfgEl.textContent = text;
+}
+
+function checkBrokers() {
+  // 只复核用户填过的 broker；没填就不查，避免把内建 broker 列表铺到界面上
+  const list = savedBrokers.slice();
+  if (list.length) wsSend({type: 'broker_check', brokers: list});
+}
+
+function handle(msg) {
+  if (!msg || typeof msg !== 'object') return;
+  switch (msg.type) {
+    case 'hello':
+    case 'state': {
+      renderCfg(msg);
+      renderKeys(msg);
+      if (msg.state === 'ready') {
+        setState('已连接 · sid=' + (msg.sid || '?'));
+        checkBrokers();
+      } else if (msg.state === 'error') {
+        setState('连接失败: ' + (msg.error || '?'), true);
+        setMsg('连接失败: ' + (msg.error || '?'), true);
+      } else if (msg.state === 'opening') {
+        setState('正在打开会话…');
+      } else {
+        setState('空闲');
+      }
+      if (msg.mqtt_rtt_ms !== undefined && msg.mqtt_rtt_ms !== null) {
+        mqttLatEl.textContent = msg.mqtt_rtt_ms + ' ms';
+      }
+      break;
+    }
+    case 'ws_pong':
+      if (msg.t !== undefined) {
+        wsLatEl.textContent = Math.round(performance.now() - msg.t) + ' ms';
+      }
+      break;
+    case 'snapshot':
+      render(msg);
+      break;
+    case 'latency':
+      if (msg.mqtt_rtt_ms !== undefined && msg.mqtt_rtt_ms !== null) {
+        mqttLatEl.textContent = msg.mqtt_rtt_ms + ' ms';
+      }
+      break;
+    case 'broker_counts':
+      if (msg.broker_counts) renderCfg(msg);
+      // 手机端 broker_add 回包后立即按三端实际列表复核
+      checkBrokers();
+      break;
+    case 'broker_status':
+      cfgStatus = Array.isArray(msg.items) ? msg.items : [];
+      renderCfg({});
+      break;
+    case 'action_result': {
+      let text = (msg.action || '?') + ' → ' + (msg.ok ? 'ok' : (msg.error || 'fail'));
+      if (msg.keys !== undefined) renderKeys(msg);
+      if (msg.broker_counts) renderCfg(msg);
+      if (msg.action === 'broker_add') {
+        renderCfg(msg);
+        const parts = [];
+        if (msg.added && msg.added.length) parts.push('新增 ' + msg.added.join(','));
+        if (msg.local && msg.local.length) parts.push('本地 ' + msg.local.join(','));
+        if (msg.remote_sent) parts.push('已同步手机端');
+        if (msg.remote_error) parts.push('手机端失败 ' + msg.remote_error);
+        if (parts.length) text += ' · ' + parts.join(' · ');
+      }
+      setMsg(text + (msg.mqtt_rtt_ms !== undefined ? ' · MQTT ' + msg.mqtt_rtt_ms + 'ms' : ''),
+             !msg.ok);
+      if (msg.mqtt_rtt_ms !== undefined && msg.mqtt_rtt_ms !== null) {
+        mqttLatEl.textContent = msg.mqtt_rtt_ms + ' ms';
+      }
+      break;
+    }
+    case 'bye':
+      setState('会话已结束: ' + (msg.reason || '?'));
+      setMsg('会话已结束: ' + (msg.reason || '?'));
+      break;
+    case 'error':
+      setMsg((msg.op || 'error') + ': ' + (msg.error || '?'), true);
+      break;
+  }
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/uiws');
+  ws.onopen = function () {
+    retry = 0;
+    setState('WebSocket 已连接，等待会话…');
+    ws.send(JSON.stringify({type: 'reconnect'}));
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = setInterval(function () {
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({type: 'ws_ping', t: performance.now()}));
+      }
+    }, 2000);
+  };
+  ws.onmessage = function (ev) {
+    try { handle(JSON.parse(ev.data)); } catch (e) {}
+  };
+  ws.onclose = function () {
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    setState('WebSocket 已断开，重连中…', true);
+    const delay = Math.min(8000, 500 * Math.pow(2, retry++));
+    setTimeout(connect, delay);
+  };
+  ws.onerror = function () {};
+}
+
+document.getElementById('refresh').addEventListener('click', function () {
+  wsSend({type: 'refresh'});
+});
+document.getElementById('wake').addEventListener('click', function () {
+  setMsg('唤醒屏幕…');
+  wsSend({type: 'wake'});
+});
+function submitBroker() {
+  const raw = brokerInput.value.trim();
+  if (!raw) return;
+  const list = raw.split(/[\s,;]+/).filter(Boolean);
+  wsSend({type: 'broker_add', brokers: list});
+  setMsg('broker_add → ' + list.join(' '));
+  list.forEach(function (item) {
+    if (savedBrokers.indexOf(item) < 0) savedBrokers.push(item);
+  });
+  try { localStorage.setItem(BROKER_KEY, JSON.stringify(savedBrokers)); } catch (e) {}
+  brokerInput.value = savedBrokers.join(' ');
+}
+document.getElementById('broker-add').addEventListener('click', submitBroker);
+brokerInput.addEventListener('keydown', function (ev) {
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    submitBroker();
+  } else if (ev.key === 'Escape') {
+    ev.stopPropagation();
+  }
+});
+document.getElementById('back').addEventListener('click', function () {
+  setMsg('返回键…');
+  wsSend({type: 'back'});
+});
+document.getElementById('toside').addEventListener('click', function () {
+  document.getElementById('side').scrollIntoView(
+      {behavior: 'smooth', inline: 'end', block: 'nearest'});
+});
+document.getElementById('tostage').addEventListener('click', function () {
+  document.getElementById('stage').scrollIntoView(
+      {behavior: 'smooth', inline: 'start', block: 'nearest'});
+});
+document.getElementById('ed-submit').addEventListener('click', submitEditor);
+document.getElementById('ed-cancel').addEventListener('click', closeEditor);
+edInput.addEventListener('keydown', function (ev) {
+  if (ev.key === 'Enter') {
+    ev.preventDefault();
+    submitEditor();
+  } else if (ev.key === 'Escape') {
+    ev.stopPropagation();
+    closeEditor();
+  }
+});
+
+// 全局按键：Esc = 手机返回键，方向键 = 无障碍 DPAD 全局动作（与 Esc 同样透传）。
+// 焦点在输入框时不劫持，避免影响文本输入。
+const DPAD_KEYS = {ArrowUp: 'dpad_up', ArrowDown: 'dpad_down',
+                   ArrowLeft: 'dpad_left', ArrowRight: 'dpad_right'};
+const DPAD_CODES = {ArrowUp: 16, ArrowDown: 17, ArrowLeft: 18, ArrowRight: 19};
+document.addEventListener('keydown', function (ev) {
+  const tag = ev.target && ev.target.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  if (ev.key === 'Escape') {
+    ev.preventDefault();
+    setMsg('返回键…');
+    wsSend({type: 'back'});
+    return;
+  }
+  const name = DPAD_KEYS[ev.key];
+  if (!name) return;
+  ev.preventDefault();
+  const action = deviceKeys[name] !== undefined ? deviceKeys[name] : DPAD_CODES[ev.key];
+  setMsg('按键 ' + name + ' → ' + action);
+  wsSend({type: 'global_action', action: action});
+});
+
+connect();
+</script>
+</body>
+</html>

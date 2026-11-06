@@ -20,6 +20,9 @@
         "allow_no_server_pubkey_response": true
     }
 
+段内键名与 client_mqtt 的连接参数别名表一致（``k``/``a``/``mb``/``topic``/
+``to`` 等简写都可直接写），见 ``_section_value``。
+
 启动方式（默认就是与 pty 相同的同口模式，MCP 与 RPC 复用 5555 端口）::
 
     python tools/xime_mcp/xime_mcp.py
@@ -66,7 +69,7 @@ for _path in (_ROOT, _CLIENT_DIR, _HERE):
 
 import client_mqtt  # noqa: E402  复用 client/rpc 的 MQTT 客户端与配置读取
 import xime_ui  # noqa: E402  元素视图的页面 / WebSocket / MQTT 数据面
-from multi_mqtt import get_standard_pem_bytes  # noqa: E402
+from multi_mqtt import get_duplicated_kargs, get_standard_pem_bytes  # noqa: E402
 from rpc_config import parse_broker_add  # noqa: E402  --broker_add 的 host:port 解析口径
 
 logger = logging.getLogger("xime_mcp")
@@ -213,6 +216,21 @@ def _merge_broker_add(config_value, cli_value):
     return merged
 
 
+def _section_value(section, aliases, name):
+    """按 client_mqtt 的 alias 表读 xime_mcp 段：任意等价键（k / key / private_key…）都命中。
+
+    只出现一个键时原样返回；多个等价键同时出现且取值冲突时抛 XimeConfigError，
+    避免“改了 k 却被 private_key 静默盖住”（与 client_mqtt.rpc 的别名解析同一套规则）。
+    """
+    try:
+        return get_duplicated_kargs(section, *aliases, default=None, no_pop=True)
+    except (TypeError, ValueError):
+        # 不转述底层异常：它的消息会带上整段配置（可能含私钥）。
+        raise XimeConfigError(
+            "xime_mcp.%s 同时出现多个等价的键，请只保留一个（%s）"
+            % (name, " / ".join(aliases))) from None
+
+
 def get_config(path=None):
     """返回 rpc.json 里 xime_mcp 段的归一化配置；缺失或非法抛 XimeConfigError。"""
 
@@ -227,21 +245,30 @@ def get_config(path=None):
             "rpc.json 缺少 xime_mcp 配置段（在 %s 里加："
             '"xime_mcp": {"request_topic": "<手机 topic>", "timeout": 20})' % path
         )
-    topic = str(section.get("request_topic") or section.get("topic") or "").strip()
+    topic = str(_section_value(
+        section, client_mqtt.alias_request_topic, "request_topic") or "").strip()
     if not topic:
         raise XimeConfigError("xime_mcp.request_topic 不能为空（填手机 server_mqtt 监听的 topic）")
-    reply_topic = str(section.get("reply_topic") or "").strip() or None
+    reply_topic = str(_section_value(
+        section, client_mqtt.alias_reply_topic, "reply_topic") or "").strip() or None
+    allow_value = _section_value(
+        section, client_mqtt.alias_allow_no_pub, "allow_no_server_pubkey_response")
     config = {
         "request_topic": topic,
         "reply_topic": reply_topic,
-        "timeout": _as_positive_float(section.get("timeout"), "timeout", _CONFIG_DEFAULTS["timeout"]),
+        "timeout": _as_positive_float(
+            _section_value(section, client_mqtt.alias_timeout, "timeout"),
+            "timeout", _CONFIG_DEFAULTS["timeout"]),
         "min_broker_count": _as_non_negative_int(
-            section.get("min_broker_count"), "min_broker_count", _CONFIG_DEFAULTS["min_broker_count"]),
-        "allow_no_server_pubkey_response": bool(
-            section.get("allow_no_server_pubkey_response",
-                        _CONFIG_DEFAULTS["allow_no_server_pubkey_response"])),
-        "private_key": _normalize_key(section.get("private_key", section.get("k"))),
-        "broker_add": _merge_broker_add(section.get("broker_add"), None),
+            _section_value(section, client_mqtt.alias_min_broker_count, "min_broker_count"),
+            "min_broker_count", _CONFIG_DEFAULTS["min_broker_count"]),
+        "allow_no_server_pubkey_response": (
+            _CONFIG_DEFAULTS["allow_no_server_pubkey_response"]
+            if allow_value is None else bool(allow_value)),
+        "private_key": _normalize_key(
+            _section_value(section, client_mqtt.alias_private_key, "private_key")),
+        "broker_add": _merge_broker_add(
+            _section_value(section, client_mqtt.alias_broker_add, "broker_add"), None),
     }
     for key, value in _CLI_OVERRIDES.items():
         if value is None:

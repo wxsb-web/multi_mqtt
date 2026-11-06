@@ -1,3 +1,23 @@
+P0 bug 依然存在：broadcast_idle_s 仍是 uptime 的 9.2 倍
+text
+uptime_s           = 56547.3
+broadcast_idle_s   = 519494.8      ← 9.19 倍
+从 41414.5s、84183.6s 到这次 56547.3s，这个字段连续三份报告都是“系统启动至今的秒数”，不是“距上次广播的秒数”。上一轮我已经定位了根因：
+
+_publish_broadcast 里 self._last_bcast_at = at_s，存的是相对 _t0 的秒数（≈2.0）
+
+get_report 里 round(now - self._last_bcast_at, 1)，now 是绝对 monotonic（≈519496）
+
+两者相减得到 519494.8，正好是“系统启动至今的秒数减去 2”。修法只有一行：
+
+python
+last_bcast_at = (round(now - self._t0 - self._last_bcast_at, 1)
+                 if self._last_bcast_at is not None else None)
+这是当前唯一一个明确的数据错误，其他所有字段都自洽
+
+
+
+
 1= **有意义，而且正是你这个 PTY + MCP 场景最核心的刚需：MCP 原生支持流式 stdout/stderr，AI 可以实时拿到命令输出，不用等进程退出；但能不能拿到，取决于三层：MCP 工具怎么封装、transport 怎么传、后端 PTY 转发有没有做流转发。**
 
 先把概念拆开，避免混淆：
@@ -22,13 +42,3 @@
 
 
 2=日志中显示运行的 详细命令原文
-
-[RPC] 15.37.42__.076  127.0.0.1:49907 "POST /mcp HTTP/1.1" 202 -
-2026-10-26 15:37:42,077 - INFO - Terminating session: None
-[RPC] 15.39.00__.328  127.0.0.1:49983 "POST /mcp HTTP/1.1" 202 -
-2026-10-26 15:39:00,329 - INFO - Terminating session: None
-
-
-3=
-echo __AI_BEGIN_e30e69e8这个改成可读时间精确ms__; sh -c "$(printf '%s' 可读化命令 Y2QgL3Jvb3QvYnVpbGRfeGltZV9ob21lL3hpbWUgJiYgc2VkIC1uICc0OTAsNTA5cCcgYXBrX3NpZ24ucHk= | { base64 -d 2>/dev/null || openssl enc -d -base64 -A 2>/dev/null || python3 -c 'import sys,base64;sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' 2>/dev/null || python -c 'import sys,base64;sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' 2>/dev/null; })"; __ai_rc=$?; echo __AI_END_e30e69e8__:$__ai_rc
-
