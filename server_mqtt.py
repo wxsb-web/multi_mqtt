@@ -201,6 +201,9 @@ def set_rpc_config(*, path=None, force_write=False, **updates):
         RPC_CONFIG_PATH = config_path
         logger.info("配置文件位置已更新到内存: %s（暂无存活实例）", config_path)
         return _json_rpc_config(candidate)
+    # 显式输入先做字段别名归一化（add_broker/topic/pub ... -> 规范键），
+    # 让模块级 rpc_config 与实例级 gms.rpc_config 支持同一套别名。
+    updates = _rpc_config.normalize_rpc_updates(updates)
     config_path = Path(path) if path is not None else RPC_CONFIG_PATH
     with _RPC_CONFIG_LOCK:
         _validate_explicit_updates(updates)   # 显式传错立刻报错，不静默回落
@@ -499,6 +502,8 @@ class MQTTServer:
                 self.rpc_config_path = config_path
             logger.info("配置文件位置已更新到内存并已热应用: %s", config_path)
             return self.rpc_config_get()
+        # 显式输入先做字段别名归一化，与模块级 rpc_config 行为一致
+        updates = _rpc_config.normalize_rpc_updates(updates)
         config_path = Path(path) if path is not None else self.rpc_config_path
         with _RPC_CONFIG_LOCK:
             _validate_explicit_updates(updates)   # 显式传错立刻报错

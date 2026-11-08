@@ -132,6 +132,10 @@ class FakeNet:
     def subscribe(self, topic):
         self.subscribed.append(topic)
 
+    def unsubscribe(self, topic):
+        if topic in self.subscribed:
+            self.subscribed.remove(topic)
+
     def publish_broadcast(self, topic, payload):
         with self.lock:
             self.published.append((topic, dict(payload)))

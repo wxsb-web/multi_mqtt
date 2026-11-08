@@ -1221,6 +1221,19 @@ def _cmq_pty_start():
         _net._cmq_pty_router[_in_topic] = _inq
         _net.subscribe(_in_topic)
 
+        def _release_in_topic():
+            # 会话收尾必须连订阅一起摘：只 pop 路由会让 in_topic 永久留在
+            # mqtt_net.subscribed_topics（重连时还会按它自动补订阅），
+            # global_topic_list 就会把早已结束的会话 topic 一直上报出去。
+            # 仅当路由表里仍是本会话队列时才摘并退订：30s 接管竞态/同 sid
+            # 重开时，同名 topic 可能已被新会话重新注册，不能误摘。
+            try:
+                if _net._cmq_pty_router.get(_in_topic) is _inq:
+                    _net._cmq_pty_router.pop(_in_topic, None)
+                    _net.unsubscribe(_in_topic)
+            except Exception:
+                pass
+
         def _in_loop():
             # 上行帧单调闸门：同一帧会被每个 broker 各投递一次（实测 11 个
             # 连接能到 ~15 份），而不同 broker 的路径延迟抖动还会让帧乱序
@@ -1373,10 +1386,7 @@ def _cmq_pty_start():
                 else:
                     _rc = _proc.returncode
                 _end.set()
-                try:
-                    _net._cmq_pty_router.pop(_in_topic, None)
-                except Exception:
-                    pass
+                _release_in_topic()
                 try:
                     with _sess_lock:
                         _sessions.pop(_sid, None)
@@ -1390,6 +1400,9 @@ def _cmq_pty_start():
                 except Exception:
                     pass
             finally:
+                # 正常收尾已在上面释放；这里是异常路径（如 _poll.poll 抛错）
+                # 的兜底，避免线程死了却把 in_topic 订阅永久挂在 manager 上。
+                _release_in_topic()
                 try:
                     _o.close(_mfd)
                 except OSError:

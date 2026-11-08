@@ -1375,6 +1375,10 @@ if IS_POSIX:
         def subscribe(self, topic):
             self.subscribed.append(topic)
 
+        def unsubscribe(self, topic):
+            if topic in self.subscribed:
+                self.subscribed.remove(topic)
+
         def publish_broadcast(self, topic, payload):
             with self._lock:
                 self.published.append((topic, dict(payload)))
@@ -1626,6 +1630,9 @@ if IS_POSIX:
             time.sleep(0.3)
             self.assertEqual(self.gms.base_calls, [])
             self._stop(sid, iseq=1)
+            # 会话结束后必须退订 in topic，否则 subscribed_topics 永久残留，
+            # global_topic_list 会把死会话 topic 一直上报。
+            self.assertNotIn("pty/%s/in" % sid, self.net.subscribed)
 
         # ---- 心跳 ----
 

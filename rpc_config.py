@@ -86,6 +86,28 @@ DEFAULT_GLOBAL_TOPIC_URL_LIST = [
 DEFAULT_STATS_PRINT_INTERVAL = ConnectionQualityStats.PRINT_INTERVAL
 DEFAULT_STATS_PING_INTERVAL = ConnectionQualityStats.PING_INTERVAL
 
+# --- [字段别名] 与 client/client_mqtt.py 的 alias_xxx 同风格 ---
+# 所有 rpc_config(...) 入口（模块级 rpc_config / 实例级 gms.rpc_config /
+# HTTP RPC / MQTT RPC）都先经 normalize_rpc_updates() 归一化，因此别名在
+# 任何入口都等价于规范键。broker_list_add/del 还接受 "host:port" 字符串
+# 或单条 (host, port, auth)，口径与 client 的 --broker_add 一致。
+RPC_CONFIG_ALIASES = {
+    "broker_list": ("brokers", "bl"),
+    "broker_list_add": ("add_broker", "add_brokers", "broker_add", "badd", "add"),
+    "broker_list_del": ("del_broker", "del_brokers", "broker_del", "bdel", "del"),
+    "request_topic": ("topic", "t", "q", "request"),
+    "pub_key": ("public_key", "pubkey", "pub"),
+    "global_topic_url_list": ("report_urls", "urls", "gul"),
+    "global_topic_list": ("report_topic", "gtl"),
+    "global_topic_list_interval": ("gtl_interval",),
+    "global_topic_list_idle_threshold": ("gtl_idle_threshold", "idle_threshold"),
+    "global_topic_list_check_interval": ("gtl_check_interval", "gtl_tick"),
+    "global_topic_list_publish_kwargs": ("gtl_publish_kwargs", "publish_kwargs"),
+    "stats_print_interval": ("print_interval", "stats_print", "spi"),
+    "stats_ping_interval": ("ping_interval", "stats_ping", "sgi"),
+    "client_stats_print_interval": ("client_print_interval", "cspi"),
+}
+
 
 def _default_rpc_config():
     return {
@@ -722,6 +744,67 @@ def parse_broker_add(spec):
         logger.warning("broker_add 条目 %r 端口超出范围，已跳过", spec)
         return None
     return (host, port)
+
+
+def _canonical_rpc_key(name):
+    """别名 -> 规范键；不是已知字段返回 None。"""
+    for canonical, aliases in RPC_CONFIG_ALIASES.items():
+        if name == canonical or name in aliases:
+            return canonical
+    return None
+
+
+def _parse_explicit_broker_spec(spec):
+    """显式输入的 broker 字符串：非法直接报错（不被 parse_broker_add 静默跳过）。"""
+    entry = parse_broker_add(spec)
+    if entry is None:
+        raise ValueError(f"broker 条目非法: {spec!r}（应为 host:port）")
+    return entry
+
+
+def _normalize_broker_alias_value(value):
+    """broker_list_add/del 的简写形式归一化。
+
+    接受 ``"host:port"``、``["host:port", ...]``、单条 ``(host, port[, auth])``；
+    其它形态（条目列表、None、空列表）原样返回，交给严格校验判定。
+    """
+    if isinstance(value, str):
+        return [_parse_explicit_broker_spec(value)]
+    if isinstance(value, tuple):
+        value = list(value)
+    if isinstance(value, list) and value and all(isinstance(item, str) for item in value):
+        return [_parse_explicit_broker_spec(item) for item in value]
+    if (isinstance(value, list) and 2 <= len(value) <= 3
+            and isinstance(value[0], str)
+            and not isinstance(value[1], (list, tuple, dict))):
+        return [value]                   # 单条 (host, port[, auth]) 包成列表
+    return value
+
+
+def normalize_rpc_updates(updates):
+    """把 rpc_config(...) 的字段别名归一化为规范键。
+
+    只在显式输入入口调用（模块级 / 实例级 rpc_config），rpc.json 文件内容
+    不走这里。同一字段同时给出多个取值不同的别名视为冲突，直接报错，
+    避免静默取其中之一。
+    """
+    if not isinstance(updates, dict):
+        return updates
+    normalized = {}
+    sources = {}
+    for key, value in updates.items():
+        canonical = _canonical_rpc_key(key)
+        if canonical is None:
+            normalized[key] = value      # 未知键保留，由严格校验统一告警
+            continue
+        if canonical in sources and normalized[canonical] != value:
+            raise ValueError(
+                f"rpc_config 收到同一字段的冲突别名: {sources[canonical]} 与 {key}")
+        if canonical in ("broker_list_add", "broker_list_del"):
+            value = _normalize_broker_alias_value(value)
+        normalized[canonical] = value
+        sources[canonical] = key
+    return normalized
 
 
 def _force_broker_list(result, composed, broker_add):

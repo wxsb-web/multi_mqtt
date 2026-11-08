@@ -952,7 +952,13 @@ def _cmq_socks5_start():
                 except Exception:
                     pass
             try:
-                _net._cmq_pty_router.pop(_in_topic, None)
+                # 只摘路由会让 in_topic 永久留在 mqtt_net.subscribed_topics，
+                # 重连还会自动补订阅，global_topic_list 便一直上报死会话
+                # topic；这里连订阅一起摘。仅当路由表里仍是本会话队列时
+                # 才动，避免接管/同名重开时误摘新会话的订阅。
+                if _net._cmq_pty_router.get(_in_topic) is _inq:
+                    _net._cmq_pty_router.pop(_in_topic, None)
+                    _net.unsubscribe(_in_topic)
             except Exception:
                 pass
             try:

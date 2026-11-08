@@ -251,6 +251,39 @@ class ServerMqttConfigTests(unittest.TestCase):
         stored = json.loads(self.config_path.read_text())
         self.assertEqual(stored["broker_list_add"], [second])
 
+    def test_add_broker_alias_accepts_host_port_string(self):
+        """HTTP/MQTT 入口常见的 add_broker='host:port' 要真正生效并落盘。"""
+        result = server_mqtt.rpc_config(add_broker="mqtt.bemfa.com:9501")
+
+        self.assertIn(["mqtt.bemfa.com", 9501], result["broker_list"])
+        self.assertEqual(
+            json.loads(self.config_path.read_text())["broker_list_add"],
+            [["mqtt.bemfa.com", 9501]],
+        )
+
+    def test_instance_level_alias_matches_module_level(self):
+        """实例级 gms.rpc_config_set 也走同一套别名。"""
+        result = self.server.rpc_config_set(
+            add_broker="mqtt.bemfa.com:9501", t="alias/request")
+
+        self.assertIn(["mqtt.bemfa.com", 9501], result["broker_list"])
+        self.assertEqual(result["request_topic"], "alias/request")
+        self.assertIn("alias/request", self.server.mqtt_net.subscribed_topics)
+
+    def test_del_broker_alias_accepts_host_port_string(self):
+        result = server_mqtt.rpc_config(del_broker="old-broker.example:1883")
+
+        self.assertNotIn(["old-broker.example", 1883], result["broker_list"])
+
+    def test_broker_alias_bad_port_raises_instead_of_silent_noop(self):
+        """显式输入写错要立刻报错，不能像未知键一样静默忽略。"""
+        with self.assertRaises(ValueError):
+            server_mqtt.rpc_config(add_broker="mqtt.bemfa.com:not-a-port")
+
+    def test_conflicting_field_aliases_raise(self):
+        with self.assertRaises(ValueError):
+            server_mqtt.rpc_config(t="a/request", request_topic="b/request")
+
     def test_object_level_rpc_config_applies_and_reaches_all_instances(self):
         """实例级 get/set 可用（不再 AttributeError），模块级 set 作用于全部实例。"""
         second = server_mqtt.MQTTServer(

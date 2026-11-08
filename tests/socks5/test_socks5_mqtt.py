@@ -151,6 +151,10 @@ class FakeNet:
     def subscribe(self, topic):
         self.subscribed.append(topic)
 
+    def unsubscribe(self, topic):
+        if topic in self.subscribed:
+            self.subscribed.remove(topic)
+
     def publish_broadcast(self, topic, payload):
         with self.lock:
             self.published.append((topic, dict(payload)))
@@ -347,6 +351,8 @@ class Socks5TemplateLiveTests(unittest.TestCase):
             lambda: any(d.get("end") for _, d in self.net.frames(self.out_t)),
             timeout=5)
         self.assertTrue(ok, "stop 后未广播 end 帧")
+        # 收尾必须同时退订 in topic，避免 subscribed_topics 永久残留
+        self.assertNotIn(self.in_t, self.net.subscribed)
 
     # ---- R2：_in_loop 单帧异常不得带死会话（畸形帧防护） ----
 
