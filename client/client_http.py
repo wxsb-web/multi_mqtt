@@ -91,8 +91,8 @@ def rpc_set_file(local_file, remote_file=None, base='http://localhost:1144/',
         "    try:\n        response.set_status(500)\n    except Exception:\n        pass",
         "    r = traceback.format_exc()",
     ]
-    code = "\n".join(lines)
-    url = base.rstrip('/') + '/' + urllib.parse.quote(str(key) + code, safe='')
+    code = "\n".join(lines)# + '/'
+    url = base.rstrip('/')  + urllib.parse.quote(str(key) + code, safe='')
 
     if proxy == 0:
         proxies = {'http': None, 'https': None}

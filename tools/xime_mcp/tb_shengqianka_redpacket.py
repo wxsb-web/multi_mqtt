@@ -8,7 +8,7 @@
 
 用法::
 
-    python tb_shengqianka_redpacket.py                       # 默认 192.168.1.100
+    python tb_shengqianka_redpacket.py                       # 默认 http://127.0.0.1:5555/mcp
     python tb_shengqianka_redpacket.py --url http://192.168.1.109:5555/mcp
     python tb_shengqianka_redpacket.py --shot http://192.168.1.109:1122 \
         --shot-out shot.jpg                                  # 结束时抓一张真机截图
@@ -18,10 +18,12 @@
     商品图左下多了一个 207x252 左右的竖版 Image 节点（源图 -tps-282-344.png），
     它的父节点可点击；点它 = 点商品，进详情页后立刻返回，计数 +1。
 
-注意：dump_ui 必须给足 max_nodes（默认 500 会把右列节点截断，导致漏掉红包角标）。
+注意：dump_ui 必须给足 max_nodes（默认 500 会把右列节点截断，导致漏掉红包角标）；
+页面异步渲染，进页/重进后要等角标出现，不能靠固定 sleep 或先下滑。
 """
 
 import argparse
+import datetime
 import json
 import random
 import re
@@ -29,7 +31,7 @@ import sys
 import time
 import urllib.request
 
-DEFAULT_URL = "http://192.168.1.100:5555/mcp"
+DEFAULT_URL = "http://127.0.0.1:5555/mcp"
 TAOBAO_PKG = "com.taobao.taobao"
 
 # 红包角标：竖版小图，宽 180~245、高 215~285，高宽比 > 1.05
@@ -39,6 +41,20 @@ BADGE_RATIO_MIN = 1.05
 
 COUNTER_RE = re.compile(r"^(\d+)/5$")
 BADGE_URL_HINT = "tps-282-344"
+DUMP_NODES = 2000                # 一次 dump 的节点上限（不够会把角标截掉）
+
+_step = 0
+_t0 = time.time()
+
+
+def log(msg):
+    """一个步骤一行（行首墙钟时间 + 累计耗时）；只打关键元素，绝不整棵 UI 树输出。"""
+    global _step
+    _step += 1
+    now = datetime.datetime.now()
+    print("%s [%02d %6.1fs] %s" % (
+        now.strftime("%Y-%m-%d__%H.%M.%S__.") + "%03d" % (now.microsecond // 1000),
+        _step, time.time() - _t0, msg), flush=True)
 
 
 class Mcp:
@@ -102,7 +118,7 @@ class Mcp:
 # ---------------------------------------------------------------------------
 
 def dump(dev):
-    return dev.call("dump_ui", max_nodes=1500, include_empty=True)
+    return dev.call("dump_ui", max_nodes=DUMP_NODES, include_empty=True)
 
 
 def nodes_of(d):
@@ -138,12 +154,37 @@ def visible(bs):
     return [b for b in bs if 280 < b["top"] < 2050]
 
 
+def summary(d):
+    """dump 的浓缩信息：节点数 / 计数 / 角标数量，一行看完。"""
+    bs = badges(d)
+    c = counter(d)
+    n = len(nodes_of(d))
+    return "节点%d%s 计数%s 角标%d(可见%d)" % (
+        n, "(截断)" if n >= DUMP_NODES else "",
+        ("%d/5" % c) if c is not None else "无", len(bs), len(visible(bs)))
+
+
+def wait_badges(dev, timeout=8.0, interval=1.2):
+    """页面是异步渲染的：反复 dump 直到可见角标出现（首屏就有，别急着下滑）。"""
+    t0 = time.time()
+    d = dump(dev)
+    bs = visible(badges(d))
+    while not bs and time.time() - t0 < timeout:
+        time.sleep(interval)
+        d = dump(dev)
+        bs = visible(badges(d))
+    log("等角标 %.1fs → 可见%d %s" % (time.time() - t0, len(bs), summary(d)))
+    return d, bs
+
+
 def swipe_up(dev):
+    log("上滑一屏")
     dev.call("swipe", x1=540, y1=1900, x2=540, y2=750, duration_ms=500)
     time.sleep(1.4)
 
 
 def back(dev):
+    log("全局返回(back)")
     dev.call("global_action", action=1)
     time.sleep(2.4)
 
@@ -157,104 +198,165 @@ def tap(dev, x, y):
 # 页面导航
 # ---------------------------------------------------------------------------
 
+def wait_text(dev, text, timeout=12, max_nodes=1500):
+    """轮询等文本出现（WebView 首屏渲染慢，不能用固定 sleep），结果压成一行。"""
+    t0 = time.time()
+    r = dev.call("wait_text", text=text, timeout=timeout, interval=0.6,
+                 max_nodes=max_nodes)
+    hits = r.get("hits") or []
+    clickable = [n for n in hits if n.get("clickable")]
+    dt = time.time() - t0
+    if hits:
+        h = (clickable or hits)[0]
+        log("等「%s」%.1fs → 命中%d(可点%d) \"%s\"(%d,%d)" % (
+            text, dt, len(hits), len(clickable),
+            h.get("text") or h.get("desc") or "", h["x"], h["y"]))
+    else:
+        log("等「%s」%.1fs → 未命中（上限%ss）" % (text, dt, timeout))
+    return r
+
+
 def open_taobao(dev):
+    log("启动淘宝 %s" % TAOBAO_PKG)
     dev.call("launch_app", package=TAOBAO_PKG)
-    time.sleep(2.5)
+    time.sleep(1.0)
+
+
+def _pick_sqk(hits):
+    """挑真正的省钱卡入口；排除“韩**A领了省钱卡红包，推荐您购买”这类浮层。"""
+    for n in hits:
+        s = (n.get("text") or "") + (n.get("desc") or "")
+        if not n.get("clickable") or "领了" in s or "推荐" in s:
+            continue
+        return n
+    return None
+
+
+def is_sqk_page(dev):
+    """省钱卡 WebView 页（淘宝原生页没有这些区块）。"""
+    return bool(wait_text(dev, "购物红包", timeout=3, max_nodes=1200).get("hits"))
 
 
 def open_shengqianka(dev):
     """在「我的淘宝」页点省钱卡入口。"""
-    hit = dev.call("find_text", text="我的淘宝")
+    hit = wait_text(dev, "我的淘宝", timeout=15, max_nodes=800)
     for n in (hit.get("hits") or []):
         if n.get("clickable"):
+            log("点底部「我的淘宝」(%d,%d)" % (n["x"], n["y"]))
             tap(dev, n["x"], n["y"])
-            time.sleep(2.2)
+            time.sleep(1.4)
             break
-    hit = dev.call("find_text", text="省钱卡")
-    hits = [n for n in (hit.get("hits") or []) if n.get("clickable")]
-    if not hits:
+    hit = wait_text(dev, "省钱卡", timeout=12, max_nodes=1100)
+    n = _pick_sqk(hit.get("hits") or [])
+    if not n:
+        log("没找到可点的「省钱卡」入口（命中项都不是入口）")
         return False
-    tap(dev, hits[0]["x"], hits[0]["y"])
-    time.sleep(2.6)
+    log("点「%s」(%d,%d)" % (n.get("text") or n.get("desc") or "省钱卡", n["x"], n["y"]))
+    tap(dev, n["x"], n["y"])
     return True
 
 
-def open_unlock(dev):
-    """点「点击红包解锁」，进兑奖页。"""
-    hit = dev.call("find_text", text="点击红包解锁")
-    if not hit.get("hits"):
+def open_unlock(dev, timeout=20):
+    """点「点击红包解锁」，进兑奖页（该节点在树的第 445+ 位，max_nodes 必须给足）。"""
+    r = wait_text(dev, "点击红包解锁", timeout=timeout, max_nodes=1600)
+    if not r.get("hits"):
+        log("没找到「点击红包解锁」")
         return False
-    h = hit["hits"][0]
+    h = r["hits"][0]
+    if not 150 <= h["y"] <= 2250:               # 屏外（多发生在翻页后），先滚回顶部
+        log("解锁入口在屏外(y=%d)，滚回顶部" % h["y"])
+        dev.call("swipe", x1=540, y1=700, x2=540, y2=2000, duration_ms=600)
+        time.sleep(1.0)
+        r = wait_text(dev, "点击红包解锁", timeout=6, max_nodes=1600)
+        if not r.get("hits"):
+            return False
+        h = r["hits"][0]
+    log("点「点击红包解锁」(%d,%d)" % (h["x"], h["y"]))
     tap(dev, h["x"], h["y"])
-    time.sleep(3.2)
+    wait_text(dev, "下滑寻找", timeout=12, max_nodes=1200)
+    return True
+
+
+def open_redeem(dev):
+    """从任意页面导航到兑奖页；淘宝常续停在省钱卡/兑奖页，没有底部 tab。"""
+    if wait_text(dev, "下滑寻找", timeout=5, max_nodes=1200).get("hits"):
+        log("已在兑奖页，跳过导航")
+        return True
+    if open_unlock(dev, timeout=6):
+        return True
+    if is_sqk_page(dev):
+        log("在省钱卡页但无解锁入口，退出 WebView 回淘宝原生页")
+        back(dev)
+    if not open_shengqianka(dev):
+        return False
+    if not open_unlock(dev):
+        log("省钱卡页没有「点击红包解锁」入口（今日可能未发放或已领完）")
+        return False
     return True
 
 
 def reenter(dev):
-    """退回省钱卡再进一次，翻两下（用户经验：这样角标会重新出现）。"""
+    """退回省钱卡再进一次（重进后首屏就有角标，不需要下滑）。"""
+    log("退回省钱卡重新进入")
     back(dev)
-    time.sleep(0.6)
     if not open_unlock(dev):
         open_shengqianka(dev)
         open_unlock(dev)
-    swipe_up(dev)
-    swipe_up(dev)
 
 
 # ---------------------------------------------------------------------------
 # 主循环
 # ---------------------------------------------------------------------------
 
-def run(dev, target=5, max_clicks=20, max_rounds=8, verbose=True):
-    d = dump(dev)
+def run(dev, target=5, max_clicks=20, max_rounds=8):
+    d, bs = wait_badges(dev, timeout=8)
     cur = counter(d) or 0
-    log = ["起始计数: %d/%d" % (cur, target)]
-    if verbose:
-        print(log[-1])
+    log("兑奖页就绪，当前 %d/%d，可见角标 %d" % (cur, target, len(bs)))
 
     clicks = 0
     for rnd in range(1, max_rounds + 1):
         if cur >= target:
             break
+        log("第%d轮开始" % rnd)
         hits_this_round = 0
         for _ in range(6):                      # 单轮内边翻边点
-            d = dump(dev)
-            cur = counter(d) or cur
-            bs = visible(badges(d))
+            if not bs:                          # 页面异步渲染：先等角标，别急着下滑
+                d, bs = wait_badges(dev, timeout=4)
             if not bs:
                 swipe_up(dev)
+                d = dump(dev)
+                bs = visible(badges(d))
+                log(summary(d))
                 continue
-            b = bs[0]
+            b = bs.pop(0)
+            log("点角标%s (%d,%d)" % (b["url"], b["cx"], b["cy"]))
             tap(dev, b["cx"], b["cy"])
             time.sleep(2.6)                     # 进详情页
             back(dev)                           # 立刻返回
             d = dump(dev)
             new = counter(d) or cur
+            bs = visible(badges(d))
             clicks += 1
-            line = "第%d轮 点击(%d,%d) 角标%s → %d/%d" % (
-                rnd, b["cx"], b["cy"], b["url"], new, target)
-            log.append(line)
-            if verbose:
-                print(line)
+            log("返回后 %s" % summary(d))
             if new > cur:
                 hits_this_round += 1
+                log("计数 %d→%d/%d" % (cur, new, target))
                 cur = new
             else:
-                log.append("  该卡片未计数，跳过")
+                log("该卡片未计数，跳过")
             if cur >= target:
                 break
         if cur >= target:
             break
         if hits_this_round == 0 or clicks >= max_clicks:
-            log.append("本轮无可点角标，退回省钱卡重新进入")
-            if verbose:
-                print(log[-1])
+            log("本轮命中%d次，已点%d次，退回重进" % (hits_this_round, clicks))
             reenter(dev)
+            bs = []                             # 重进后重新等首屏角标
             if hits_this_round == 0:
                 time.sleep(random.uniform(1.5, 3.0))
     final = counter(dump(dev))
-    log.append("结束计数: %s/%d，总点击 %d 次" % (final, target, clicks))
-    return final, log
+    log("结束：%s/%d，总点击 %d 次" % (final, target, clicks))
+    return final
 
 
 def save_shot(shot_base, out_path):
@@ -281,26 +383,23 @@ def main(argv=None):
     ap.add_argument("--shot-out", default="tb_shot.jpg")
     args = ap.parse_args(argv)
 
+    log("连接 %s" % args.url)
     dev = Mcp(args.url)
     dev.initialize()
     status = dev.call("status")
     if not (status.get("status") or {}).get("connected"):
         print("手机未连上: %s" % status, file=sys.stderr)
         return 2
-    print("已连接手机，开始流程")
+    log("手机已连接，开始导航")
 
     if not args.skip_nav:
         open_taobao(dev)
-        open_shengqianka(dev)
-        if not open_unlock(dev):
-            print("没找到「点击红包解锁」入口", file=sys.stderr)
+        if not open_redeem(dev):
+            print("导航到兑奖页失败（未找到「点击红包解锁」入口）", file=sys.stderr)
             return 3
-        swipe_up(dev)
-        swipe_up(dev)
 
-    final, log = run(dev, target=args.target,
-                     max_clicks=args.max_clicks, max_rounds=args.max_rounds)
-    print("\n".join(log))
+    final = run(dev, target=args.target,
+                max_clicks=args.max_clicks, max_rounds=args.max_rounds)
     if args.shot:
         print("截图已保存 %s（%d 字节）" % (args.shot_out, save_shot(args.shot, args.shot_out)))
     return 0 if (final or 0) >= args.target else 1

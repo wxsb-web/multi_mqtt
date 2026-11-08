@@ -618,6 +618,15 @@ class FirstPacketStatsTests(unittest.TestCase):
         self.assertLessEqual(cov["seen"], cov["attempted"])
         self.assertEqual(cov["attempted"], cov["seen"] + cov["blind"])
 
+    def test_broadcast_idle_is_relative_to_uptime(self):
+        """回归：_last_bcast_at 存的是相对 _t0 的秒数，不能拿绝对 monotonic 去减。"""
+        self.net.publish_broadcast("t", {"x": 1})
+        rep = self.stats.get_report()
+        idle = rep["uplink_publish"]["coverage"]["broadcast_idle_s"]
+        # 刚广播完：空闲时长必须很小，且物理上不可能超过进程 uptime
+        self.assertLess(idle, 5.0)
+        self.assertLessEqual(idle, rep["uptime_s"])
+
     def test_uplink_offline_host_is_counted_not_blind(self):
         """在 clients 里但 is_connected() 为假：记 offline，不是 blind。"""
         net = self.net

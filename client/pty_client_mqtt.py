@@ -2045,7 +2045,9 @@ class FirstPacketStats:
             gres = {k: list(v) for k, v in self._gsamples.items()}
             snap_rows = list(self._snapshots) if snapshots else None
             uptime = max(0.0, now - self._t0)
-            last_bcast_at = (round(now - self._last_bcast_at, 1)
+            # _last_bcast_at 是相对 _t0 的秒数，now 是绝对 monotonic，
+            # 必须先减去 _t0 才是「距上次广播的秒数」。
+            last_bcast_at = (round(now - self._t0 - self._last_bcast_at, 1)
                              if self._last_bcast_at is not None else None)
             if reset:
                 self._reset_locked()
