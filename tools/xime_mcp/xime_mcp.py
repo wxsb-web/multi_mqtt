@@ -59,6 +59,7 @@ import sys
 import threading
 import time
 from collections import deque
+from urllib.parse import quote
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -70,7 +71,7 @@ for _path in (_ROOT, _CLIENT_DIR, _HERE):
 import client_mqtt  # noqa: E402  复用 client/rpc 的 MQTT 客户端与配置读取
 import xime_ui  # noqa: E402  元素视图的页面 / WebSocket / MQTT 数据面
 from multi_mqtt import get_duplicated_kargs, get_standard_pem_bytes  # noqa: E402
-from rpc_config import parse_broker_add  # noqa: E402  --broker_add 的 host:port 解析口径
+from rpc_config import parse_broker_add  # noqa: E402  --broker_add 解析口径（[user:pass@]host[:port]）
 
 logger = logging.getLogger("xime_mcp")
 
@@ -181,29 +182,50 @@ def _normalize_key(value):
     return get_standard_pem_bytes(text)
 
 
-def _normalize_broker_add(value):
-    """把 broker_add 归一成 ["host:port", ...]：支持单个字符串、[host,port] 与列表。
+def _broker_spec_from_item(item):
+    """把 [host, port(, auth)] 转成 [user:pass@]host:port 字符串。"""
+    if not isinstance(item, (list, tuple)):
+        return item
+    if len(item) < 2:
+        return None
+    host, port = item[0], item[1]
+    auth = item[2] if len(item) >= 3 else None
+    if isinstance(auth, (list, tuple)) and len(auth) >= 2:
+        return "%s:%s@%s:%s" % (
+            quote(str(auth[0]), safe=""), quote(str(auth[1]), safe=""), host, port)
+    if isinstance(auth, str) and auth:
+        username, separator, password = auth.partition(":")
+        if separator:
+            return "%s:%s@%s:%s" % (
+                quote(username, safe=""), quote(password, safe=""), host, port)
+        return "%s@%s:%s" % (quote(auth, safe=""), host, port)
+    return "%s:%s" % (host, port)
 
-    非法条目按 parse_broker_add 的口径丢弃（只告警），不影响启动。
+
+def _normalize_broker_add(value):
+    """把 broker_add 归一成 ["[user:pass@]host[:port]", ...]。
+
+    支持单个字符串、[host,port(,auth)] 与列表；按 host:port 去重，
+    认证信息保留在字符串里。非法条目按 parse_broker_add 的口径丢弃
+    （只告警），不影响启动。
     """
     if value is None:
         return []
     items = [value] if isinstance(value, str) else list(value or [])
     result = []
+    seen = set()
     for item in items:
-        if isinstance(item, (list, tuple)):
-            if len(item) < 2:
-                continue
-            item = "%s:%s" % (item[0], item[1])
-        text = str(item or "").strip()
+        text = str(_broker_spec_from_item(item) or "").strip()
         if not text:
             continue
         entry = parse_broker_add(text)
         if entry is None:
             continue
-        spec = "%s:%d" % entry
-        if spec not in result:
-            result.append(spec)
+        key = "%s:%d" % (entry[0], entry[1])
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
     return result
 
 
@@ -324,13 +346,19 @@ def device_call(fn, args=(), op=None, timeout=None):
 
 
 def _broker_entries(specs):
-    """["host:port", ...] / [(host, port), ...] -> [[host, port], ...]。"""
+    """["[user:pass@]host[:port]", ...] / [(host, port[, auth]), ...] -> 条目列表。"""
     entries = []
     for spec in specs or []:
         parsed = parse_broker_add(spec) if isinstance(spec, str) else spec
         if not isinstance(parsed, (list, tuple)) or len(parsed) < 2:
             continue
         entry = [str(parsed[0]), int(parsed[1])]
+        if len(parsed) >= 3 and parsed[2]:
+            auth = parsed[2]
+            if isinstance(auth, (list, tuple)) and len(auth) >= 2:
+                entry.append([str(auth[0]), str(auth[1])])
+            elif isinstance(auth, str):
+                entry.append(auth)
         if entry not in entries:
             entries.append(entry)
     return entries
@@ -645,7 +673,7 @@ def xime_windows():
 
 
 def xime_broker_add(brokers=("192.168.1.20:1883",)):
-    """为了改善同一个局域网控制延迟， 同时 把 broker 追加进内存 broker 列表（host:port，可空格/逗号分隔多条）。
+    """为了改善同一个局域网控制延迟， 同时 把 broker 追加进内存 broker 列表（[user:pass@]host[:port]，可空格/逗号分隔多条）。
 
     只改内存（update_brokers），不写 rpc.json；手机端在下一次 RPC 前自动补上
     同一批 broker（幂等，已在列表时不重复建连）。
@@ -1108,8 +1136,8 @@ def main(argv=None):
     parser.add_argument(
         *client_mqtt._cli_opts(*client_mqtt.alias_broker_add),
         dest="broker_add", action="append", default=None,
-        help="强制加入 broker（host:port，可重复）：本地与手机端都只在内存生效，"
-             "不写 rpc.json")
+        help="强制加入 broker（[user:pass@]host[:port]，可重复，缺端口默认 1883）："
+             "本地与手机端都只在内存生效，不写 rpc.json")
     parser.add_argument(
         *client_mqtt._cli_opts(*client_mqtt.alias_allow_no_pub),
         dest="allow_no_pub", action="store_true", default=None,

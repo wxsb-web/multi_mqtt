@@ -272,13 +272,11 @@ def _rpc_config_with_cli_overrides(
         config["broker_list_add"] = []
         config["broker_list_del"] = []
         for broker in brokers:
-            host, separator, port = broker.rpartition(":")
-            if not separator:
-                raise ValueError(f"broker 格式必须是 host:port: {broker!r}")
-            try:
-                config["broker_list"].append((host, int(port)))
-            except ValueError as error:
-                raise ValueError(f"broker 端口必须是整数: {broker!r}") from error
+            entry = _rpc_config.parse_broker_add(broker)
+            if entry is None:
+                raise ValueError(
+                    f"broker 格式必须是 [user:pass@]host[:port]: {broker!r}")
+            config["broker_list"].append(entry)
         config["_broker_list_base"] = config["broker_list"]
     if global_topic_url_list is not None:
         config["global_topic_url_list"] = global_topic_url_list
@@ -1163,7 +1161,7 @@ if __name__ == "__main__":
     parser.add_argument("--request_topic", "--topic", "-t", default=None)
     parser.add_argument("--pub", "--pubkey", "-pub", nargs="*", default=None)
     parser.add_argument("--broker", action="append", default=None,
-                        help="追加 broker，格式为 host:port")
+                        help="追加 broker，格式 [user:pass@]host[:port]，缺端口默认 1883")
     parser.add_argument("--global_topic_url_list", nargs="*", default=None)
     args = parser.parse_args()
     try:

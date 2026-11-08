@@ -66,7 +66,10 @@ def _parse_broker_spec(spec):
             return None
     try:
         from rpc_config import parse_broker_add
-        return parse_broker_add(spec)
+        parsed = parse_broker_add(spec)
+        if not parsed:
+            return None
+        return (str(parsed[0]), int(parsed[1]))
     except Exception:
         return None
 
@@ -657,7 +660,7 @@ def add_brokers(specs):
         if entry is not None and entry not in entries:
             entries.append(entry)
     if not entries:
-        return {"ok": False, "error": "broker_add 无合法条目（格式 host:port）"}
+        return {"ok": False, "error": "broker_add 无合法条目（格式 [user:pass@]host[:port]）"}
 
     added = []
     with _RUNTIME_LOCK:

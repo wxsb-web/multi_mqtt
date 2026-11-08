@@ -969,9 +969,9 @@ def add_connection_args(p, default_timeout=DEFAULT_TIMEOUT):
     p.add_argument(
         *_cm._cli_opts(*_cm.alias_broker_add),
         dest="broker_add", action="append", default=None,
-        metavar="host:port",
-        help="强制加入的 broker，可重复；优先级最高，绕过 broker_list_no 屏蔽"
-             "与 broker_list_del 删除",
+        metavar="[user:pass@]host[:port]",
+        help="强制加入的 broker，可重复；缺端口默认 1883，优先级最高，"
+             "绕过 broker_list_no 屏蔽与 broker_list_del 删除",
     )
 
 

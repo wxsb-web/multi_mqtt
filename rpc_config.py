@@ -29,7 +29,7 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from ecdsa import VerifyingKey
 
@@ -89,8 +89,9 @@ DEFAULT_STATS_PING_INTERVAL = ConnectionQualityStats.PING_INTERVAL
 # --- [字段别名] 与 client/client_mqtt.py 的 alias_xxx 同风格 ---
 # 所有 rpc_config(...) 入口（模块级 rpc_config / 实例级 gms.rpc_config /
 # HTTP RPC / MQTT RPC）都先经 normalize_rpc_updates() 归一化，因此别名在
-# 任何入口都等价于规范键。broker_list_add/del 还接受 "host:port" 字符串
-# 或单条 (host, port, auth)，口径与 client 的 --broker_add 一致。
+# 任何入口都等价于规范键。broker_list_add/del 还接受
+# "[user:pass@]host[:port]" 字符串或单条 (host, port, auth)，口径与
+# client 的 --broker_add 一致（缺端口默认 1883）。
 RPC_CONFIG_ALIASES = {
     "broker_list": ("brokers", "bl"),
     "broker_list_add": ("add_broker", "add_brokers", "broker_add", "badd", "add"),
@@ -705,10 +706,11 @@ def load_broker_list(path=None, module=None, broker_add=None):
     屏蔽（见 filter_broker_list）。每次调用现读文件、不缓存，任何解析问题
     只告警回落，绝不阻断启动。
 
-    broker_add 给定时（CLI ``--broker_add host:port`` 显式条目，字符串或
-    (host, port) 元组）强制加入最终列表，优先级最高：绕过 broker_list_no
-    屏蔽与 broker_list_del 删除；同身份已在列表则不动，合成表（屏蔽前）
-    有同身份条目则补回原条目（保留认证），否则追加纯 (host, port)。
+    broker_add 给定时（CLI ``--broker_add`` 显式条目，字符串或
+    (host, port[, auth]) 元组）强制加入最终列表，优先级最高：绕过
+    broker_list_no 屏蔽与 broker_list_del 删除；同身份已在列表则不动，
+    合成表（屏蔽前）有同身份条目则补回原条目（保留认证），否则追加。
+    字符串支持 ``[user:pass@]host[:port]``，缺端口默认 1883。
     """
     composed = load_rpc_config(path)["broker_list"]
     result = filter_broker_list(composed, module, path=path)
@@ -717,33 +719,81 @@ def load_broker_list(path=None, module=None, broker_add=None):
     return _force_broker_list(result, composed, broker_add)
 
 
-def parse_broker_add(spec):
-    """解析 ``--broker_add`` 的 "host:port" 条目 -> (host, port)。
+def _split_broker_host_port(text):
+    """拆 ``host[:port]``，支持 ``[IPv6]:port``；非法返回 (None, None)。"""
+    text = text.strip()
+    if not text:
+        return None, None
+    if text.startswith("["):
+        end = text.find("]")
+        if end < 0:
+            return None, None
+        host = text[1:end].strip()
+        rest = text[end + 1:].strip()
+        if rest and not rest.startswith(":"):
+            return None, None
+        port_text = rest[1:].strip() if rest else ""
+    else:
+        host, sep, port_text = text.rpartition(":")
+        if not sep:
+            host, port_text = text, ""
+        if ":" in host:
+            # 裸 IPv6 无法区分哪一段是端口，要求加方括号
+            return None, None
+        host, port_text = host.strip(), port_text.strip()
+    if not host:
+        return None, None
+    if not port_text:
+        return host, 1883
+    if not port_text.isdecimal():
+        return None, None
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        return None, None
+    return host, port
 
-    无端口时默认 1883；host 允许含冒号的 IPv6（rpartition(":") 拆最后一段，
-    与 broker_list_no 的键解析同口径）。非法输入告警返回 None，绝不抛异常。
+
+def parse_broker_add(spec):
+    """解析 broker 条目字符串（CLI --broker_add / rpc_config 别名共用）。
+
+    支持（``mqtt://`` 前缀可省略，缺端口默认 1883）::
+
+        host[:port]                     "broker.codenow.cn" / "192.168.1.20"
+        user:password@host[:port]       "appID:secretKey@bemfa.com:9501"
+        token@host[:port]               用户名=token，密码为空
+        mqtt://user:pass@host:port      "mqtt://appID:secretKey@bemfa.com:9501"
+        mqtt://[2001:db8::1]:1883       IPv6 必须加方括号
+
+    用户名/密码按 URI 规则做百分号解码（密码里的 ``:`` 写成 ``%3A``）。
+    非法输入告警返回 None，绝不抛异常。
     """
     if not isinstance(spec, str) or not spec.strip():
         logger.warning("broker_add 条目 %r 非法，已跳过", spec)
         return None
-    host, sep, port_text = spec.strip().rpartition(":")
-    host = host.strip()
-    port_text = port_text.strip()
-    if not sep:
-        host, port_text = spec.strip(), ""
-    if not host:
+    text = spec.strip()
+    if "://" in text:
+        scheme, _, rest = text.partition("://")
+        if scheme.strip().lower() != "mqtt":
+            logger.warning("broker_add 条目 %r 协议不支持（仅 mqtt://），已跳过", spec)
+            return None
+        text = rest.strip()
+
+    auth = None
+    if "@" in text:
+        userinfo, _, text = text.rpartition("@")
+        username, separator, password = userinfo.partition(":")
+        username = unquote(username).strip()
+        password = unquote(password) if separator else ""
+        if not username:
+            logger.warning("broker_add 条目 %r 用户名不能为空，已跳过", spec)
+            return None
+        auth = [username, password]
+
+    host, port = _split_broker_host_port(text)
+    if host is None:
         logger.warning("broker_add 条目 %r 非法，已跳过", spec)
         return None
-    if not port_text:
-        return (host, 1883)
-    if not port_text.isdecimal():
-        logger.warning("broker_add 条目 %r 端口非法，已跳过", spec)
-        return None
-    port = int(port_text)
-    if not 1 <= port <= 65535:
-        logger.warning("broker_add 条目 %r 端口超出范围，已跳过", spec)
-        return None
-    return (host, port)
+    return (host, port, auth) if auth is not None else (host, port)
 
 
 def _canonical_rpc_key(name):
@@ -758,15 +808,16 @@ def _parse_explicit_broker_spec(spec):
     """显式输入的 broker 字符串：非法直接报错（不被 parse_broker_add 静默跳过）。"""
     entry = parse_broker_add(spec)
     if entry is None:
-        raise ValueError(f"broker 条目非法: {spec!r}（应为 host:port）")
+        raise ValueError(f"broker 条目非法: {spec!r}（应为 [user:pass@]host[:port]）")
     return entry
 
 
 def _normalize_broker_alias_value(value):
     """broker_list_add/del 的简写形式归一化。
 
-    接受 ``"host:port"``、``["host:port", ...]``、单条 ``(host, port[, auth])``；
-    其它形态（条目列表、None、空列表）原样返回，交给严格校验判定。
+    接受 ``"[user:pass@]host[:port]"``、``["host:port", ...]``、
+    单条 ``(host, port[, auth])``；其它形态（条目列表、None、空列表）
+    原样返回，交给严格校验判定。
     """
     if isinstance(value, str):
         return [_parse_explicit_broker_spec(value)]

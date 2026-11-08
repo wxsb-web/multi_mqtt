@@ -261,6 +261,23 @@ class ServerMqttConfigTests(unittest.TestCase):
             [["mqtt.bemfa.com", 9501]],
         )
 
+    def test_add_broker_alias_accepts_dsn_with_credentials(self):
+        """mqtt://user:pass@host:port（前缀可省略）要保留认证并落盘。"""
+        result = server_mqtt.rpc_config(
+            add_broker="mqtt://appID:secretKey@bemfa.com:9501")
+
+        self.assertIn(["bemfa.com", 9501, ["appID", "secretKey"]],
+                      result["broker_list"])
+        self.assertEqual(
+            json.loads(self.config_path.read_text())["broker_list_add"],
+            [["bemfa.com", 9501, ["appID", "secretKey"]]],
+        )
+
+    def test_add_broker_alias_defaults_port_to_1883(self):
+        result = server_mqtt.rpc_config(add_broker="broker.codenow.cn")
+
+        self.assertIn(["broker.codenow.cn", 1883], result["broker_list"])
+
     def test_instance_level_alias_matches_module_level(self):
         """实例级 gms.rpc_config_set 也走同一套别名。"""
         result = self.server.rpc_config_set(
@@ -398,6 +415,15 @@ class ServerMqttConfigTests(unittest.TestCase):
         self.assertEqual(config["request_topic"], "cli/request")
         self.assertEqual(config["broker_list"], [("cli-broker.example", 1885)])
         self.assertEqual(config["pub_key"], server_mqtt.DEFAULT_PUB_KEY)
+
+    def test_command_line_broker_accepts_dsn_and_default_port(self):
+        config = server_mqtt._rpc_config_with_cli_overrides(
+            brokers=["appID:secretKey@bemfa.com:9501", "broker.codenow.cn"])
+
+        self.assertEqual(config["broker_list"], [
+            ("bemfa.com", 9501, ["appID", "secretKey"]),
+            ("broker.codenow.cn", 1883),
+        ])
 
     def test_command_line_pub_without_value_disables_file_public_key(self):
         self.config_path.write_text(
@@ -1397,6 +1423,26 @@ class BrokerAddForceTests(unittest.TestCase):
         self.assertIsNone(rpc_config.parse_broker_add("host:abc"))
         self.assertIsNone(rpc_config.parse_broker_add("host:99999"))
         self.assertIsNone(rpc_config.parse_broker_add(":1883"))
+
+    def test_parse_broker_add_dsn(self):
+        self.assertEqual(
+            rpc_config.parse_broker_add("mqtt://appID:secretKey@bemfa.com:9501"),
+            ("bemfa.com", 9501, ["appID", "secretKey"]))
+        self.assertEqual(
+            rpc_config.parse_broker_add("appID:secretKey@bemfa.com"),
+            ("bemfa.com", 1883, ["appID", "secretKey"]))
+        self.assertEqual(
+            rpc_config.parse_broker_add("token@bemfa.com:9501"),
+            ("bemfa.com", 9501, ["token", ""]))
+        self.assertEqual(
+            rpc_config.parse_broker_add("mqtt://[2001:db8::1]:1883"),
+            ("2001:db8::1", 1883))
+        # 密码里的冒号按 URI 规则写成 %3A
+        self.assertEqual(
+            rpc_config.parse_broker_add("user:p%3Ass@host:1883"),
+            ("host", 1883, ["user", "p:ss"]))
+        self.assertIsNone(rpc_config.parse_broker_add("mqtts://host:1883"))
+        self.assertIsNone(rpc_config.parse_broker_add("@host:1883"))
 
     def test_empty_auth_list_equals_no_auth(self):
         # ["host", port, []] 等价于 ["host", port]，不再判认证信息非法

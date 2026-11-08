@@ -82,7 +82,7 @@ alias_exit         =('exit', 'quit')
 alias_timeout      =('timeout','time','wait','second','sec','to')
 alias_timestamp_ms =('timestamp_ms','ts','server_ms')
 alias_min_broker_count =('min_broker_count','mb','min')
-# CLI 显式 broker（host:port）强制加入最终列表，优先级最高（绕过屏蔽/删除）；
+# CLI 显式 broker（[user:pass@]host[:port]，缺端口默认 1883）强制加入最终列表，优先级最高（绕过屏蔽/删除）；
 # 不占用 -b 避免与其它单字符短选项歧义。
 alias_broker_add    =('broker_add','brokeradd','badd')
 # 统一命名 stats_print_interval / stats_ping_interval；
