@@ -292,6 +292,67 @@ class ServerMqttConfigTests(unittest.TestCase):
 
         self.assertNotIn(["old-broker.example", 1883], result["broker_list"])
 
+    def test_del_broker_also_drops_matching_entry_from_add_list(self):
+        """手动 del 要连同 broker_list_add 里同身份的旧条目一起摘掉，
+        其它 add 条目与 broker_list 里无关的连接完全不动。"""
+        server_mqtt.rpc_config(add_broker=["bemfa.com:9501", "keep.example:1884"])
+
+        result = server_mqtt.rpc_config(del_broker="bemfa.com:9501")
+
+        self.assertNotIn(["bemfa.com", 9501], result["broker_list"])
+        self.assertNotIn(["bemfa.com", 9501], result["broker_list_add"])
+        self.assertIn(["keep.example", 1884], result["broker_list"])
+        self.assertIn(["keep.example", 1884], result["broker_list_add"])
+        stored = json.loads(self.config_path.read_text())
+        self.assertEqual(stored["broker_list_add"], [["keep.example", 1884]])
+
+    def test_del_broker_dsn_removes_same_host_added_entry(self):
+        """add_broker/del_broker 用同一条带凭据 DSN 时，del 必须真的删掉。"""
+        spec = "6b5b0d333ad94aa4a50d5ffbbf0662b2@bemfa.com:9501"
+        server_mqtt.rpc_config(add_broker=spec)
+
+        result = server_mqtt.rpc_config(del_broker=spec)
+
+        self.assertFalse([b for b in result["broker_list"] if b[0] == "bemfa.com"])
+        self.assertEqual(result["broker_list_add"], [])
+
+    def test_del_broker_stays_deleted_after_reload(self):
+        """del 后重新读 rpc.json 也不能被旧的 add 行复活。"""
+        server_mqtt.rpc_config(add_broker="bemfa.com:9501")
+        server_mqtt.rpc_config(del_broker="bemfa.com:9501")
+
+        reloaded = server_mqtt.load_rpc_config(self.config_path)
+
+        self.assertNotIn(("bemfa.com", 9501), reloaded["broker_list"])
+        self.assertEqual(reloaded["broker_list_add"], [])
+
+    def test_add_broker_after_del_restores_only_that_entry(self):
+        """删掉后再手动 add 回来要生效，只撤销这一条的 del 记录。"""
+        server_mqtt.rpc_config(del_broker="old-broker.example:1883")
+        self.assertNotIn(["old-broker.example", 1883],
+                         server_mqtt.rpc_config_get()["broker_list"])
+
+        result = server_mqtt.rpc_config(add_broker="old-broker.example:1883")
+
+        self.assertIn(["old-broker.example", 1883], result["broker_list"])
+        self.assertEqual(result["broker_list_del"], [])
+        stored = json.loads(self.config_path.read_text())
+        self.assertEqual(stored["broker_list_add"], [["old-broker.example", 1883]])
+        self.assertEqual(stored["broker_list_del"], [])
+
+    def test_normalize_del_wins_over_add_for_same_identity_only(self):
+        """合成期兜底：同身份 add+del 时 del 胜出，只影响该身份（host 大小写不敏感）。"""
+        config = server_mqtt._normalize_rpc_config({
+            "broker_list": [("bemfa.com", 9501, ["u", "p"]), ("keep.example", 1884)],
+            "broker_list_add": [["bemfa.com", 9501, ["u", "p"]],
+                                ["other.example", 1885]],
+            "broker_list_del": [["BEMFA.com", 9501]],
+        })
+
+        self.assertEqual(config["broker_list"],
+                         [("keep.example", 1884), ("other.example", 1885)])
+        self.assertEqual(config["broker_list_add"], [("other.example", 1885)])
+
     def test_broker_alias_bad_port_raises_instead_of_silent_noop(self):
         """显式输入写错要立刻报错，不能像未知键一样静默忽略。"""
         with self.assertRaises(ValueError):

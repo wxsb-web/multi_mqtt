@@ -176,6 +176,28 @@ def _broker_identity(broker):
     return broker[0].casefold(), broker[1]
 
 
+def _broker_identities(entries):
+    """把 broker 条目序列提取成身份集合；非法/非条目项直接跳过，绝不抛异常。"""
+    identities = set()
+    for entry in entries or ():
+        if (isinstance(entry, (list, tuple)) and len(entry) >= 2
+                and isinstance(entry[0], str)):
+            identities.add(_broker_identity(entry))
+    return identities
+
+
+def _without_broker_identities(entries, identities):
+    """剔除指定身份的条目，其它条目原样保留（含非法项，交给后续校验兜底）。"""
+    kept = []
+    for entry in entries or ():
+        if (isinstance(entry, (list, tuple)) and len(entry) >= 2
+                and isinstance(entry[0], str)
+                and _broker_identity(entry) in identities):
+            continue
+        kept.append(entry)
+    return kept
+
+
 def _normalize_positive_seconds(value, name):
     """正数秒校验：接受 int/float/纯数字字符串，统一归一为 float。"""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
@@ -291,6 +313,13 @@ def _validate_rpc_config(config):
         result["broker_list_del"], "broker_list_del", allow_empty=True
     )
     deleted = {_broker_identity(broker) for broker in brokers_del}
+    # 删除只作用于被点名的那条：同一身份若还留在 broker_list_add（例如旧的
+    # add_broker 记录或 rpc.json 里的残留行），一并剔除，避免 del 删完又被
+    # add 原样加回来；其它身份完全不动。
+    brokers_add = [
+        broker for broker in brokers_add
+        if _broker_identity(broker) not in deleted
+    ]
     effective_brokers = [
         broker for broker in broker_base
         if _broker_identity(broker) not in deleted
@@ -1018,6 +1047,16 @@ def _write_rpc_config_updates(updates, path=None, force_write=False):
         # 校验用净化后的配置（脏键回落默认值），写回仍以用户文件的原始键为准
         source = _sanitize_rpc_document(stored, config_path)
         source.update(updates)
+        # 与内存合并同一套镜像规则：显式 add 的身份撤销落盘的旧 del，
+        # 显式 del 的身份从落盘的 add 行里摘掉，保证重启后状态一致。
+        if "broker_list_add" in updates:
+            source["broker_list_del"] = _without_broker_identities(
+                source.get("broker_list_del", ()),
+                _broker_identities(updates["broker_list_add"]))
+        if "broker_list_del" in updates:
+            source["broker_list_add"] = _without_broker_identities(
+                source.get("broker_list_add", ()),
+                _broker_identities(updates["broker_list_del"]))
         normalized = _normalize_rpc_config(source)
         serialized = _json_rpc_config(normalized)
         patch = {}
@@ -1028,6 +1067,12 @@ def _write_rpc_config_updates(updates, path=None, force_write=False):
                 patch[key] = ""
             elif key in serialized:
                 patch[key] = serialized[key]
+        # add / del 是一对镜像记录：手动 del 掉的身份要同步从落盘的 add 行里
+        # 摘掉（手动 add 的身份同理从 del 行摘掉），否则重启读文件时旧 add
+        # 会把刚删掉的 broker 又加回来。两个键一起写，其它条目原样保留。
+        if "broker_list_add" in updates or "broker_list_del" in updates:
+            patch["broker_list_add"] = serialized["broker_list_add"]
+            patch["broker_list_del"] = serialized["broker_list_del"]
         # 文本级按键改写：只动被改键的一行，保留用户手写缩进与其余内容
         update_json_document(config_path, patch, force_write=force_write)
 
@@ -1147,9 +1192,21 @@ def _merge_rpc_updates(current, updates):
 
     broker_list 走 _broker_list_base 语义：基线里 broker_list 是"生效结果"，
     叠加时要先还原成 base，再按 broker_list_add / broker_list_del 重新合成。
+
+    add / del 只影响被点名的那条：本次显式 add 的身份会从历史 del 里撤销
+    （删掉后再加回来要能生效），本次显式 del 的身份会从历史 add 里撤销
+    （加进去的条目要能真正删掉），其它身份的 add/del 记录原样保留。
     """
     merged = dict(current)
     merged["broker_list"] = merged["_broker_list_base"]
     if "broker_list" in updates:
         merged["_broker_list_base"] = updates["broker_list"]
+    if "broker_list_add" in updates:
+        merged["broker_list_del"] = _without_broker_identities(
+            merged.get("broker_list_del", ()),
+            _broker_identities(updates["broker_list_add"]))
+    if "broker_list_del" in updates:
+        merged["broker_list_add"] = _without_broker_identities(
+            merged.get("broker_list_add", ()),
+            _broker_identities(updates["broker_list_del"]))
     return _normalize_rpc_config({**merged, **updates})
