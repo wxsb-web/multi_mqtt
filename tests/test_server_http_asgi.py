@@ -107,13 +107,13 @@ class AsgiApplicationTests(unittest.TestCase):
 
     def test_query_params_injected_into_params_alias(self):
         # alias.md 8.1：ASGI 垫片从原始 query_string 解析一次交给执行器
-        _call_asgi("#alias addi(x, y=3)\nint(x) + int(y)")
+        _call_asgi("#alias addi(x, y=3)\nr = int(x) + int(y)")
         status, _headers, out = _call_asgi_path("/-addi", query=b"x=4")
         self.assertEqual(status, 200)
         self.assertEqual(out, b"7")
 
     def test_unknown_query_param_returns_500(self):
-        _call_asgi("#alias addi(x, y=3)\nint(x) + int(y)")
+        _call_asgi("#alias addi(x, y=3)\nr = int(x) + int(y)")
         status, _headers, out = _call_asgi_path(
             "/-addi", query=b"x=4&z=9")
         self.assertEqual(status, 500)

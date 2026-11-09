@@ -689,7 +689,8 @@ class PythonExecutor:
     # ------------------------------------------------------------------ #
 
     def execute(self, code,globals=None,format_result=False,alias=None,timeout=999,
-                alias_params=None, alias_prefix=True):
+                alias_params=None, alias_prefix=True,
+                eval_last_expr=True, transient_r=False):
         """执行 ``code``。
 
         ``globals`` 若提供，应是一个包含**请求级**上下文变量的映射。
@@ -723,6 +724,19 @@ class PythonExecutor:
         前缀别名 → 普通 Python。因此 ``abc+1``、``print(abc)`` 等普通
         代码完全不受别名影响。
 
+        eval_last_expr / transient_r
+        ----------------------------
+        HTTP 通道的返回约定（见 docs/rpc_executor_http_求值返回.md）：
+
+        - ``eval_last_expr=False``：禁用“最后一条裸表达式自动求值返回”，
+          代码按整段执行，结果只取 ``r``；
+        - ``transient_r=True``：执行前没有全局 ``r`` 时，代码里临时定义的
+          ``r`` 视为请求级变量，执行结束即从命名空间移除（与 ``request`` /
+          ``response`` 注入同一生命周期）；已有全局 ``r`` 时仍按普通变量
+          读写，修改会保留。
+
+        MQTT / TCP 通道保持默认值（``True`` / ``False``），行为不变。
+
         timeout
         -------
         最长等待秒数（默认 999，兼容长任务；``None`` 表示无限等待的
@@ -747,7 +761,8 @@ class PythonExecutor:
             with self.lock:
                 return self._execute_inner(
                     code, globals, format_result, alias,
-                    alias_prefix=alias_prefix, alias_params=alias_params)
+                    alias_prefix=alias_prefix, alias_params=alias_params,
+                    eval_last_expr=eval_last_expr, transient_r=transient_r)
 
         return self._run_bounded(_job, timeout)
 
@@ -823,7 +838,8 @@ class PythonExecutor:
                          f"本请求已作废（不会被延迟执行）"}
 
     def _execute_inner(self, code, globals=None, format_result=False, alias=True,
-                       alias_prefix=True, alias_params=None):
+                       alias_prefix=True, alias_params=None,
+                       eval_last_expr=True, transient_r=False):
         """execute 的同线程同步版（含 alias 指令解析与递归）。
 
         调用方必须已持有 self.lock（工作线程 / alias 定义即执行的递归）。
@@ -835,13 +851,16 @@ class PythonExecutor:
             if directive is not None:
                 return self._handle_alias_directive(
                     directive, globals, format_result, alias,
-                    alias_prefix=alias_prefix, alias_params=alias_params)
+                    alias_prefix=alias_prefix, alias_params=alias_params,
+                    eval_last_expr=eval_last_expr, transient_r=transient_r)
         return self._execute_code_locked(
             code, globals, format_result, alias,
-            alias_prefix=alias_prefix, alias_params=alias_params)
+            alias_prefix=alias_prefix, alias_params=alias_params,
+            eval_last_expr=eval_last_expr, transient_r=transient_r)
 
     def _execute_code_locked(self, code, globals=None, format_result=False, alias=True,
-                             alias_prefix=True, alias_params=None):
+                             alias_prefix=True, alias_params=None,
+                             eval_last_expr=True, transient_r=False):
         """execute 的常规执行主体：alias 展开 / 请求级注入 / 执行 / 还原。
 
         调用方必须已持有 self.lock。返回结构见 execute 文档。别名的参数
@@ -867,6 +886,9 @@ class PythonExecutor:
             warnings = expansion.warnings
         saved = {}
         injected = []
+        # 执行前是否已有全局 r：决定 transient_r 下本次的 r 是“请求级”还是
+        # “全局变量”。放在注入之前快照，请求级 r 的清理因此只看真实持久态。
+        had_global_r = "r" in self.globals_dict
         try:
             for k, v in merged_globals.items():
                 if k in self.globals_dict:
@@ -876,7 +898,7 @@ class PythonExecutor:
 
             try:
                 with _redirect_stdout(output):
-                    result = self._execute(code)
+                    result = self._execute(code, eval_last_expr=eval_last_expr)
                 if format_result: #让 r始终是 str 对象
                     # 参数名 format_result 遮蔽了模块级同名函数，经 sys.modules 取原函数；
                     # 非 JSON 可序列化对象（如 sys 模块）在此统一转为字符串
@@ -904,6 +926,11 @@ class PythonExecutor:
                     self.globals_dict[k] = saved[k]
                 else:
                     self.globals_dict.pop(k, None)
+            # HTTP 的请求级 r（transient_r）：执行前没有全局 r 时，代码里
+            # 临时定义的 r 与 request / response 注入同生命周期，请求结束
+            # 即移除；已有全局 r 的修改则保留（等价普通全局变量赋值）。
+            if transient_r and not had_global_r:
+                self.globals_dict.pop("r", None)
 
     # ------------------------------------------------------------------ #
     # code alias：#alias / #unalias 指令与别名替换
@@ -946,7 +973,8 @@ class PythonExecutor:
         return None
 
     def _handle_alias_directive(self, directive, globals=None, format_result=False,
-                                alias=True, alias_prefix=True, alias_params=None):
+                                alias=True, alias_prefix=True, alias_params=None,
+                                eval_last_expr=True, transient_r=False):
         """按指令 kind 分发增删查改。调用方（execute）已持有 self.lock。"""
         if directive["kind"] == "unalias":
             return self._alias_unalias(directive["arg"])
@@ -963,7 +991,8 @@ class PythonExecutor:
         if body:
             return self._alias_define(
                 arg, body, globals, format_result, alias,
-                alias_prefix=alias_prefix, alias_params=alias_params)
+                alias_prefix=alias_prefix, alias_params=alias_params,
+                eval_last_expr=eval_last_expr, transient_r=transient_r)
         # 查询：允许写成签名形态（#alias add(x, y=3)），按名字查，签名只做展示容错
         try:
             spec = parse_alias_signature(arg)
@@ -1102,7 +1131,8 @@ class PythonExecutor:
         return '%r 可绑定 %r' % (name, list(info.get('params') or []))
 
     def _alias_define(self, name_or_spec, body, globals=None, format_result=False,
-                      alias=True, alias_prefix=True, alias_params=None):
+                      alias=True, alias_prefix=True, alias_params=None,
+                      eval_last_expr=True, transient_r=False):
         """注册（重名覆盖，保留 created / hits 计数）并立即执行一次 body。
 
         注册期校验（R1–R7）全部在写注册表之前完成，失败时注册表不产生
@@ -1160,7 +1190,8 @@ class PythonExecutor:
             # 另起工作线程排队等自己持有的锁，直到超时。
             execution = self._execute_inner(
                 body, globals=run_globals, format_result=format_result, alias=alias,
-                alias_prefix=alias_prefix, alias_params=None)
+                alias_prefix=alias_prefix, alias_params=None,
+                eval_last_expr=eval_last_expr, transient_r=transient_r)
         execution["alias"] = {
             "action": "updated" if old else "saved",
             "name": name,
@@ -1222,14 +1253,14 @@ class PythonExecutor:
     # 内部执行逻辑
     # ------------------------------------------------------------------ #
 
-    def _execute(self, code):
+    def _execute(self, code, eval_last_expr=True):
         # 顶层的 ``await`` 会让 ``ast.parse(..., mode="exec")`` 抛出
         # SyntaxError；这种情况下回退到异步路径。
         try:
             tree = ast.parse(code, filename="<rpc>", mode="exec")
         except SyntaxError:
             if "await" in code:
-                return self._execute_awaitable(code)
+                return self._execute_awaitable(code, eval_last_expr=eval_last_expr)
             raise
 
         # 裸 ``await`` 同样会让 ``compile`` 抛出。
@@ -1237,11 +1268,12 @@ class PythonExecutor:
             compiled_tree = compile(tree, "<rpc>", "exec")
         except SyntaxError:
             if "await" in code:
-                return self._execute_awaitable(code)
+                return self._execute_awaitable(code, eval_last_expr=eval_last_expr)
             raise
 
         # REPL 语义：若最后一条语句是裸表达式，则求值并返回其结果。
-        if tree.body and isinstance(tree.body[-1], ast.Expr):
+        # HTTP 通道传 eval_last_expr=False 关闭该行为，只取 ``r``。
+        if eval_last_expr and tree.body and isinstance(tree.body[-1], ast.Expr):
             prefix = ast.Module(body=tree.body[:-1], type_ignores=[])
             if prefix.body:
                 exec(
@@ -1260,16 +1292,20 @@ class PythonExecutor:
         # 若代码片段没有以表达式结尾，则回退到用户自己设置的 ``r``。
         return self.locals_dict.get("r", self.globals_dict.get("r"))
 
-    def _execute_awaitable(self, code):
+    def _execute_awaitable(self, code, eval_last_expr=True):
         indented_code = textwrap.indent(code, "    ")
 
         # 检测函数体是否为单个表达式，以便用 ``return (expr)``，
-        # 从而对 await 也保留 REPL 行为。
-        try:
-            wrapped_tree = ast.parse(f"async def _rpc_async():\n{indented_code}")
-            body = wrapped_tree.body[0].body
-            is_single_expr = len(body) == 1 and isinstance(body[0], ast.Expr)
-        except SyntaxError:
+        # 从而对 await 也保留 REPL 行为；HTTP（eval_last_expr=False）
+        # 不做该特判，整段执行后只取 ``r``。
+        if eval_last_expr:
+            try:
+                wrapped_tree = ast.parse(f"async def _rpc_async():\n{indented_code}")
+                body = wrapped_tree.body[0].body
+                is_single_expr = len(body) == 1 and isinstance(body[0], ast.Expr)
+            except SyntaxError:
+                is_single_expr = False
+        else:
             is_single_expr = False
 
         if is_single_expr:

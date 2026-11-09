@@ -619,15 +619,17 @@ class AliasHttpChannelTests(unittest.TestCase):
         return urllib.request.urlopen(url, timeout=10).read().decode('utf-8')
 
     def test_roundtrip(self):
-        # execution['r'] 回退修复：尾表达式直接返回，与 MQTT 通道对齐
-        self.assertEqual(self.call("1+1").strip(), "2")
+        # HTTP 禁用尾表达式自动求值：裸表达式无 r 时 body 为 None
+        self.assertEqual(self.call("1+1").strip(), "None")
+        # 需要返回时必须显式赋值 r
+        self.assertEqual(self.call("r=1+1").strip(), "2")
 
-        # %23 / %0A 编码端到端：定义即执行
-        self.assertEqual(self.call("#alias sum2\n1+1").strip(), "2")
+        # %23 / %0A 编码端到端：定义即执行（body 显式 r=1+1）
+        self.assertEqual(self.call("#alias sum2\nr=1+1").strip(), "2")
         # 使用
         self.assertEqual(self.call("sum2").strip(), "2")
         # 查询：pformat 后能回显 body
-        self.assertIn("1+1", self.call("#alias sum2"))
+        self.assertIn("r=1+1", self.call("#alias sum2"))
 
         # 删除后再用 → 500 NameError
         self.assertIn("deleted", self.call("#unalias sum2"))

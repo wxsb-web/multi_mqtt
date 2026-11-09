@@ -267,7 +267,7 @@ def verify(base, timeout, key=''):
         return resp.text.strip()
 
     checks = [
-        ("expr r-fallback", "1+1", "2"),
+        ("expr r-fallback", "r=1+1", "2"),
         ("keyword list live", "server_http.rpc_executor.ALIAS_KEYWORDS", "'alias'"),
         # 激活哨兵：旧版 executor 没有该属性——防止“master 未真正重载、
         # 仍在跑旧内存代码”的情况蒙混过关（worker fork 不重新 import 磁盘）
@@ -280,7 +280,7 @@ def verify(base, timeout, key=''):
         print(f"[verify] {name}: {got[:80]}")
 
     # alias 全链路: 定义 → 使用 → 列表 → 删除（不在生产留测试别名）
-    got = get("#alias update_selfcheck\n40+2")
+    got = get("#alias update_selfcheck\nr=40+2")
     if "42" not in got:
         raise RuntimeError(f"verify[alias define] got {got!r}")
     got = get("update_selfcheck")

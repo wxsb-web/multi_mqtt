@@ -173,15 +173,18 @@ class KeyPrefixAndAliasUrlTests(unittest.TestCase):
 
     def test_key_is_true_url_prefix_and_legacy_form_still_works(self):
         port = self._start(key="-")
-        # key='-' → /-r=1+1；旧地址 /-/r=1+1 也保留
-        self.assertEqual(self._get(port, "/-1%2B1"), "2")
-        self.assertEqual(self._get(port, "/-/1%2B1"), "2")
+        # key='-' → /-r=1+1；旧地址 /-/r=1+1 也保留。
+        # HTTP 不返回尾表达式：裸 `1+1` 无 r，body 为 None。
+        self.assertEqual(self._get(port, "/-1%2B1"), "None")
+        self.assertEqual(self._get(port, "/-/1%2B1"), "None")
+        self.assertEqual(self._get(port, "/-r%3D1%2B1"), "2")
         self._assert_403(port, "/1%2B1")
 
     def test_key_strips_surrounding_slashes(self):
         port = self._start(key="/abc/")
-        self.assertEqual(self._get(port, "/abc/1%2B1"), "2")
-        self.assertEqual(self._get(port, "/abc1%2B1"), "2")
+        self.assertEqual(self._get(port, "/abc/1%2B1"), "None")
+        self.assertEqual(self._get(port, "/abc1%2B1"), "None")
+        self.assertEqual(self._get(port, "/abc/r%3D1%2B1"), "2")
         self._assert_403(port, "/1%2B1")
 
     def test_alias_url_keyed_requires_key_prefix(self):
@@ -213,6 +216,101 @@ class KeyPrefixAndAliasUrlTests(unittest.TestCase):
     def test_alias_url_rejects_unknown_value(self):
         with self.assertRaises(ValueError):
             self._start(alias_url="definitely-not-valid")
+
+
+class HttpRVariableSemanticsTests(unittest.TestCase):
+    """HTTP 的 r 语义（docs/rpc_executor_http_求值返回.md 第 2/3 节）。
+
+    覆盖：禁用尾表达式自动求值、请求级 r 不泄漏、全局 r 的读取 / 改写、
+    stdout 兜底、response.data 优先，以及 await 路径与别名 body 同样遵守。
+    """
+
+    def _start(self, namespace=None):
+        namespace = {} if namespace is None else namespace
+        server = server_http.start_rpc_server(
+            port=0, ip="127.0.0.1", globals=namespace, locals=namespace,
+            persist_aliases=False,
+        )
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server, namespace
+
+    @staticmethod
+    def _get(server, code):
+        url = (f"http://127.0.0.1:{server.server_port}/"
+               + urllib.parse.quote(code, safe=""))
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return response.read().decode()
+
+    def test_tail_expression_is_not_returned(self):
+        server, namespace = self._start()
+        self.assertEqual(self._get(server, "1+1"), "None")
+        self.assertEqual(self._get(server, "x = 41\nx + 1"), "None")
+        self.assertNotIn("r", namespace)
+
+    def test_stdout_is_fallback_only_when_no_r(self):
+        server, namespace = self._start()
+        self.assertEqual(self._get(server, "print('hi')"), "hi\n")
+        # 尾表达式不返回，stdout 仍兜底
+        self.assertEqual(self._get(server, "print('a')\n1+1"), "a\n")
+        self.assertNotIn("r", namespace)
+
+    def test_request_scoped_r_is_removed_after_request(self):
+        server, namespace = self._start()
+        self.assertEqual(self._get(server, "r=1+1"), "2")
+        self.assertNotIn("r", namespace, "无全局 r 时临时 r 不得跨请求存活")
+        # 后续请求既看不到上次的 r，也没有尾表达式兜底
+        self.assertEqual(self._get(server, "1+1"), "None")
+        self.assertEqual(self._get(server, "x=1"), "None")
+
+    def test_request_scoped_r_visible_within_same_request(self):
+        server, namespace = self._start()
+        # 同一请求内可连续读写 r；末尾裸表达式 r*3 不参与返回
+        self.assertEqual(self._get(server, "r=2\nr=r*3"), "6")
+        self.assertEqual(self._get(server, "r=2\nr*3"), "2")
+        # 有 stdout 时 r 仍优先
+        self.assertEqual(self._get(server, "r=2\nprint('side')"), "2")
+        self.assertNotIn("r", namespace)
+
+    def test_global_r_read_when_code_does_not_touch_it(self):
+        server, namespace = self._start({"r": 42})
+        self.assertEqual(self._get(server, "x=1"), "42")
+        self.assertEqual(self._get(server, "r"), "42")
+        self.assertEqual(namespace["r"], 42)
+
+    def test_global_r_assignment_updates_namespace(self):
+        server, namespace = self._start({"r": 42})
+        self.assertEqual(self._get(server, "r = r + 1"), "43")
+        self.assertEqual(namespace["r"], 43)
+        self.assertEqual(self._get(server, "r"), "43")
+
+    def test_global_r_none_falls_back_to_stdout(self):
+        server, namespace = self._start({"r": None})
+        self.assertEqual(self._get(server, "print('hi')"), "hi\n")
+        self.assertEqual(self._get(server, "r=None"), "None")
+        self.assertIn("r", namespace)
+        self.assertIsNone(namespace["r"])
+
+    def test_response_data_wins_over_r(self):
+        server, _namespace = self._start()
+        code = "r='from-r'\nresponse.set_data('from-response')"
+        self.assertEqual(self._get(server, code), "from-response")
+
+    def test_await_path_obeys_same_r_rules(self):
+        server, namespace = self._start()
+        ignored = "import asyncio\nawait asyncio.sleep(0, 'ignored')"
+        self.assertEqual(self._get(server, ignored), "None")
+        self.assertNotIn("r", namespace)
+        assigned = "import asyncio\nr = await asyncio.sleep(0, 'ok')"
+        self.assertEqual(self._get(server, assigned), "ok")
+        self.assertNotIn("r", namespace)
+
+    def test_alias_body_r_is_request_scoped(self):
+        server, namespace = self._start()
+        self.assertEqual(self._get(server, "#alias twosum\nr=1+1"), "2")
+        self.assertNotIn("r", namespace)
+        self.assertEqual(self._get(server, "twosum"), "2")
+        self.assertNotIn("r", namespace)
 
 
 class AliasQueryParamTests(unittest.TestCase):
@@ -259,7 +357,7 @@ class AliasQueryParamTests(unittest.TestCase):
 
     def test_params_query_injection_defaults_and_routes(self):
         port = self._start()
-        self._define(port, "#alias addi(x, y=3)\nint(x) + int(y)")
+        self._define(port, "#alias addi(x, y=3)\nr = int(x) + int(y)")
         # 缺省 y=3；dash 路由与 raw 路由同一条执行路径
         self.assertEqual(self._get(port, "/-addi?x=4"), "7")
         self.assertEqual(self._get(port, "/-addi?x=4&y=3"), "7")
@@ -267,7 +365,7 @@ class AliasQueryParamTests(unittest.TestCase):
 
     def test_missing_and_unknown_query_params_fail_loud(self):
         port = self._start()
-        self._define(port, "#alias addi(x, y=3)\nint(x) + int(y)")
+        self._define(port, "#alias addi(x, y=3)\nr = int(x) + int(y)")
         # C1：缺必填 x，错误里带声明原文
         self._assert_error(port, "/-addi?y=3", "缺少必填参数", "addi(x, y=3)")
         # C2：未知参数 z，错误里带可绑定集
@@ -276,7 +374,7 @@ class AliasQueryParamTests(unittest.TestCase):
     def test_repeated_query_key_last_wins(self):
         # C4：重复 key 按 HTTP 标准 last-wins，不报错
         port = self._start()
-        self._define(port, "#alias addi(x, y=3)\nint(x) + int(y)")
+        self._define(port, "#alias addi(x, y=3)\nr = int(x) + int(y)")
         self.assertEqual(self._get(port, "/-addi?x=1&x=4"), "7")
 
     def test_query_values_stay_strings_by_default(self):
@@ -296,7 +394,7 @@ class AliasQueryParamTests(unittest.TestCase):
     def test_plain_alias_query_uses_free_variables(self):
         # 13.4：无签名别名的可绑定集 = body 顶层自由变量集
         port = self._start()
-        self._define(port, "#alias sum3\nint(x) + int(y) + int(z)")
+        self._define(port, "#alias sum3\nr = int(x) + int(y) + int(z)")
         self.assertEqual(self._get(port, "/-sum3?x=1&y=2&z=3"), "6")
         # 显式 query 参与 C1：缺 z 时不会退化成 NameError
         self._assert_error(port, "/-sum3?x=1&y=2", "缺少必填参数", "sum3")
@@ -501,7 +599,7 @@ class ServeFileAliasTests(unittest.TestCase):
         self.assertEqual(seen.get('status'), 200, seen)
         started = time.monotonic()
         with urllib.request.urlopen(
-                f'http://127.0.0.1:{server.server_port}/-1%2B1',
+                f'http://127.0.0.1:{server.server_port}/-r%3D1%2B1',
                 timeout=10) as response:
             self.assertEqual(response.read().decode(), '2')
         self.assertLess(time.monotonic() - started, 1.5)
@@ -703,7 +801,7 @@ class BasicAuthConfigTests(unittest.TestCase):
     @staticmethod
     def _request(server, credential=None):
         request = urllib.request.Request(
-            f"http://127.0.0.1:{server.server_port}/1%2B1")
+            f"http://127.0.0.1:{server.server_port}/r%3D1%2B1")
         if credential:
             request.add_header(
                 "Authorization",
@@ -750,7 +848,7 @@ class BasicAuthConfigTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         port = server.server_port
-        url = f"http://127.0.0.1:{port}/-1%2B1"
+        url = f"http://127.0.0.1:{port}/-r%3D1%2B1"
 
         with self.assertRaises(urllib.error.HTTPError) as context:
             urllib.request.urlopen(url, timeout=10)
@@ -833,13 +931,13 @@ class AliasPersistenceTests(unittest.TestCase):
     def test_params_alias_persists_signature_and_restores_mode(self):
         port = self._start()
         with self._get(port, "/-" + self._quote(
-                "#alias addi(x, y=3)\nint(x) + int(y)")):
+                "#alias addi(x, y=3)\nr = int(x) + int(y)")):
             pass
         # params 别名落盘为 object（code + 原始签名）；mode/params/defaults
         # 属于派生字段，启动时由执行器重新推导，不写进文件。
         self.assertEqual(
             self._saved()["addi"],
-            {"code": "int(x) + int(y)", "signature": "x, y=3"})
+            {"code": "r = int(x) + int(y)", "signature": "x, y=3"})
 
         # 新服务器 = 新执行器：签名恢复后仍是 params，query 走默认值
         port2 = self._start()

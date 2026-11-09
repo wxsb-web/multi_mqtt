@@ -1377,7 +1377,11 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 # （长任务/死循环）就冻结全部 HTTP RPC（含日志台/诊断口）。
                 # 执行的串行化与超时守卫由执行器自身的锁与 timeout 保证。
                 execution = executor.execute(
-                    code, globals=context, alias_params=alias_params)
+                    code, globals=context, alias_params=alias_params,
+                    # HTTP 返回约定（docs/rpc_executor_http_求值返回.md）：
+                    # 禁用尾表达式自动求值；无全局 r 时请求内临时定义的 r
+                    # 随 request / response 一起在请求结束后移除。
+                    eval_last_expr=False, transient_r=True)
                 # 别名定义 / 更新 / 删除写回 rpc.json（默认持久化）。执行
                 # 失败（例如 body 运行报错）时别名可能已注册，因此放在
                 # execute 之后立即同步；持久化本身出错不能打挂请求。
@@ -1396,19 +1400,16 @@ class RPCRequestHandler(BaseHTTPRequestHandler):
                 if getattr(response, '_streamed', False):
                     return
 
-                namespace = executor.globals_dict
                 if response.data is not None:
                     result_obj = response.data
                 elif execution.get('r') is not None:
-                    # 尾表达式求值结果：与 MQTT 通道对齐，让 1+1 这类代码
-                    # 直接返回 2，不再要求显式赋值 r 或 print
+                    # 只认 r：尾表达式已被禁用（eval_last_expr=False），
+                    # 无全局 r 时临时 r 已由执行器按请求级清理。
                     result_obj = execution['r']
-                elif 'r' in namespace:
-                    result_obj = namespace['r']
                 elif output:
                     result_obj = output
                 else:
-                    result_obj = f"no 'r' variable, locals keys: {list(namespace.keys())}"
+                    result_obj = None
 
                 result_str = format_result(result_obj)
                 self.send_response(response.status)
