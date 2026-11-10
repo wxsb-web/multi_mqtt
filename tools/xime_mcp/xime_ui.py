@@ -193,6 +193,63 @@ def _cmq_xime_ui_start():
         except Exception as _exc:
             return {"ok": False, "op": "wake", "error": str(_exc)}
 
+    def _pkg_and_component():
+        # 包名直接问 Java 层，不依赖 diagnose（老 APK 可能没有该接口）；
+        # 服务组件名只用于「直达本服务详情页」，取不到就跳过该入口。
+        _pkg = ""
+        try:
+            from java import jclass as _jcp
+            _app0 = _jcp("com.chaquo.python.Python").getPlatform().getApplication()
+            _pkg = str(_app0.getPackageName())
+        except Exception:
+            try:
+                from java import jclass as _jcp2
+                _pkg = str(_jcp2("android.app.ActivityThread")
+                           .currentApplication().getPackageName())
+            except Exception:
+                _pkg = ""
+        _component = ""
+        _diag = _ftcall("diagnose")
+        if isinstance(_diag, dict):
+            _component = str(_diag.get("component") or "")
+            if not _pkg:
+                _pkg = str(_diag.get("package") or "")
+        return _pkg, _component
+
+    def _open_settings():
+        # 无障碍开关入口按 ROM 兼容性依次尝试：直达本服务详情页 → 无障碍列表页
+        # → 应用详情页（Android 13+ 侧载包要先在这里打开「允许受限制的设置」）。
+        # 某个入口打不开就继续下一个，全部失败才回报错误。
+        try:
+            import app as _appmod
+        except Exception as _exc:
+            return {"ok": False, "op": "accessibility_settings",
+                    "error": "import app 失败: %s" % _exc}
+        _pkg, _component = _pkg_and_component()
+        _specs = []
+        if "/" in _component:
+            _specs.append({"action": "android.settings.ACCESSIBILITY_DETAILS_SETTINGS",
+                           "data": "package:" + _component})
+        _specs.append({"action": "android.settings.ACCESSIBILITY_SETTINGS"})
+        if _pkg:
+            _specs.append({"action": "android.settings.APPLICATION_DETAILS_SETTINGS",
+                           "data": "package:" + _pkg})
+        _last = {}
+        for _spec in _specs:
+            try:
+                _res = _pj(_appmod.RpcUiController.startIntent(_j.dumps(_spec)))
+            except Exception as _exc:
+                _last = {"ok": False, "error": str(_exc)}
+                continue
+            if isinstance(_res, dict) and _res.get("ok"):
+                return {"ok": True, "op": "accessibility_settings",
+                        "action": _spec["action"], "data": _spec.get("data"),
+                        "tried": [_s["action"] for _s in _specs]}
+            _last = _res if isinstance(_res, dict) else {"ok": False}
+        return {"ok": False, "op": "accessibility_settings",
+                "error": (_last or {}).get("error") or "系统没有可用的无障碍设置入口",
+                "tried": [_s["action"] for _s in _specs]}
+
     _g = globals()
     _lock = _g.get("_cmq_ui_sess_lock")
     if _lock is None:
@@ -535,6 +592,10 @@ def _cmq_xime_ui_start():
                     _res = _ftcall("global_action", 1)
                 elif _type == "wake":
                     _res = _pj(_wake())
+                elif _type == "accessibility_settings":
+                    _res = _open_settings()
+                elif _type == "diagnose":
+                    _res = _ftcall("diagnose")
                 elif _type in ("volume", "volume_get"):
                     # volume=设置（拖动松手才发），volume_get=只读，用于页面初始化。
                     # 注意不能用键名 stream：上行帧的 stream 字段是会话 sid。
@@ -1147,7 +1208,7 @@ class _UiHub:
             return
         if mtype in ("tap", "long_press", "swipe", "set_text", "perform_action",
                      "refresh", "wake", "back", "global_action",
-                     "volume", "volume_get"):
+                     "volume", "volume_get", "accessibility_settings", "diagnose"):
             body = {"type": mtype}
             if mtype == "global_action":
                 body["action"] = int(msg.get("action", 1))

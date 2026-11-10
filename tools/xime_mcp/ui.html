@@ -35,6 +35,11 @@ button:hover { background: #243444; }
 #broker { display: flex; flex-direction: column; gap: 6px; }
 #broker input { width: 100%; background: #0b0f14; color: #d7e0ea;
   border: 1px solid #2b3a4a; border-radius: 4px; padding: 6px 8px; font: inherit; }
+#broker .row { display: flex; gap: 6px; }
+#diag-out { margin: 0; max-height: 180px; overflow: auto; background: #0b0f14;
+  border: 1px solid #2b3a4a; border-radius: 4px; padding: 6px 8px;
+  font: 11px/1.45 ui-monospace, "Cascadia Code", Consolas, monospace;
+  color: #8ea3b7; white-space: pre-wrap; word-break: break-all; }
 #labelcfg { display: flex; flex-direction: column; gap: 6px; }
 #volume { display: flex; flex-direction: column; gap: 6px; }
 #volume .row { display: flex; align-items: center; justify-content: space-between;
@@ -147,6 +152,11 @@ button:hover { background: #243444; }
     <input id="broker-input" type="text" autocomplete="off"
       placeholder="broker_add，如 192.168.1.20:1883">
     <button id="broker-add">加入 Broker</button>
+    <div class="row">
+      <button id="open-accessibility">无障碍设置</button>
+      <button id="diagnose">诊断</button>
+    </div>
+    <pre id="diag-out" hidden></pre>
   </div>
   <div id="foot">
     <span id="conn">未连接</span>
@@ -169,6 +179,7 @@ const editorEl = document.getElementById('editor');
 const edRefEl = document.getElementById('ed-ref');
 const edInput = document.getElementById('ed-input');
 const brokerInput = document.getElementById('broker-input');
+const diagOutEl = document.getElementById('diag-out');
 // 媒体音量滑条：拖动只改本地显示，松手才发一次 volume 帧（走 MQTT 到手机）。
 const volumeValEl = document.getElementById('volume-val');
 const volumeRangeEl = document.getElementById('volume-range');
@@ -951,6 +962,19 @@ function handle(msg) {
         if (msg.remote_error) parts.push('手机端失败 ' + msg.remote_error);
         if (parts.length) text += ' · ' + parts.join(' · ');
       }
+      if (msg.action === 'diagnose') {
+        // 设备端 diagnose 的完整结果留在侧栏，hints 压到状态行
+        const dr = msg.result || {};
+        diagOutEl.hidden = false;
+        diagOutEl.textContent = JSON.stringify(dr, null, 2);
+        if (Array.isArray(dr.hints) && dr.hints.length) {
+          text += ' · ' + dr.hints.join('；');
+        }
+      }
+      if (msg.action === 'accessibility_settings') {
+        const ar = msg.result || {};
+        if (msg.ok && ar.action) text += ' · ' + ar.action;
+      }
       if (msg.action === 'volume' || msg.action === 'volume_get') {
         const vr = msg.result || {};
         if (vr.ok) {
@@ -1023,6 +1047,14 @@ function submitBroker() {
   brokerInput.value = savedBrokers.join(' ');
 }
 document.getElementById('broker-add').addEventListener('click', submitBroker);
+document.getElementById('open-accessibility').addEventListener('click', function () {
+  setMsg('打开无障碍设置…');
+  wsSend({type: 'accessibility_settings'});
+});
+document.getElementById('diagnose').addEventListener('click', function () {
+  setMsg('设备端诊断中…');
+  wsSend({type: 'diagnose'});
+});
 brokerInput.addEventListener('keydown', function (ev) {
   if (ev.key === 'Enter') {
     ev.preventDefault();
