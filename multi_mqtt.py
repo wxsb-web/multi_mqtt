@@ -58,6 +58,14 @@ PERIODIC_WAKEUP_TOPIC = "__periodic_wakeup__"
 PERIODIC_WAKEUP_SENTINEL = (PERIODIC_WAKEUP_TOPIC, None, None)
 
 
+def _normalize_positive(value, name):
+    """发布健康看门狗参数校验：必须是 >0 的 int/float/纯数字字符串。"""
+    number = _normalize_stats_interval(value, name)
+    if number <= 0:
+        raise ValueError(f"{name} 必须是 >0 的数")
+    return number
+
+
 def _normalize_stats_interval(value, name):
     """统计周期校验：接受 >=0 的 int/float/纯数字字符串，0 表示停用该周期任务。"""
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
@@ -498,8 +506,12 @@ class ConnectionQualityStats:
     #   - 由 MultiMQTTManager 传入 → 与 manager 共享同一把锁，
     #     保证 self.clients_ref（就是 manager.clients 同一个 dict）
     #     的读取与 manager 的 clients 写入使用同一把锁，彻底消除跨锁竞态。
-    def __init__(self, enabled=True, print_interval=None, ping_interval=None, lock=None):
+    def __init__(self, enabled=True, print_interval=None, ping_interval=None, lock=None, on_qos_publish=None):
         self.enabled = enabled
+        # [发布健康] QoS1 Ping 的发送回调 fn(host, msg_info, qos)，供 manager
+        # 记录“已发未确认”，用于识别“连接在但发不出去”的半死 socket。
+        # 回调异常一律吞掉，不影响统计本身。
+        self.on_qos_publish = on_qos_publish
         self.stats = {}
         self.lock = lock if lock is not None else threading.Lock()
         self.print_interval = _normalize_stats_interval(
@@ -833,6 +845,13 @@ class ConnectionQualityStats:
                 msg_info = client.publish(f"multi_mqtt/ping_rtt/{host}", b"", qos=1)
                 if msg_info is not None and msg_info.mid is not None:
                     self.record_ping_send(host, msg_info.mid)
+                    if self.on_qos_publish is not None:
+                        try:
+                            self.on_qos_publish(host, msg_info, 1)
+                        except Exception:
+                            logger.debug(
+                                "发布健康回调异常: broker=%s", host, exc_info=True
+                            )
                     pinged_hosts.append(host)
                     sent_mids[host] = msg_info.mid
             except Exception:
@@ -872,7 +891,7 @@ class MultiMQTTManager:
     # [修复-N3] stop() 中等待分发线程退出的超时（秒）。
     DISPATCH_JOIN_TIMEOUT = 5.0
 
-    def __init__(self,brokers=None,broker_module=None,broker_add=None,log_messages=False,enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0,timestamp_window=400,stats_print_interval=None, stats_ping_interval=None):
+    def __init__(self,brokers=None,broker_module=None,broker_add=None,log_messages=False,enable_crypto=False, server_public_key_bytes=None, client_private_key_bytes=None, enable_stats=True, log_connection=None, keepalive=60*5, max_reconnect_delay=3600, recovery_enabled=True, recovery_interval=15.0, recovery_probe_timeout=3.0, recovery_force_gap=30.0, recovery_start_grace=90.0,timestamp_window=400,stats_print_interval=None, stats_ping_interval=None, publish_health_enabled=True, publish_ack_timeout=10.0, publish_backlog_threshold=16, publish_backlog_rounds=3, publish_health_max_rebuild=2):
         if brokers is None:
             # 直读通道：rpc.json 三键合成 + broker_list_no 按 broker_module 屏蔽，
             # server_mqtt 与 client 启动读到同一份 broker。晚绑定导入：rpc_config
@@ -898,6 +917,33 @@ class MultiMQTTManager:
         self.recovery_start_grace = recovery_start_grace
         self._recovery_last_force = {}
         self._recovery_thread = None
+        # ---- [发布健康看门狗] ----
+        # 背景（2026-11-11 14c 真机）：网络切换/重连风暴后，13 条长连接进入
+        # “半死”状态——is_connected() 仍为 True、收报文正常，但发送方向卡死，
+        # 报文堆在 paho 的 _out_packet 里出不去（QoS0 静默丢，QoS1 拿不到
+        # PUBACK）。此时只要“集群里还有在线节点”，旧恢复逻辑就永不介入，
+        # 表现为“手机日志显示收到并执行了请求，客户端却一直超时”。
+        # 因此在原有“全灭才重建”之外，再补一条按【发布健康】判定的重建路径：
+        #   (1) QoS>0 发布在 publish_ack_timeout 内收不到 PUBACK；
+        #   (2) _out_packet 积压 >= publish_backlog_threshold 且连续
+        #       publish_backlog_rounds 轮未回落。
+        # 每条连接独立冷却（复用 recovery_force_gap），且必须裸 TCP 探活成功
+        # 才重建，网络确实断掉时保持安静，避免重连风暴。任何异常只跳过本轮，
+        # 不影响主收发流程。
+        self.publish_health_enabled = bool(publish_health_enabled)
+        self.publish_ack_timeout = _normalize_positive(publish_ack_timeout, "publish_ack_timeout")
+        self.publish_backlog_threshold = int(
+            _normalize_positive(publish_backlog_threshold, "publish_backlog_threshold")
+        )
+        self.publish_backlog_rounds = int(
+            _normalize_positive(publish_backlog_rounds, "publish_backlog_rounds")
+        )
+        self.publish_health_max_rebuild = int(
+            _normalize_positive(publish_health_max_rebuild, "publish_health_max_rebuild")
+        )
+        # host -> {"pending": {mid: 发送时间}, "backlog": 上轮积压, "rounds": 连续积压轮数}
+        self._pub_health = {}
+        self._pub_health_lock = threading.Lock()
         self._started_at = 0.0
         self.clients = {}
         self.log_messages = log_messages
@@ -928,6 +974,7 @@ class MultiMQTTManager:
             print_interval=stats_print_interval,
             ping_interval=stats_ping_interval,
             lock=self.lock,
+            on_qos_publish=self._note_publish,
         )
         # ------------------
         # [重放窗口] 已验签消息的 timestamp 允许与本机时钟的最大偏差（秒）。
@@ -1298,19 +1345,9 @@ class MultiMQTTManager:
             old = self.clients.get(host)
         if old is not None:
             try:
-                old._thread_terminate = True
-                try:
-                    # 唤醒可能阻塞在 select 上的网络线程
-                    try:
-                        old._sockpairW.send(b"x")
-                    except Exception:
-                        pass
-                    old.loop_stop()
-                finally:
-                    try:
-                        old._sock_close()
-                    except Exception:
-                        pass
+                # 有界终止：半死 socket 上 paho 的 loop_stop() 会永久阻塞，
+                # 这里用带超时的 shutdown + join 替代，绝不拖死调用线程。
+                self._terminate_stuck_client(old)
             except Exception:
                 logger.debug("终止旧 client 线程 [%s] 时出现异常", host, exc_info=True)
         entry = None
@@ -1370,6 +1407,9 @@ class MultiMQTTManager:
                             dead_hosts.append(host)
                     if online == 0 and dead_hosts:
                         self._global_recovery_scan(dead_hosts)
+                    else:
+                        # 有在线节点时，再查“连接在但发不出去”的半死 socket
+                        self._publish_health_scan(snapshot)
             except Exception:
                 logger.exception("网络恢复看门狗一轮扫描异常")
             ev.wait(self.recovery_interval)
@@ -1428,6 +1468,153 @@ class MultiMQTTManager:
                 len(dead_hosts), built,
             )
 
+    def _publish_health_scan(self, snapshot=None):
+        """[发布健康看门狗] 找出“连接在、但发不出去”的半死 client 并重建。
+
+        判定依据（任一命中即视为不健康，可在构造参数里配置/关闭）：
+          1. QoS>0 发布超过 ``publish_ack_timeout`` 秒仍未收到 PUBACK；
+          2. paho 发送队列 ``_out_packet`` 长度 >= ``publish_backlog_threshold``
+             且连续 ``publish_backlog_rounds`` 轮扫描都没有回落。
+
+        安全边界（与原有“全灭才重建”策略互补、不冲突）：
+          - 只看 is_connected() 为 True 的连接，掉线节点仍交给 paho 退避/全局恢复；
+          - 每条连接独立冷却 ``recovery_force_gap``；
+          - 重建前必须裸 TCP 探活成功，网络真断时保持安静；
+          - 每轮最多重建 ``publish_health_max_rebuild`` 条，避免重连风暴；
+          - 单条连接的任何异常只跳过该条，绝不影响其它连接与主收发流程。
+        """
+        if not self.publish_health_enabled or self._stop_event.is_set():
+            return
+        if snapshot is None:
+            with self.lock:
+                snapshot = dict(self.clients)
+        if not snapshot:
+            return
+        # 启动宽限期内连接还在建立/补订阅，发送队列有正常突发，不参与判定
+        if time.time() - self._started_at < self.recovery_start_grace:
+            return
+
+        now = time.time()
+        candidates = []
+        for host, client in snapshot.items():
+            try:
+                if not client.is_connected():
+                    with self._pub_health_lock:
+                        self._pub_health.pop(host, None)
+                    continue
+            except Exception:
+                continue
+            try:
+                backlog = len(getattr(client, "_out_packet", ()) or ())
+            except Exception:
+                backlog = 0
+
+            reason = None
+            with self._pub_health_lock:
+                state = self._pub_health.get(host)
+                if state is None:
+                    state = {"pending": {}, "backlog": -1, "rounds": 0}
+                    self._pub_health[host] = state
+                # 判定 1：QoS>0 发布迟迟没有 PUBACK（半死 socket 的典型特征）
+                expired = [
+                    mid for mid, sent_at in state["pending"].items()
+                    if now - sent_at >= self.publish_ack_timeout
+                ]
+                for mid in expired:
+                    state["pending"].pop(mid, None)
+                if expired:
+                    reason = (
+                        f"QoS1 发布超过 {self.publish_ack_timeout:g}s 未收到 PUBACK"
+                        f"（{len(expired)} 条）"
+                    )
+                # 判定 2：发送队列持续积压（健康连接会在毫秒级清空）
+                if backlog >= self.publish_backlog_threshold:
+                    state["rounds"] += 1
+                else:
+                    state["rounds"] = 0
+                state["backlog"] = backlog
+                if reason is None and state["rounds"] >= self.publish_backlog_rounds:
+                    reason = (
+                        f"发送队列连续 {state['rounds']} 轮积压 {backlog} 个报文"
+                    )
+            if reason:
+                candidates.append((host, reason))
+
+        if not candidates:
+            return
+        # 探活是阻塞操作，限制本轮最多处理多少条，避免拖长看门狗周期
+        candidates = candidates[: max(1, self.publish_health_max_rebuild * 2)]
+        host_port = self._host_port_map()
+        rebuilt = 0
+        for host, reason in candidates:
+            if self._stop_event.is_set() or rebuilt >= self.publish_health_max_rebuild:
+                break
+            if now - self._recovery_last_force.get(host, 0.0) < self.recovery_force_gap:
+                continue
+            try:
+                if not self._probe_reachable(host, host_port.get(host, 1883)):
+                    continue   # 网络确实不可达：交给 paho 退避/全局恢复，别制造重连风暴
+            except Exception:
+                continue
+            self._recovery_last_force[host] = time.time()
+            logger.warning(
+                "🩺 [发布健康] %s 判定为半死连接（%s），重建 client", host, reason
+            )
+            try:
+                ok = self._recover_client(host)
+            except Exception:
+                logger.exception("🩺 [发布健康] 重建 client 失败 [%s]", host)
+                ok = False
+            with self._pub_health_lock:
+                self._pub_health.pop(host, None)
+            if ok:
+                rebuilt += 1
+        if rebuilt:
+            logger.warning("🩺 [发布健康] 本轮已重建 %d 条半死连接", rebuilt)
+
+    def _terminate_stuck_client(self, client, timeout=2.0):
+        """有界终止一个可能卡死在阻塞 send() 的 paho client，返回旧线程是否已退出。
+
+        paho 的 ``loop_stop()`` 内部是无超时的 ``join()``：当 socket 上行已死、
+        网络线程阻塞在 ``send()`` 里时，join 永不返回，会把调用线程（看门狗）
+        一起拖死——2026-11-11 真机排障时正是这样把 RPC 执行线程卡住的。
+        这里先 shutdown 底层 socket 逼阻塞的 send 立刻报错，再带超时 join。
+        """
+        if client is None:
+            return True
+        try:
+            client._thread_terminate = True
+        except Exception:
+            pass
+        try:
+            # 唤醒可能阻塞在 select 上的网络线程
+            client._sockpairW.send(b"x")
+        except Exception:
+            pass
+        sock = getattr(client, "_sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+        thread = getattr(client, "_thread", None)
+        try:
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=timeout)
+        except Exception:
+            pass
+        alive = bool(thread is not None and thread.is_alive())
+        if not alive:
+            try:
+                client._sock_close()
+            except Exception:
+                pass
+        else:
+            logger.warning(
+                "旧 client 网络线程 %.1fs 内未退出（已 shutdown socket，继续重建）", timeout
+            )
+        return not alive
+
 
     def wait_connected(self, min_count=1, timeout=10.0, poll_interval=0.05):
         """阻塞等待，直到至少 ``min_count`` 个 broker 建立连接或 ``timeout`` 到期。
@@ -1478,8 +1665,51 @@ class MultiMQTTManager:
             if self.log_connection:
                 logger.warning(f"⚠️ [意外断开] Broker: {host} (rc={rc})，自动尝试重连...")
 
+    # 发布健康：单条连接待确认 mid 的记录上限，超出丢最早的一半（防止极端情况膨胀）
+    PUB_HEALTH_PENDING_MAX = 256
+
+    def _note_publish(self, host, info, qos=0):
+        """[发布健康] 记录一条 QoS>0 的发布，供看门狗判断 PUBACK 是否丢失。
+
+        只做一次短临界区写，任何异常仅 debug 记录：绝不允许因为统计失败影响
+        正常发布路径（边缘功能只降级，不阻塞主流程）。
+        """
+        try:
+            if not self.publish_health_enabled or int(qos or 0) <= 0:
+                return
+            mid = getattr(info, "mid", None)
+            if mid is None:
+                return
+            with self._pub_health_lock:
+                state = self._pub_health.get(host)
+                if state is None:
+                    state = {"pending": {}, "backlog": -1, "rounds": 0}
+                    self._pub_health[host] = state
+                state["pending"][mid] = time.time()
+                if len(state["pending"]) > self.PUB_HEALTH_PENDING_MAX:
+                    excess = len(state["pending"]) - self.PUB_HEALTH_PENDING_MAX // 2
+                    for old_mid, _ in sorted(
+                        state["pending"].items(), key=lambda kv: kv[1]
+                    )[:excess]:
+                        state["pending"].pop(old_mid, None)
+        except Exception:
+            logger.debug("记录发布健康状态失败: broker=%s", host, exc_info=True)
+
+    def _note_publish_ack(self, host, mid):
+        """[发布健康] 收到 PUBACK 后清除待确认记录（运行在 paho 网络线程，必须极轻）。"""
+        try:
+            if not self.publish_health_enabled:
+                return
+            with self._pub_health_lock:
+                state = self._pub_health.get(host)
+                if state is not None:
+                    state["pending"].pop(mid, None)
+        except Exception:
+            logger.debug("清理发布健康状态失败: broker=%s", host, exc_info=True)
+
     def _on_publish(self, client, userdata, mid, *args, **kwargs):
         host = userdata
+        self._note_publish_ack(host, mid)
         if self.enable_stats:
             self.stats.on_publish_ack(host, mid)
 
@@ -1756,6 +1986,7 @@ class MultiMQTTManager:
     def publish_broadcast(self, topic: str, payload_dict: dict, client_private_key_bytes=None, **ka):
         """广播传输消息并返回成功入队的 Broker 数；QoS 等参数透传给 paho。"""
         payload_str = self._prepare_broadcast_payload(payload_dict, client_private_key_bytes)
+        qos = ka.get("qos", 0)
         published = 0
         with self.lock:
             clients_snapshot = list(self.clients.items())
@@ -1764,6 +1995,7 @@ class MultiMQTTManager:
                 info = c.publish(topic, payload_str, **ka)
                 if info.rc == mqtt_client.MQTT_ERR_SUCCESS:
                     published += 1
+                    self._note_publish(host, info, qos)
         return published
 
     def publish_broadcast_confirmed(self, topic: str, payload_dict: dict, client_private_key_bytes=None, confirm_timeout: float = 2.0, **ka) -> dict:
@@ -1773,6 +2005,7 @@ class MultiMQTTManager:
         后台线程调用；acked 只统计真正收到 PUBACK 的连接，入队但未确认不计。
         """
         payload_str = self._prepare_broadcast_payload(payload_dict, client_private_key_bytes)
+        qos = ka.get("qos", 0)
         with self.lock:
             clients_snapshot = list(self.clients.items())
         queued_infos = []
@@ -1781,6 +2014,7 @@ class MultiMQTTManager:
                 info = c.publish(topic, payload_str, **ka)
                 if info.rc == mqtt_client.MQTT_ERR_SUCCESS:
                     queued_infos.append((host, info))
+                    self._note_publish(host, info, qos)
         deadline = time.monotonic() + max(0.0, float(confirm_timeout or 0.0))
         acked = 0
         for host, info in queued_infos:
@@ -1836,6 +2070,8 @@ class MultiMQTTManager:
         with self.lock:
             clients_snapshot = list(self.clients.values())
             self.clients.clear()
+        with self._pub_health_lock:
+            self._pub_health.clear()
         for c in clients_snapshot:
             try:
                 c.loop_stop()
