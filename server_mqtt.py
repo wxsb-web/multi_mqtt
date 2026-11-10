@@ -75,6 +75,10 @@ _SYNCED_CONFIG_CONSTS = frozenset({
 
 class _ServerMqttModule(types.ModuleType):
     def __setattr__(self, name, value):
+        # 唯一配置路径：赋值先同步到 rpc_config（server_http 等已绑定模块一起跟随），
+        # 再写回本模块字典，保证模块内函数按 globals 直接读到的也是新值。
+        if name == 'RPC_CONFIG_PATH':
+            value = _rpc_config.set_config_path(value)
         super().__setattr__(name, value)
         if name in _SYNCED_CONFIG_CONSTS:
             setattr(_rpc_config, name, value)
@@ -85,7 +89,11 @@ sys.modules[__name__].__class__ = _ServerMqttModule
 logger = logging.getLogger("Server")
 DEFAULT_REPLY_TOPIC = "sys/device/response"
 
-RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
+# rpc.json 路径不再由本模块决定：登记到 rpc_config 的唯一路径上。
+# app.py 里 “server_mqtt.RPC_CONFIG_PATH = files/rpc.json” 的旧写法继续有效，
+# 并会同步 server_http（HTTP 的 basic_auth / http_aliases 与 MQTT 读同一份文件）。
+_rpc_config.bind_config_path(sys.modules[__name__])
+RPC_CONFIG_PATH = _rpc_config.get_config_path()
 # 读-改-写 rpc.json 的统一锁：与 server_http 别名持久化共用同一把（rpc_config.CONFIG_LOCK），
 # 跨模块写同一文件的读-改-写串行，消除两把锁时的丢失更新；reload 安全由 setdefault 保证。
 _RPC_CONFIG_LOCK = _rpc_config.CONFIG_LOCK
@@ -192,13 +200,13 @@ def set_rpc_config(*, path=None, force_write=False, **updates):
                     except Exception:
                         logger.exception("rpc_config 回滚失败，实例配置可能已部分生效")
                 raise
-            RPC_CONFIG_PATH = config_path
+            _rpc_config.set_config_path(config_path)
             for server in servers:
                 server.rpc_config_path = config_path
             logger.info("配置文件位置已更新到内存并已热应用: %s（实例 %d 个）",
                         config_path, len(servers))
             return _primary_server(servers).rpc_config_get()
-        RPC_CONFIG_PATH = config_path
+        _rpc_config.set_config_path(config_path)
         logger.info("配置文件位置已更新到内存: %s（暂无存活实例）", config_path)
         return _json_rpc_config(candidate)
     # 显式输入先做字段别名归一化（add_broker/topic/pub ... -> 规范键），

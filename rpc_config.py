@@ -15,10 +15,11 @@ rpc.json 读写逻辑，行为与抽离前逐条保持一致：
   与 client 启动经同一份合成实现读到同样的 broker；``broker_list_no``
   （可选顶层键，如 ``{"192.168.1.20:1883": ["pty"]}``）支持按模块屏蔽条目。
 
-路径相关接口（``load_rpc_config`` 等）``path=None`` 时默认读写本模块的
-``DEFAULT_RPC_CONFIG_PATH``；server_mqtt / client_mqtt 保留原函数名的薄封装，
-在调用时解析各自模块的 ``RPC_CONFIG_PATH`` / ``CLIENT_RPC_CONFIG_PATH``
-（测试 / 部署会打补丁注入路径，必须晚绑定），接口与行为全部不变。
+路径相关接口（``load_rpc_config`` 等）``path=None`` 时读写 :func:`get_config_path`
+返回的唯一路径；server_mqtt / server_http 的模块级 ``RPC_CONFIG_PATH`` 通过
+:func:`bind_config_path` 接成它的视图：任意一侧赋值（app.py 改到 files/rpc.json、
+测试打补丁）都会同步到全局，不再出现“server_mqtt 读 A 文件、server_http 读 B 文件”
+的分裂状态（Android 上曾因此导致 rpc.json 的 basic_auth 静默失效）。
 """
 
 import copy
@@ -43,6 +44,58 @@ from multi_mqtt import (
 logger = logging.getLogger("Server")
 
 DEFAULT_RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
+
+
+# ---------------------------------------------------------------------------
+# 唯一配置路径（单一真源）
+# ---------------------------------------------------------------------------
+# 背景：server_mqtt / server_http 原先各自写 `Path(__file__).with_name("rpc.json")`。
+# 桌面端两个文件同目录，看不出问题；Android（Chaquopy）上 app.py 会把 server_mqtt
+# 的路径改到 files/rpc.json，而 server_http 仍读模块同级那份（根本不存在），于是
+# rpc.json 里的 basic_auth / http_aliases 全部静默失效，且 HTTP 与服务端读写两份文件。
+# 现在路径只由这里持有：各模块通过 bind_config_path() 接成视图，赋值即全局切换。
+CONFIG_PATH = globals().setdefault('CONFIG_PATH', Path(DEFAULT_RPC_CONFIG_PATH))
+# 已绑定模块（reload 安全：setdefault 保住同一列表，避免旧模块被丢出同步范围）
+_BOUND_CONFIG_MODULES = globals().setdefault('_BOUND_CONFIG_MODULES', [])
+
+
+def get_config_path():
+    """当前生效的 rpc.json 路径（唯一真源，所有模块共用）。"""
+    return Path(CONFIG_PATH)
+
+
+def set_config_path(path):
+    """切换全局 rpc.json 路径，并同步所有已 bind 模块的 RPC_CONFIG_PATH。
+
+    显式传入的路径当场校验（``Path()`` 类型错误直接抛），不做静默兜底：
+    这是用户/部署方主动改路径，写错应当立刻暴露；运行期的文件内容仍然容错读取。
+    """
+    global CONFIG_PATH
+    CONFIG_PATH = Path(path)
+    for module in tuple(_BOUND_CONFIG_MODULES):
+        module.__dict__['RPC_CONFIG_PATH'] = CONFIG_PATH
+    return CONFIG_PATH
+
+
+def bind_config_path(module):
+    """把模块级 ``RPC_CONFIG_PATH`` 接到 :func:`get_config_path` 上。
+
+    实现约定（配合各模块的 ModuleType 子类 ``__setattr__``）：
+    - 模块字典里仍保留一个普通变量：模块内函数按 globals 直接读，零开销；
+    - ``module.RPC_CONFIG_PATH = x`` 会先 ``set_config_path(x)`` 再写字典，
+      其它已绑定模块（server_http ↔ server_mqtt）同时切到新文件；
+    - 所以 app.py 只改 server_mqtt 的路径、测试只补丁 server_http 的路径，
+      两边看到的都始终是同一份 rpc.json。
+    """
+    if module not in _BOUND_CONFIG_MODULES:
+        _BOUND_CONFIG_MODULES.append(module)
+    module.__dict__['RPC_CONFIG_PATH'] = get_config_path()
+
+
+def _resolve_config_path(path=None):
+    """显式 path 优先，否则用唯一路径；所有读写入口共用。"""
+    return Path(path) if path is not None else get_config_path()
+
 
 # 读-改-写的统一锁：server_mqtt 配置写回与 server_http 别名持久化共用同一把，
 # 跨模块写同一文件时串行，消除两把锁时的丢失更新竞态。
@@ -694,7 +747,7 @@ def _read_rpc_config_document(path=None):
     文件不存在返回 {}；JSON 损坏 / 根节点不是 object 时抛 ValueError
     （调用方自行决定回落还是拒绝写入）；其它 OSError 原样上抛。
     """
-    config_path = Path(path) if path is not None else DEFAULT_RPC_CONFIG_PATH
+    config_path = _resolve_config_path(path)
     with CONFIG_LOCK:
         try:
             with config_path.open("r", encoding="utf-8") as config_file:
@@ -1027,7 +1080,7 @@ def _write_rpc_config_updates(updates, path=None, force_write=False):
     force_write 语义与 :func:`update_json_document` 一致：正确或空 rpc.json
     直接写；非空错误文件默认抛 ValueError 拒绝覆盖，force_write=True 才重写。
     """
-    config_path = Path(path) if path is not None else DEFAULT_RPC_CONFIG_PATH
+    config_path = _resolve_config_path(path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with CONFIG_LOCK:
         try:

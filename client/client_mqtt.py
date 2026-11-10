@@ -16,8 +16,9 @@ logger = logging.getLogger(__file__)
 from server_mqtt import REQUEST_TOPIC, DEFAULT_REPLY_TOPIC as REPLY_TOPIC
 DEFAULT_TIMEOUT = 30
 
-# 客户端与 service 端共用项目根目录的 rpc.json；client/ 子目录向上一级。
-CLIENT_RPC_CONFIG_PATH = os.path.join(os.path.dirname(_HERE), "rpc.json")
+# 客户端与 service 端共用同一份 rpc.json：路径由 rpc_config 唯一持有，
+# 不再各自拼一份（服务端路径被部署脚本改到 files/rpc.json 时客户端也跟随）。
+CLIENT_RPC_CONFIG_PATH = _rpc_config.get_config_path()
 
 
 def load_client_rpc_config(path=None):

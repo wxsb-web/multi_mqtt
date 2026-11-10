@@ -7,14 +7,27 @@ from pathlib import Path
 import rpc_executor
 from rpc_executor import PythonExecutor, format_result ,stime, utc_ms
 import rpc_config as _rpc_config
+import types
 
 
 # --------------------------------------------------------------------------- #
-# 别名持久化：默认 rpc.json 与本文件同目录（测试 / 部署可改 RPC_CONFIG_PATH）
+# 别名持久化：rpc.json 路径统一由 rpc_config 持有（唯一真源）
 # --------------------------------------------------------------------------- #
 # 与 server_mqtt 共用同一份 rpc.json：server_mqtt 写 request_topic 等键，
-# 这里只读写自己的 http_aliases 段，读-改-写时其它键原样保留，互不覆盖。
-RPC_CONFIG_PATH = Path(__file__).with_name("rpc.json")
+# 这里只读写自己的 http_aliases / basic_auth 段，读-改-写时其它键原样保留。
+# 路径不再是本模块的 Path(__file__) 副本：Android 上 app.py 只改 server_mqtt 的
+# 路径（files/rpc.json），旧实现会让 HTTP 继续读模块同级那份（不存在）→
+# basic_auth 静默失效。绑定后任一侧赋值都会同步两边。
+class _ServerHttpModule(types.ModuleType):
+    def __setattr__(self, name, value):
+        if name == 'RPC_CONFIG_PATH':
+            value = _rpc_config.set_config_path(value)
+        super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _ServerHttpModule
+_rpc_config.bind_config_path(sys.modules[__name__])
+RPC_CONFIG_PATH = _rpc_config.get_config_path()
 ALIAS_CONFIG_KEY = 'http_aliases'
 # HTTP Basic 认证凭据同样放在 rpc.json：字符串 'user:password' 或
 # [user, password] 数组；缺省 / 空值 / 写错都表示不启用。

@@ -72,10 +72,12 @@ import client_mqtt  # noqa: E402  复用 client/rpc 的 MQTT 客户端与配置�
 import xime_ui  # noqa: E402  元素视图的页面 / WebSocket / MQTT 数据面
 from multi_mqtt import get_duplicated_kargs, get_standard_pem_bytes  # noqa: E402
 from rpc_config import parse_broker_add  # noqa: E402  --broker_add 解析口径（[user:pass@]host[:port]）
+import rpc_config  # noqa: E402  唯一配置路径（与服务端/客户端同一份 rpc.json）
 
 logger = logging.getLogger("xime_mcp")
 
-CONFIG_PATH = os.environ.get("XIME_MCP_CONFIG") or os.path.join(_ROOT, "rpc.json")
+# 显式 XIME_MCP_CONFIG 优先；否则用 rpc_config 持有的唯一路径（默认仓库根 rpc.json）。
+CONFIG_PATH = os.environ.get("XIME_MCP_CONFIG") or str(rpc_config.get_config_path())
 
 # 进程内事件环形缓冲：HTTP 同口 RPC 可查（/r=get_log()），stdio 模式不写 stdout。
 _EVENT_LOG = deque(maxlen=300)

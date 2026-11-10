@@ -25,7 +25,13 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+for _p in (_HERE, _ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import rpc_config
 
 # ---------------------------------------------------------------- 配置
 FOLDER_ID = "trae-autocheckin"
@@ -38,7 +44,9 @@ DEFAULT_RPC_CFG = {          # 仅兜底：rpc.json 缺失/坏掉时才用这些
     "k": 2 ** 222,
     "a": 1,
 }
-RPC_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rpc.json")
+# 与 server_mqtt / server_http / client 共用同一份 rpc.json（路径由 rpc_config
+# 唯一持有）。旧实现写死 tools/rpc.json，该文件不存在，本段配置永远读不到。
+RPC_CFG_PATH = str(rpc_config.get_config_path())
 
 
 def load_rpc_cfg(path: str = RPC_CFG_PATH) -> dict:

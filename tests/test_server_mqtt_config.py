@@ -1732,5 +1732,80 @@ class JsonPreserveWriteTests(unittest.TestCase):
             {"request_topic": "t/request"})
 
 
+class UnifiedConfigPathTests(unittest.TestCase):
+    """rpc.json 路径唯一化。
+
+    真机教训（Android/Chaquopy）：app.py 只把 server_mqtt.RPC_CONFIG_PATH 改到
+    files/rpc.json，server_http 仍读模块同级那份（不存在），于是 basic_auth /
+    http_aliases 静默失效、HTTP 与服务端各写各的文件。
+
+    绑定 rpc_config.CONFIG_PATH 后，任一侧赋值都必须让另一侧立即跟随。
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._temp.name)
+        self.a = self.tmp / "a.json"
+        self.b = self.tmp / "b.json"
+        self.old_path = rpc_config.get_config_path()
+        # 隔离上一个用例可能残留的存活实例：模块级 rpc_config(path=...) 会对它们
+        # 逐个热应用，让本类只验证"路径同步"这一件事。
+        self._patch_stack = [
+            mock.patch.object(server_mqtt, "_RPC_SERVERS", weakref.WeakSet()),
+            mock.patch.object(server_mqtt, "gms", None),
+        ]
+        for patch in self._patch_stack:
+            patch.start()
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for patch in reversed(self._patch_stack):
+            patch.stop()
+        rpc_config.set_config_path(self.old_path)
+        self._temp.cleanup()
+
+    def test_server_mqtt_assignment_reaches_server_http(self):
+        """app.py 的旧写法（只改 server_mqtt 路径）必须同步到 server_http。"""
+        import server_http
+        server_mqtt.RPC_CONFIG_PATH = self.a
+        self.assertEqual(rpc_config.get_config_path(), self.a)
+        self.assertEqual(server_http.RPC_CONFIG_PATH, self.a)
+
+    def test_server_http_assignment_reaches_server_mqtt(self):
+        """测试/部署只补丁 server_http 路径时，服务端读到同一份文件。"""
+        import server_http
+        self.b.write_text(json.dumps({"request_topic": "unified/topic"}),
+                          encoding="utf-8")
+        server_http.RPC_CONFIG_PATH = self.b
+        self.assertEqual(server_mqtt.RPC_CONFIG_PATH, self.b)
+        self.assertEqual(server_mqtt.load_rpc_config()["request_topic"],
+                         "unified/topic")
+
+    def test_basic_auth_reads_unified_path(self):
+        """核心回归：路径切到 files/rpc.json 后，HTTP basic_auth 必须能读出来。"""
+        import server_http
+        self.a.write_text(json.dumps({"basic_auth": "q:q"}), encoding="utf-8")
+        server_mqtt.RPC_CONFIG_PATH = self.a
+        self.assertEqual(server_http.load_basic_auth_from_config(), "q:q")
+
+    def test_rpc_config_hot_path_switch_is_unified(self):
+        """rpc_config(path=...) 热切路径也必须同步，而不是只改 server_mqtt。"""
+        import server_http
+        self.a.write_text(json.dumps({"request_topic": "hot/topic"}),
+                          encoding="utf-8")
+        server_mqtt.rpc_config(path=self.a)
+        self.assertEqual(rpc_config.get_config_path(), self.a)
+        self.assertEqual(server_http.RPC_CONFIG_PATH, self.a)
+
+    def test_dirty_config_still_falls_back(self):
+        """路径统一后脏 rpc.json 仍只降级：坏 JSON 不抛、回落默认值。"""
+        import server_http
+        self.a.write_text("{ this is not json", encoding="utf-8")
+        server_mqtt.RPC_CONFIG_PATH = self.a
+        self.assertEqual(server_http.load_basic_auth_from_config(), "")
+        self.assertEqual(server_mqtt.load_rpc_config()["request_topic"],
+                         rpc_config.REQUEST_TOPIC)
+
+
 if __name__ == "__main__":
     unittest.main()
