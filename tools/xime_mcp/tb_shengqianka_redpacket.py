@@ -43,6 +43,19 @@ COUNTER_RE = re.compile(r"^(\d+)/5$")
 BADGE_URL_HINT = "tps-282-344"
 DUMP_NODES = 2000                # 一次 dump 的节点上限（不够会把角标截掉）
 
+# 页面识别结果（按“从具体到笼统”的顺序判定，见 detect_page）
+PAGE_REDEEM = "redeem"           # 兑奖页（有 x/5 计数或「下滑寻找」）
+PAGE_UNLOCK = "unlock"           # 省钱卡页且露出「点击红包解锁」
+PAGE_SQK = "sqk"                 # 省钱卡 WebView 页
+PAGE_MINE = "mine"               # 我的淘宝（有可点的省钱卡入口）
+PAGE_NATIVE = "native"           # 淘宝原生页（有底部「我的淘宝」tab）
+PAGE_OTHER = "other"             # 淘宝其它页面 / 开屏广告 / 浮层
+PAGE_NAME = {
+    PAGE_REDEEM: "兑奖页", PAGE_UNLOCK: "省钱卡页(有解锁入口)",
+    PAGE_SQK: "省钱卡页", PAGE_MINE: "我的淘宝",
+    PAGE_NATIVE: "淘宝原生页", PAGE_OTHER: "未知页面",
+}
+
 _step = 0
 _t0 = time.time()
 
@@ -216,12 +229,6 @@ def wait_text(dev, text, timeout=12, max_nodes=1500):
     return r
 
 
-def open_taobao(dev):
-    log("启动淘宝 %s" % TAOBAO_PKG)
-    dev.call("launch_app", package=TAOBAO_PKG)
-    time.sleep(1.0)
-
-
 def _pick_sqk(hits):
     """挑真正的省钱卡入口；排除“韩**A领了省钱卡红包，推荐您购买”这类浮层。"""
     for n in hits:
@@ -232,76 +239,147 @@ def _pick_sqk(hits):
     return None
 
 
-def is_sqk_page(dev):
-    """省钱卡 WebView 页（淘宝原生页没有这些区块）。"""
-    return bool(wait_text(dev, "购物红包", timeout=3, max_nodes=1200).get("hits"))
+def hits_in(d, text):
+    """在已有 dump 里按文本/描述找节点（不额外发 RPC），字段与 find_text 一致。"""
+    out = []
+    for n in nodes_of(d):
+        t = str(n.get("t") or "")
+        ds = str(n.get("d") or "")
+        if text not in t and text not in ds:
+            continue
+        b = n.get("b") or []
+        if len(b) != 4:
+            continue
+        out.append({"text": t, "desc": ds, "clickable": bool(n.get("k")),
+                    "x": (b[0] + b[2]) // 2, "y": (b[1] + b[3]) // 2})
+    return out
 
 
-def open_shengqianka(dev):
-    """在「我的淘宝」页点省钱卡入口。"""
-    hit = wait_text(dev, "我的淘宝", timeout=15, max_nodes=800)
-    for n in (hit.get("hits") or []):
-        if n.get("clickable"):
-            log("点底部「我的淘宝」(%d,%d)" % (n["x"], n["y"]))
-            tap(dev, n["x"], n["y"])
-            time.sleep(1.4)
-            break
-    hit = wait_text(dev, "省钱卡", timeout=12, max_nodes=1100)
-    n = _pick_sqk(hit.get("hits") or [])
-    if not n:
-        log("没找到可点的「省钱卡」入口（命中项都不是入口）")
-        return False
-    log("点「%s」(%d,%d)" % (n.get("text") or n.get("desc") or "省钱卡", n["x"], n["y"]))
+def click_node(dev, n, label=""):
+    log("点「%s」(%d,%d)" % (label or n.get("text") or n.get("desc") or "节点",
+                            n["x"], n["y"]))
     tap(dev, n["x"], n["y"])
-    return True
+    time.sleep(1.2)
 
 
-def open_unlock(dev, timeout=20):
+def foreground_pkg(dev):
+    """当前前台应用包名（多窗口时取 active 窗口）。"""
+    r = dev.call("windows")
+    for w in (r.get("windows") or []):
+        if isinstance(w, dict) and w.get("active"):
+            return str(w.get("pkg") or "")
+    return ""
+
+
+def ensure_taobao(dev, timeout=25):
+    """淘宝在前台就不重启（避免把用户当前页面顶掉）；不在才拉起并等它到前台。"""
+    pkg = foreground_pkg(dev)
+    if pkg == TAOBAO_PKG:
+        log("淘宝已在前台，跳过启动")
+        return True
+    log("启动淘宝 %s（当前前台 %s）" % (TAOBAO_PKG, pkg or "未知"))
+    dev.call("launch_app", package=TAOBAO_PKG)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(0.8)
+        if foreground_pkg(dev) == TAOBAO_PKG:
+            log("淘宝已到前台 %.1fs" % (time.time() - t0))
+            return True
+    log("等淘宝到前台超时 %.1fs，继续尝试识别页面" % timeout)
+    return False
+
+
+def detect_page(dev, d=None):
+    """一次 dump 判定当前在哪个页面（从具体到笼统），不做任何点击/等待。"""
+    d = dump(dev) if d is None else d
+    if counter(d) is not None or hits_in(d, "下滑寻找"):
+        return PAGE_REDEEM, d
+    if hits_in(d, "点击红包解锁"):
+        return PAGE_UNLOCK, d
+    if hits_in(d, "购物红包"):
+        return PAGE_SQK, d
+    if _pick_sqk(hits_in(d, "省钱卡")):
+        return PAGE_MINE, d
+    if any(h["clickable"] for h in hits_in(d, "我的淘宝")):
+        return PAGE_NATIVE, d
+    return PAGE_OTHER, d
+
+
+def open_unlock(dev, timeout=20, d=None):
     """点「点击红包解锁」，进兑奖页（该节点在树的第 445+ 位，max_nodes 必须给足）。"""
-    r = wait_text(dev, "点击红包解锁", timeout=timeout, max_nodes=1600)
-    if not r.get("hits"):
+    hits = hits_in(d, "点击红包解锁") if d is not None else []
+    if not hits:
+        hits = wait_text(dev, "点击红包解锁", timeout=timeout,
+                         max_nodes=1600).get("hits") or []
+    if not hits:
         log("没找到「点击红包解锁」")
         return False
-    h = r["hits"][0]
+    h = next((n for n in hits if n.get("clickable")), hits[0])
     if not 150 <= h["y"] <= 2250:               # 屏外（多发生在翻页后），先滚回顶部
         log("解锁入口在屏外(y=%d)，滚回顶部" % h["y"])
         dev.call("swipe", x1=540, y1=700, x2=540, y2=2000, duration_ms=600)
         time.sleep(1.0)
-        r = wait_text(dev, "点击红包解锁", timeout=6, max_nodes=1600)
-        if not r.get("hits"):
+        hits = wait_text(dev, "点击红包解锁", timeout=6,
+                         max_nodes=1600).get("hits") or []
+        if not hits:
             return False
-        h = r["hits"][0]
-    log("点「点击红包解锁」(%d,%d)" % (h["x"], h["y"]))
-    tap(dev, h["x"], h["y"])
+        h = next((n for n in hits if n.get("clickable")), hits[0])
+    click_node(dev, h, "点击红包解锁")
     wait_text(dev, "下滑寻找", timeout=12, max_nodes=1200)
     return True
 
 
-def open_redeem(dev):
-    """从任意页面导航到兑奖页；淘宝常续停在省钱卡/兑奖页，没有底部 tab。"""
-    if wait_text(dev, "下滑寻找", timeout=5, max_nodes=1200).get("hits"):
-        log("已在兑奖页，跳过导航")
-        return True
-    if open_unlock(dev, timeout=6):
-        return True
-    if is_sqk_page(dev):
-        log("在省钱卡页但无解锁入口，退出 WebView 回淘宝原生页")
-        back(dev)
-    if not open_shengqianka(dev):
-        return False
-    if not open_unlock(dev):
-        log("省钱卡页没有「点击红包解锁」入口（今日可能未发放或已领完）")
-        return False
-    return True
+def open_redeem(dev, tries=10):
+    """按“当前页面”逐跳导航到兑奖页：已在该页直接返回，不盲探入口。"""
+    unknown_backs = 0
+    relaunched = False
+    for _ in range(tries):
+        page, d = detect_page(dev)
+        log("识别页面：%s（%s）" % (PAGE_NAME[page], summary(d)))
+        if page == PAGE_REDEEM:
+            return True
+        if page in (PAGE_UNLOCK, PAGE_SQK):
+            if open_unlock(dev, timeout=6 if page == PAGE_UNLOCK else 3, d=d):
+                return True
+            log("省钱卡页没有「点击红包解锁」入口，退回上一页")
+            back(dev)
+            continue
+        if page == PAGE_MINE:
+            n = _pick_sqk(hits_in(d, "省钱卡"))
+            click_node(dev, n, n.get("text") or n.get("desc") or "省钱卡")
+            continue
+        if page == PAGE_NATIVE:
+            n = next((h for h in hits_in(d, "我的淘宝") if h["clickable"]), None)
+            if n is None:
+                log("淘宝原生页没有可点的底部「我的淘宝」")
+                return False
+            click_node(dev, n, "我的淘宝")
+            continue
+        # 未知页面：先关开屏广告/浮层，再退回一次，最后才重新拉起淘宝
+        n = next((h for h in hits_in(d, "跳过") if h["clickable"]), None)
+        if n is not None:
+            click_node(dev, n, "跳过")
+            continue
+        if unknown_backs < 2:
+            unknown_backs += 1
+            back(dev)
+            continue
+        if relaunched:
+            return False
+        relaunched = True
+        ensure_taobao(dev)
+    log("导航尝试 %d 次仍未到兑奖页" % tries)
+    return False
 
 
 def reenter(dev):
-    """退回省钱卡再进一次（重进后首屏就有角标，不需要下滑）。"""
-    log("退回省钱卡重新进入")
+    """退回一页后重新按识别结果导航（重进后首屏就有角标，不需要下滑）。"""
+    log("退回重新进入兑奖页")
     back(dev)
-    if not open_unlock(dev):
-        open_shengqianka(dev)
-        open_unlock(dev)
+    if open_redeem(dev, tries=4):
+        return True
+    ensure_taobao(dev)
+    return open_redeem(dev)
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +428,9 @@ def run(dev, target=5, max_clicks=20, max_rounds=8):
             break
         if hits_this_round == 0 or clicks >= max_clicks:
             log("本轮命中%d次，已点%d次，退回重进" % (hits_this_round, clicks))
-            reenter(dev)
+            if not reenter(dev):
+                log("重进兑奖页失败，结束")
+                break
             bs = []                             # 重进后重新等首屏角标
             if hits_this_round == 0:
                 time.sleep(random.uniform(1.5, 3.0))
@@ -393,9 +473,9 @@ def main(argv=None):
     log("手机已连接，开始导航")
 
     if not args.skip_nav:
-        open_taobao(dev)
+        ensure_taobao(dev)
         if not open_redeem(dev):
-            print("导航到兑奖页失败（未找到「点击红包解锁」入口）", file=sys.stderr)
+            print("导航到兑奖页失败（当前页面无法识别或不含入口）", file=sys.stderr)
             return 3
 
     final = run(dev, target=args.target,
