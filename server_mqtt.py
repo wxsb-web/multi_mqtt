@@ -12,7 +12,6 @@ import weakref
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from ecdsa import VerifyingKey
 from multi_mqtt import (
     BROKER_LIST,
     ConnectionQualityStats,
@@ -20,6 +19,8 @@ from multi_mqtt import (
     _describe_public_key,
     get_standard_public_pem_bytes,
 )
+from ecdsa import VerifyingKey# multi_mqtt.py 自动检测依赖，应该放前面
+
 from rpc_executor import utc_ms,stime
 from rpc_executor import PythonExecutor#, format_result
 import rpc_config as _rpc_config  # 本模块下方 rpc_config=set_rpc_config 别名赋值会覆盖同名模块名，引用模块一律用 _rpc_config

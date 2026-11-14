@@ -1917,7 +1917,7 @@ class MultiMQTTManager:
 
                 if now >= next_print_at:
                     try:
-                        logger.info("📡 [连接质量统计报告]" + self.stats.get_report(probe=False,is_windows_cmd=self.is_windows_cmd))
+                        logger.info(f"📡 [连接质量统计报告] {print_interval}s" + self.stats.get_report(probe=False,is_windows_cmd=self.is_windows_cmd))
                     except Exception:
                         logger.exception("生成连接质量统计报告失败")
                     next_print_at = now + print_interval

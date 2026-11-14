@@ -24,3 +24,7 @@ _*.py
 realtime_editor.txt
 
 rpc.json
+# Syncthing 冲突副本（rpc.json 的备份，含 broker 凭据/AK-SK）
+rpc.sync-conflict-*.json
+# 短信账号登录态（含明文 accessToken / refreshToken）
+trae_sms_accounts.json
